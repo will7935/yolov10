@@ -51,8 +51,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Directory containing extracted images. Change this before the first run.
 IMAGES_DIR = Path(r"I:\youyan\camera_B_20260920_083913")
 
-# Use "segment" to preserve polygon outlines or "detect" for rectangles.
-TASK_TYPE = "segment"
+# Run this script twice, changing only this value between "detect" and
+# "segment". Each profile keeps only its own classes and shape type.
+TRAINING_PROFILE = "segment"
+TASK_TYPE = TRAINING_PROFILE
+
+DETECT_CLASSES = [
+    "hand",
+    "hatch_handle",
+    "water_gun",
+    "wafer_slot",
+]
+SEGMENT_CLASSES = ["hatch"]
 
 # Directory containing X-AnyLabeling JSON files. Use None when JSON files are
 # stored next to their corresponding images.
@@ -60,27 +70,21 @@ LABELS_DIR: Path | None = None
 
 # This names-only YAML is selected in X-AnyLabeling's Data field when using
 # workspace training.
-CLASSES_YAML = PROJECT_ROOT / "industrial_inspection" / "configs" / "classes.yaml"
+CLASSES_YAML = (
+    PROJECT_ROOT
+    / "industrial_inspection"
+    / "configs"
+    / f"{TRAINING_PROFILE}_classes.yaml"
+)
 
 # Keep as None to generate/validate only the workspace YAML. To also create a
 # ready-to-train YOLO train/val dataset, set a new or empty output directory,
 # for example: Path(r"D:\wafer_data\yolo_dataset")
-OUTPUT_DATASET = Path(r"I:\youyan\yolo_segment_dataset")
+OUTPUT_DATASET = Path(r"I:\youyan\yolo_datasets") / TRAINING_PROFILE
 
 # Class order becomes the YOLO class ID order. Names must exactly match the
 # labels used in X-AnyLabeling.
-CLASSES = [
-    "hand",
-    "hatch_handle",
-    "water_gun",
-    # "gun_nozzle",
-    # "marble_wall",
-    # "planetary_plate",
-    # "planetary_ring",
-    # "wafer",
-    "wafer_slot",
-    "hatch"
-]
+CLASSES = DETECT_CLASSES if TRAINING_PROFILE == "detect" else SEGMENT_CLASSES
 
 TRAIN_RATIO = 0.8
 RANDOM_SEED = 42
@@ -93,6 +97,11 @@ GROUP_REGEX: str | None = None
 # Set True only when every image without JSON is an intentional negative
 # sample. Keep False to catch forgotten annotations.
 ALLOW_MISSING_JSON = False
+
+# Mixed X-AnyLabeling JSON files may contain both Detect and Segment classes.
+# Ignore labels not listed in the active profile instead of treating them as
+# errors. A listed class with the wrong shape type still raises an error.
+IGNORE_UNLISTED_LABELS = True
 
 # Optional Detect-only compatibility behavior. Keep False to preserve the
 # original polygon annotations and reject accidental conversion to boxes.
@@ -221,6 +230,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=FORCE_CLASSES_YAML,
         help="Allow replacement of an existing different classes YAML.",
+    )
+    parser.add_argument(
+        "--strict-class-list",
+        action="store_true",
+        default=not IGNORE_UNLISTED_LABELS,
+        help="Fail instead of ignoring labels outside the active class profile.",
     )
     parser.add_argument(
         "--strict-rectangles",
@@ -369,6 +384,7 @@ def parse_annotation(
     class_to_id: dict[str, int],
     task_type: str,
     convert_polygons_to_boxes: bool,
+    ignore_unlisted_labels: bool,
 ) -> tuple[int, int, tuple[str, ...], Counter[str], int]:
     if annotation is None:
         try:
@@ -402,6 +418,8 @@ def parse_annotation(
             raise PreparationError(f"Invalid shape #{index}: {annotation}")
         label = shape.get("label")
         if label not in class_to_id:
+            if ignore_unlisted_labels:
+                continue
             raise PreparationError(
                 f"Unknown label {label!r} in {annotation}. "
                 "Add it to --classes or correct the annotation."
@@ -453,6 +471,7 @@ def collect_samples(
     allow_missing_json: bool,
     task_type: str,
     convert_polygons_to_boxes: bool,
+    ignore_unlisted_labels: bool,
 ) -> tuple[list[Sample], Counter[str], list[Path]]:
     class_to_id = {name: index for index, name in enumerate(classes)}
     samples: list[Sample] = []
@@ -472,6 +491,7 @@ def collect_samples(
             class_to_id,
             task_type,
             convert_polygons_to_boxes,
+            ignore_unlisted_labels,
         )
         total_counts.update(counts)
         samples.append(
@@ -649,6 +669,7 @@ def main() -> int:
             allow_missing_json=args.allow_missing_json,
             task_type=args.task,
             convert_polygons_to_boxes=not args.strict_rectangles,
+            ignore_unlisted_labels=not args.strict_class_list,
         )
         print_summary(samples, classes, counts, missing)
 
