@@ -5,9 +5,9 @@ The script supports two workflows:
 
 1. Workspace mode: validate X-AnyLabeling image/JSON pairs and generate a
    names-only YAML file accepted by X-AnyLabeling's built-in trainer.
-2. Prepared-dataset mode: additionally convert rectangle annotations to YOLO
-   text labels and split train/val by source-video group, so adjacent frames
-   from one video never appear in both splits.
+2. Prepared-dataset mode: additionally create YOLO detection labels from
+   rectangles or preserve polygons as YOLO segmentation labels, then split
+   train/val by source-video group.
 
 The simplest workflow is to edit the ``USER CONFIGURATION`` block near the
 top of this file and then run the script without arguments.
@@ -51,6 +51,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Directory containing extracted images. Change this before the first run.
 IMAGES_DIR = Path(r"I:\youyan\camera_B_20260920_083913")
 
+# Use "segment" to preserve polygon outlines or "detect" for rectangles.
+TASK_TYPE = "segment"
+
 # Directory containing X-AnyLabeling JSON files. Use None when JSON files are
 # stored next to their corresponding images.
 LABELS_DIR: Path | None = None
@@ -62,7 +65,7 @@ CLASSES_YAML = PROJECT_ROOT / "industrial_inspection" / "configs" / "classes.yam
 # Keep as None to generate/validate only the workspace YAML. To also create a
 # ready-to-train YOLO train/val dataset, set a new or empty output directory,
 # for example: Path(r"D:\wafer_data\yolo_dataset")
-OUTPUT_DATASET = Path(r"I:\youyan")
+OUTPUT_DATASET = Path(r"I:\youyan\yolo_segment_dataset")
 
 # Class order becomes the YOLO class ID order. Names must exactly match the
 # labels used in X-AnyLabeling.
@@ -91,10 +94,9 @@ GROUP_REGEX: str | None = None
 # sample. Keep False to catch forgotten annotations.
 ALLOW_MISSING_JSON = False
 
-# Convert polygon and rotation annotations to their axis-aligned outer
-# rectangles when preparing a Detect dataset. Original JSON files are never
-# modified. Set False to reject every non-rectangle annotation.
-CONVERT_POLYGONS_TO_BOXES = True
+# Optional Detect-only compatibility behavior. Keep False to preserve the
+# original polygon annotations and reject accidental conversion to boxes.
+CONVERT_POLYGONS_TO_BOXES = False
 
 # Set True only when intentionally replacing an existing classes YAML whose
 # class names or order differ.
@@ -139,6 +141,12 @@ def parse_args() -> argparse.Namespace:
             "Validate X-AnyLabeling JSON files, generate classes.yaml, and "
             "optionally create a video-grouped Ultralytics dataset."
         )
+    )
+    parser.add_argument(
+        "--task",
+        choices=("detect", "segment"),
+        default=TASK_TYPE,
+        help="Training task (defaults to config block).",
     )
     parser.add_argument(
         "--images-dir",
@@ -218,7 +226,7 @@ def parse_args() -> argparse.Namespace:
         "--strict-rectangles",
         action="store_true",
         default=not CONVERT_POLYGONS_TO_BOXES,
-        help="Reject polygon/rotation annotations instead of boxing them.",
+        help="Detect only: reject polygon/rotation annotations instead of boxing them.",
     )
     return parser.parse_args()
 
@@ -334,10 +342,32 @@ def rectangle_to_yolo(
     )
 
 
+def polygon_to_yolo(
+    points: object,
+    width: int,
+    height: int,
+    class_id: int,
+    source: Path,
+) -> str:
+    """Preserve a polygon as an Ultralytics segmentation row."""
+    if not isinstance(points, list) or len(points) < 3:
+        raise PreparationError(f"Polygon has fewer than three points: {source}")
+    normalized: list[str] = []
+    try:
+        for point in points:
+            x = max(0.0, min(float(width), float(point[0]))) / width
+            y = max(0.0, min(float(height), float(point[1]))) / height
+            normalized.extend((f"{x:.6f}", f"{y:.6f}"))
+    except (IndexError, TypeError, ValueError) as exc:
+        raise PreparationError(f"Invalid polygon points in: {source}") from exc
+    return f"{class_id} " + " ".join(normalized)
+
+
 def parse_annotation(
     annotation: Path | None,
     image: Path,
     class_to_id: dict[str, int],
+    task_type: str,
     convert_polygons_to_boxes: bool,
 ) -> tuple[int, int, tuple[str, ...], Counter[str], int]:
     if annotation is None:
@@ -377,19 +407,40 @@ def parse_annotation(
                 "Add it to --classes or correct the annotation."
             )
         shape_type = shape.get("shape_type", "polygon")
-        if shape_type in {"polygon", "rotation"} and convert_polygons_to_boxes:
-            converted_shapes += 1
-        elif shape_type != "rectangle":
-            raise PreparationError(
-                f"Detect training requires rectangles; found {shape_type!r} "
-                f"for label {label!r} in {annotation}. Enable polygon-to-box "
-                "conversion or train a matching Segment/OBB task."
+        if task_type == "segment":
+            if shape_type != "polygon":
+                raise PreparationError(
+                    f"Segment training requires polygons; found {shape_type!r} "
+                    f"for label {label!r} in {annotation}. Re-annotate this "
+                    "class as a polygon or move it to a Detect dataset."
+                )
+            rows.append(
+                polygon_to_yolo(
+                    shape.get("points"),
+                    width,
+                    height,
+                    class_to_id[label],
+                    annotation,
+                )
             )
-        rows.append(
-            rectangle_to_yolo(
-                shape.get("points"), width, height, class_to_id[label], annotation
+        else:
+            if shape_type in {"polygon", "rotation"} and convert_polygons_to_boxes:
+                converted_shapes += 1
+            elif shape_type != "rectangle":
+                raise PreparationError(
+                    f"Detect training requires rectangles; found {shape_type!r} "
+                    f"for label {label!r} in {annotation}. Choose Segment to "
+                    "preserve polygon outlines."
+                )
+            rows.append(
+                rectangle_to_yolo(
+                    shape.get("points"),
+                    width,
+                    height,
+                    class_to_id[label],
+                    annotation,
+                )
             )
-        )
         counts[label] += 1
     return width, height, tuple(rows), counts, converted_shapes
 
@@ -400,6 +451,7 @@ def collect_samples(
     classes: Sequence[str],
     group_pattern: re.Pattern[str] | None,
     allow_missing_json: bool,
+    task_type: str,
     convert_polygons_to_boxes: bool,
 ) -> tuple[list[Sample], Counter[str], list[Path]]:
     class_to_id = {name: index for index, name in enumerate(classes)}
@@ -418,6 +470,7 @@ def collect_samples(
             annotation,
             image,
             class_to_id,
+            task_type,
             convert_polygons_to_boxes,
         )
         total_counts.update(counts)
@@ -594,6 +647,7 @@ def main() -> int:
             classes=classes,
             group_pattern=group_pattern,
             allow_missing_json=args.allow_missing_json,
+            task_type=args.task,
             convert_polygons_to_boxes=not args.strict_rectangles,
         )
         print_summary(samples, classes, counts, missing)
@@ -603,7 +657,7 @@ def main() -> int:
         print(f"Workspace classes YAML: {classes_yaml}")
 
         converted_shapes = sum(sample.converted_shapes for sample in samples)
-        if converted_shapes and not args.output_dataset:
+        if args.task == "detect" and converted_shapes and not args.output_dataset:
             print(
                 "WARNING: X-AnyLabeling workspace Detect conversion ignores "
                 "polygon annotations. Set OUTPUT_DATASET in this script and "
