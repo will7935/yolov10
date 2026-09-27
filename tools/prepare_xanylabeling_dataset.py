@@ -94,9 +94,11 @@ RANDOM_SEED = 42
 # r"^(.*)_\d{6}$".
 GROUP_REGEX: str | None = None
 
-# Set True only when every image without JSON is an intentional negative
-# sample. Keep False to catch forgotten annotations.
-ALLOW_MISSING_JSON = False
+# How to handle images that do not have an X-AnyLabeling JSON file:
+#   "error"    stop and list them;
+#   "skip"     exclude them from training (recommended for unfinished work);
+#   "negative" include them as intentional empty/negative samples.
+MISSING_JSON_POLICY = "skip"
 
 # Mixed X-AnyLabeling JSON files may contain both Detect and Segment classes.
 # Ignore labels not listed in the active profile instead of treating them as
@@ -217,12 +219,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--allow-missing-json",
-        action="store_true",
-        default=ALLOW_MISSING_JSON,
+        "--missing-json-policy",
+        choices=("error", "skip", "negative"),
+        default=MISSING_JSON_POLICY,
         help=(
-            "Treat an image without JSON as an intentional negative sample. "
-            "Without this flag, missing JSON is an error."
+            "How to handle images without JSON annotations "
+            "(defaults to config block)."
         ),
     )
     parser.add_argument(
@@ -468,7 +470,7 @@ def collect_samples(
     labels_dir: Path,
     classes: Sequence[str],
     group_pattern: re.Pattern[str] | None,
-    allow_missing_json: bool,
+    missing_json_policy: str,
     task_type: str,
     convert_polygons_to_boxes: bool,
     ignore_unlisted_labels: bool,
@@ -483,7 +485,7 @@ def collect_samples(
         annotation = find_annotation(image, images_dir, labels_dir)
         if annotation is None:
             missing_annotations.append(image)
-            if not allow_missing_json:
+            if missing_json_policy in {"error", "skip"}:
                 continue
         width, height, rows, counts, converted_shapes = parse_annotation(
             annotation,
@@ -507,14 +509,15 @@ def collect_samples(
             )
         )
 
-    if missing_annotations and not allow_missing_json:
+    if missing_annotations and missing_json_policy == "error":
         preview = "\n".join(f"  - {path}" for path in missing_annotations[:10])
         extra = max(0, len(missing_annotations) - 10)
         suffix = f"\n  ... and {extra} more" if extra else ""
         raise PreparationError(
             "Images without X-AnyLabeling JSON were found. They may be "
             "unlabeled rather than true negatives. Label/save them first, or "
-            "rerun with --allow-missing-json if they are intentional negatives:\n"
+            "set MISSING_JSON_POLICY to 'skip' for unfinished images or "
+            "'negative' only for reviewed negative images:\n"
             f"{preview}{suffix}"
         )
     return samples, total_counts, missing_annotations
@@ -624,6 +627,7 @@ def print_summary(
     classes: Sequence[str],
     counts: Counter[str],
     missing_annotations: Sequence[Path],
+    missing_json_policy: str,
 ) -> None:
     groups = defaultdict(int)
     for sample in samples:
@@ -636,8 +640,10 @@ def print_summary(
     print("Class instances:")
     for class_id, name in enumerate(classes):
         print(f"  {class_id:>2}  {name:<24} {counts[name]}")
-    if missing_annotations:
-        print(f"Intentional empty-label images: {len(missing_annotations)}")
+    if missing_annotations and missing_json_policy == "skip":
+        print(f"Images skipped because JSON is missing: {len(missing_annotations)}")
+    elif missing_annotations and missing_json_policy == "negative":
+        print(f"Missing-JSON images included as negatives: {len(missing_annotations)}")
     converted_shapes = sum(sample.converted_shapes for sample in samples)
     if converted_shapes:
         print(
@@ -666,12 +672,12 @@ def main() -> int:
             labels_dir=labels_dir,
             classes=classes,
             group_pattern=group_pattern,
-            allow_missing_json=args.allow_missing_json,
+            missing_json_policy=args.missing_json_policy,
             task_type=args.task,
             convert_polygons_to_boxes=not args.strict_rectangles,
             ignore_unlisted_labels=not args.strict_class_list,
         )
-        print_summary(samples, classes, counts, missing)
+        print_summary(samples, classes, counts, missing, args.missing_json_policy)
 
         classes_yaml = args.classes_yaml.expanduser().resolve()
         write_classes_yaml(classes_yaml, classes, args.force_yaml)
