@@ -91,6 +91,11 @@ GROUP_REGEX: str | None = None
 # sample. Keep False to catch forgotten annotations.
 ALLOW_MISSING_JSON = False
 
+# Convert polygon and rotation annotations to their axis-aligned outer
+# rectangles when preparing a Detect dataset. Original JSON files are never
+# modified. Set False to reject every non-rectangle annotation.
+CONVERT_POLYGONS_TO_BOXES = True
+
 # Set True only when intentionally replacing an existing classes YAML whose
 # class names or order differ.
 FORCE_CLASSES_YAML = False
@@ -125,6 +130,7 @@ class Sample:
     width: int
     height: int
     yolo_rows: tuple[str, ...]
+    converted_shapes: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,6 +213,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=FORCE_CLASSES_YAML,
         help="Allow replacement of an existing different classes YAML.",
+    )
+    parser.add_argument(
+        "--strict-rectangles",
+        action="store_true",
+        default=not CONVERT_POLYGONS_TO_BOXES,
+        help="Reject polygon/rotation annotations instead of boxing them.",
     )
     return parser.parse_args()
 
@@ -326,7 +338,8 @@ def parse_annotation(
     annotation: Path | None,
     image: Path,
     class_to_id: dict[str, int],
-) -> tuple[int, int, tuple[str, ...], Counter[str]]:
+    convert_polygons_to_boxes: bool,
+) -> tuple[int, int, tuple[str, ...], Counter[str], int]:
     if annotation is None:
         try:
             from PIL import Image
@@ -336,7 +349,7 @@ def parse_annotation(
             ) from exc
         with Image.open(image) as opened:
             width, height = opened.size
-        return width, height, (), Counter()
+        return width, height, (), Counter(), 0
 
     try:
         with annotation.open("r", encoding="utf-8") as handle:
@@ -353,6 +366,7 @@ def parse_annotation(
 
     rows: list[str] = []
     counts: Counter[str] = Counter()
+    converted_shapes = 0
     for index, shape in enumerate(shapes):
         if not isinstance(shape, dict):
             raise PreparationError(f"Invalid shape #{index}: {annotation}")
@@ -363,10 +377,13 @@ def parse_annotation(
                 "Add it to --classes or correct the annotation."
             )
         shape_type = shape.get("shape_type", "polygon")
-        if shape_type != "rectangle":
+        if shape_type in {"polygon", "rotation"} and convert_polygons_to_boxes:
+            converted_shapes += 1
+        elif shape_type != "rectangle":
             raise PreparationError(
-                f"Detect training accepts rectangles only; found {shape_type!r} "
-                f"for label {label!r} in {annotation}."
+                f"Detect training requires rectangles; found {shape_type!r} "
+                f"for label {label!r} in {annotation}. Enable polygon-to-box "
+                "conversion or train a matching Segment/OBB task."
             )
         rows.append(
             rectangle_to_yolo(
@@ -374,7 +391,7 @@ def parse_annotation(
             )
         )
         counts[label] += 1
-    return width, height, tuple(rows), counts
+    return width, height, tuple(rows), counts, converted_shapes
 
 
 def collect_samples(
@@ -383,6 +400,7 @@ def collect_samples(
     classes: Sequence[str],
     group_pattern: re.Pattern[str] | None,
     allow_missing_json: bool,
+    convert_polygons_to_boxes: bool,
 ) -> tuple[list[Sample], Counter[str], list[Path]]:
     class_to_id = {name: index for index, name in enumerate(classes)}
     samples: list[Sample] = []
@@ -396,8 +414,11 @@ def collect_samples(
             missing_annotations.append(image)
             if not allow_missing_json:
                 continue
-        width, height, rows, counts = parse_annotation(
-            annotation, image, class_to_id
+        width, height, rows, counts, converted_shapes = parse_annotation(
+            annotation,
+            image,
+            class_to_id,
+            convert_polygons_to_boxes,
         )
         total_counts.update(counts)
         samples.append(
@@ -409,6 +430,7 @@ def collect_samples(
                 width=width,
                 height=height,
                 yolo_rows=rows,
+                converted_shapes=converted_shapes,
             )
         )
 
@@ -543,6 +565,12 @@ def print_summary(
         print(f"  {class_id:>2}  {name:<24} {counts[name]}")
     if missing_annotations:
         print(f"Intentional empty-label images: {len(missing_annotations)}")
+    converted_shapes = sum(sample.converted_shapes for sample in samples)
+    if converted_shapes:
+        print(
+            "Polygon/rotation annotations converted to detection boxes: "
+            f"{converted_shapes}"
+        )
 
 
 def main() -> int:
@@ -566,12 +594,22 @@ def main() -> int:
             classes=classes,
             group_pattern=group_pattern,
             allow_missing_json=args.allow_missing_json,
+            convert_polygons_to_boxes=not args.strict_rectangles,
         )
         print_summary(samples, classes, counts, missing)
 
         classes_yaml = args.classes_yaml.expanduser().resolve()
         write_classes_yaml(classes_yaml, classes, args.force_yaml)
         print(f"Workspace classes YAML: {classes_yaml}")
+
+        converted_shapes = sum(sample.converted_shapes for sample in samples)
+        if converted_shapes and not args.output_dataset:
+            print(
+                "WARNING: X-AnyLabeling workspace Detect conversion ignores "
+                "polygon annotations. Set OUTPUT_DATASET in this script and "
+                "select its data.yaml in the trainer, or choose Segment.",
+                file=sys.stderr,
+            )
 
         if args.output_dataset:
             output_dataset = args.output_dataset.expanduser().resolve()
