@@ -49,7 +49,7 @@ from typing import Iterable, Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Directory containing extracted images. Change this before the first run.
-IMAGES_DIR = Path(r"D:\CHANGE_ME\frames")
+IMAGES_DIR = Path(r"I:\youyan\camera_B_20260920_083913")
 
 # Directory containing X-AnyLabeling JSON files. Use None when JSON files are
 # stored next to their corresponding images.
@@ -62,7 +62,7 @@ CLASSES_YAML = PROJECT_ROOT / "industrial_inspection" / "configs" / "classes.yam
 # Keep as None to generate/validate only the workspace YAML. To also create a
 # ready-to-train YOLO train/val dataset, set a new or empty output directory,
 # for example: Path(r"D:\wafer_data\yolo_dataset")
-OUTPUT_DATASET: Path | None = None
+OUTPUT_DATASET = Path(r"I:\youyan")
 
 # Class order becomes the YOLO class ID order. Names must exactly match the
 # labels used in X-AnyLabeling.
@@ -70,12 +70,13 @@ CLASSES = [
     "hand",
     "hatch_handle",
     "water_gun",
-    "gun_nozzle",
-    "marble_wall",
-    "planetary_plate",
-    "planetary_ring",
-    "wafer",
+    # "gun_nozzle",
+    # "marble_wall",
+    # "planetary_plate",
+    # "planetary_ring",
+    # "wafer",
     "wafer_slot",
+    "hatch"
 ]
 
 TRAIN_RATIO = 0.8
