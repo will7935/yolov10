@@ -9,7 +9,10 @@ The script supports two workflows:
    text labels and split train/val by source-video group, so adjacent frames
    from one video never appear in both splits.
 
-Examples:
+The simplest workflow is to edit the ``USER CONFIGURATION`` block near the
+top of this file and then run the script without arguments.
+
+Command-line examples (optional overrides):
 
     python tools/prepare_xanylabeling_dataset.py ^
         --images-dir D:\inspection\frames ^
@@ -39,7 +42,31 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-DEFAULT_CLASSES = [
+# =============================================================================
+# USER CONFIGURATION - edit these values, then run this script directly.
+# =============================================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Directory containing extracted images. Change this before the first run.
+IMAGES_DIR = Path(r"D:\CHANGE_ME\frames")
+
+# Directory containing X-AnyLabeling JSON files. Use None when JSON files are
+# stored next to their corresponding images.
+LABELS_DIR: Path | None = None
+
+# This names-only YAML is selected in X-AnyLabeling's Data field when using
+# workspace training.
+CLASSES_YAML = PROJECT_ROOT / "industrial_inspection" / "configs" / "classes.yaml"
+
+# Keep as None to generate/validate only the workspace YAML. To also create a
+# ready-to-train YOLO train/val dataset, set a new or empty output directory,
+# for example: Path(r"D:\wafer_data\yolo_dataset")
+OUTPUT_DATASET: Path | None = None
+
+# Class order becomes the YOLO class ID order. Names must exactly match the
+# labels used in X-AnyLabeling.
+CLASSES = [
     "hand",
     "hatch_handle",
     "water_gun",
@@ -50,6 +77,33 @@ DEFAULT_CLASSES = [
     "wafer",
     "wafer_slot",
 ]
+
+TRAIN_RATIO = 0.8
+RANDOM_SEED = 42
+
+# Leave as None for names such as video01_000001.jpg. For another naming
+# scheme, provide a regex whose first capture group is the video name, e.g.
+# r"^(.*)_\d{6}$".
+GROUP_REGEX: str | None = None
+
+# Set True only when every image without JSON is an intentional negative
+# sample. Keep False to catch forgotten annotations.
+ALLOW_MISSING_JSON = False
+
+# Set True only when intentionally replacing an existing classes YAML whose
+# class names or order differ.
+FORCE_CLASSES_YAML = False
+
+# Set True when launching by double-click and you want the console to remain
+# open after completion. It is usually unnecessary in PowerShell or an IDE.
+PAUSE_ON_EXIT = False
+
+# =============================================================================
+# END USER CONFIGURATION
+# =============================================================================
+
+
+DEFAULT_CLASSES = CLASSES
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 AUTO_GROUP_PATTERN = re.compile(
@@ -82,12 +136,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--images-dir",
         type=Path,
-        required=True,
-        help="Directory containing extracted images.",
+        default=IMAGES_DIR,
+        help="Directory containing extracted images (defaults to config block).",
     )
     parser.add_argument(
         "--labels-dir",
         type=Path,
+        default=LABELS_DIR,
         help=(
             "Directory containing X-AnyLabeling JSON files. Defaults to "
             "--images-dir. Relative subdirectories are preserved."
@@ -96,8 +151,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--classes-yaml",
         type=Path,
-        default=Path("classes.yaml"),
-        help="Names-only YAML for X-AnyLabeling workspace training.",
+        default=CLASSES_YAML,
+        help=(
+            "Names-only YAML for X-AnyLabeling workspace training "
+            "(defaults to config block)."
+        ),
     )
     parser.add_argument(
         "--classes",
@@ -108,6 +166,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dataset",
         type=Path,
+        default=OUTPUT_DATASET,
         help=(
             "Optional new directory for a prepared YOLO train/val dataset. "
             "The directory must be absent or empty."
@@ -116,17 +175,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-ratio",
         type=float,
-        default=0.8,
-        help="Fraction of video groups assigned to train (default: 0.8).",
+        default=TRAIN_RATIO,
+        help="Fraction of video groups assigned to train (defaults to config block).",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed used to split video groups (default: 42).",
+        default=RANDOM_SEED,
+        help="Random seed used to split video groups (defaults to config block).",
     )
     parser.add_argument(
         "--group-regex",
+        default=GROUP_REGEX,
         help=(
             "Regex used on each image stem to derive the source-video group. "
             "It must contain one capture group, e.g. ^(.*)_\\d{6}$."
@@ -135,6 +195,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-missing-json",
         action="store_true",
+        default=ALLOW_MISSING_JSON,
         help=(
             "Treat an image without JSON as an intentional negative sample. "
             "Without this flag, missing JSON is an error."
@@ -143,6 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-yaml",
         action="store_true",
+        default=FORCE_CLASSES_YAML,
         help="Allow replacement of an existing different classes YAML.",
     )
     return parser.parse_args()
@@ -534,4 +596,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if PAUSE_ON_EXIT:
+        input("Press Enter to close...")
+    raise SystemExit(exit_code)
