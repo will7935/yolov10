@@ -89,6 +89,11 @@ CLASSES = DETECT_CLASSES if TRAINING_PROFILE == "detect" else SEGMENT_CLASSES
 TRAIN_RATIO = 0.8
 RANDOM_SEED = 42
 
+# With only one source video, "temporal" assigns the earlier frames to train
+# and the later frames to val without random mixing. Use "error" to require
+# independent source videos (recommended for final evaluation).
+SINGLE_GROUP_POLICY = "temporal"
+
 # Leave as None for names such as video01_000001.jpg. For another naming
 # scheme, provide a regex whose first capture group is the video name, e.g.
 # r"^(.*)_\d{6}$".
@@ -104,6 +109,11 @@ MISSING_JSON_POLICY = "skip"
 # Ignore labels not listed in the active profile instead of treating them as
 # errors. A listed class with the wrong shape type still raises an error.
 IGNORE_UNLISTED_LABELS = True
+
+# For an unfinished mixed-label project, skip JSON files that contain no
+# annotations for the active profile. Change to "keep" only after confirming
+# those images are genuine negatives for the active task.
+EMPTY_ACTIVE_LABEL_POLICY = "skip"
 
 # Optional Detect-only compatibility behavior. Keep False to preserve the
 # original polygon annotations and reject accidental conversion to boxes.
@@ -211,6 +221,12 @@ def parse_args() -> argparse.Namespace:
         help="Random seed used to split video groups (defaults to config block).",
     )
     parser.add_argument(
+        "--single-group-policy",
+        choices=("error", "temporal"),
+        default=SINGLE_GROUP_POLICY,
+        help="How to split when all images come from one video.",
+    )
+    parser.add_argument(
         "--group-regex",
         default=GROUP_REGEX,
         help=(
@@ -238,6 +254,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=not IGNORE_UNLISTED_LABELS,
         help="Fail instead of ignoring labels outside the active class profile.",
+    )
+    parser.add_argument(
+        "--empty-active-label-policy",
+        choices=("skip", "keep"),
+        default=EMPTY_ACTIVE_LABEL_POLICY,
+        help="How to handle JSON files with no labels for the active profile.",
     )
     parser.add_argument(
         "--strict-rectangles",
@@ -474,11 +496,13 @@ def collect_samples(
     task_type: str,
     convert_polygons_to_boxes: bool,
     ignore_unlisted_labels: bool,
-) -> tuple[list[Sample], Counter[str], list[Path]]:
+    empty_active_label_policy: str,
+) -> tuple[list[Sample], Counter[str], list[Path], int]:
     class_to_id = {name: index for index, name in enumerate(classes)}
     samples: list[Sample] = []
     total_counts: Counter[str] = Counter()
     missing_annotations: list[Path] = []
+    skipped_empty_active = 0
 
     for image in find_images(images_dir):
         relative = image.relative_to(images_dir)
@@ -495,6 +519,9 @@ def collect_samples(
             convert_polygons_to_boxes,
             ignore_unlisted_labels,
         )
+        if not rows and empty_active_label_policy == "skip":
+            skipped_empty_active += 1
+            continue
         total_counts.update(counts)
         samples.append(
             Sample(
@@ -520,7 +547,7 @@ def collect_samples(
             "'negative' only for reviewed negative images:\n"
             f"{preview}{suffix}"
         )
-    return samples, total_counts, missing_annotations
+    return samples, total_counts, missing_annotations, skipped_empty_active
 
 
 def render_names_yaml(classes: Sequence[str]) -> str:
@@ -574,17 +601,58 @@ def safe_output_stem(relative_image: Path) -> str:
     return "__".join(part.replace(" ", "_") for part in parts)
 
 
+def natural_path_key(path: Path) -> list[object]:
+    """Sort frame_2 before frame_10 even when names are not zero-padded."""
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", path.as_posix())
+    ]
+
+
 def prepare_dataset(
     output: Path,
     samples: Sequence[Sample],
     classes: Sequence[str],
     train_ratio: float,
     seed: int,
+    single_group_policy: str,
 ) -> tuple[Counter[str], dict[str, set[str]]]:
-    train_groups, val_groups = split_video_groups(samples, train_ratio, seed)
+    groups = sorted({sample.group for sample in samples})
+    sample_splits: dict[Path, str] = {}
+    if len(groups) == 1 and single_group_policy == "temporal":
+        ordered_samples = sorted(
+            samples, key=lambda sample: natural_path_key(sample.relative_image)
+        )
+        if len(ordered_samples) < 2:
+            raise PreparationError(
+                "A temporal train/val split requires at least two labeled images."
+            )
+        train_count = round(len(ordered_samples) * train_ratio)
+        train_count = max(1, min(len(ordered_samples) - 1, train_count))
+        for index, sample in enumerate(ordered_samples):
+            sample_splits[sample.image] = (
+                "train" if index < train_count else "val"
+            )
+        group = groups[0]
+        train_groups = {f"{group}:earlier"}
+        val_groups = {f"{group}:later"}
+        print(
+            "WARNING: Only one video group was found. Using a chronological "
+            "train/val split; use another video for reliable final evaluation."
+        )
+    else:
+        train_groups, val_groups = split_video_groups(samples, train_ratio, seed)
+        for sample in samples:
+            sample_splits[sample.image] = (
+                "train" if sample.group in train_groups else "val"
+            )
     ensure_empty_output(output)
     split_groups = {"train": train_groups, "val": val_groups}
     split_counts: Counter[str] = Counter()
+    split_instances = {
+        "train": Counter(),
+        "val": Counter(),
+    }
     used_names: set[str] = set()
 
     for split in ("train", "val"):
@@ -592,7 +660,7 @@ def prepare_dataset(
         (output / "labels" / split).mkdir(parents=True, exist_ok=True)
 
     for sample in samples:
-        split = "train" if sample.group in train_groups else "val"
+        split = sample_splits[sample.image]
         output_stem = safe_output_stem(sample.relative_image)
         if output_stem in used_names:
             raise PreparationError(
@@ -609,6 +677,9 @@ def prepare_dataset(
             encoding="utf-8",
         )
         split_counts[split] += 1
+        for row in sample.yolo_rows:
+            class_id = int(row.split(maxsplit=1)[0])
+            split_instances[split][class_id] += 1
 
     data_yaml = [
         f"path: {json.dumps(output.resolve().as_posix(), ensure_ascii=False)}",
@@ -619,6 +690,18 @@ def prepare_dataset(
         "",
     ]
     (output / "data.yaml").write_text("\n".join(data_yaml), encoding="utf-8")
+    print("Instances by split:")
+    for class_id, name in enumerate(classes):
+        train_instances = split_instances["train"][class_id]
+        val_instances = split_instances["val"][class_id]
+        print(
+            f"  {name}: train={train_instances}, val={val_instances}"
+        )
+        if train_instances == 0 or val_instances == 0:
+            print(
+                f"WARNING: Class {name!r} has no instances in "
+                f"{'train' if train_instances == 0 else 'val'}."
+            )
     return split_counts, split_groups
 
 
@@ -628,6 +711,7 @@ def print_summary(
     counts: Counter[str],
     missing_annotations: Sequence[Path],
     missing_json_policy: str,
+    skipped_empty_active: int,
 ) -> None:
     groups = defaultdict(int)
     for sample in samples:
@@ -644,6 +728,11 @@ def print_summary(
         print(f"Images skipped because JSON is missing: {len(missing_annotations)}")
     elif missing_annotations and missing_json_policy == "negative":
         print(f"Missing-JSON images included as negatives: {len(missing_annotations)}")
+    if skipped_empty_active:
+        print(
+            "JSON images skipped because the active profile has no labels: "
+            f"{skipped_empty_active}"
+        )
     converted_shapes = sum(sample.converted_shapes for sample in samples)
     if converted_shapes:
         print(
@@ -667,7 +756,7 @@ def main() -> int:
         if group_pattern is not None and group_pattern.groups < 1:
             raise PreparationError("--group-regex must contain a capture group.")
 
-        samples, counts, missing = collect_samples(
+        samples, counts, missing, skipped_empty_active = collect_samples(
             images_dir=images_dir,
             labels_dir=labels_dir,
             classes=classes,
@@ -676,8 +765,16 @@ def main() -> int:
             task_type=args.task,
             convert_polygons_to_boxes=not args.strict_rectangles,
             ignore_unlisted_labels=not args.strict_class_list,
+            empty_active_label_policy=args.empty_active_label_policy,
         )
-        print_summary(samples, classes, counts, missing, args.missing_json_policy)
+        print_summary(
+            samples,
+            classes,
+            counts,
+            missing,
+            args.missing_json_policy,
+            skipped_empty_active,
+        )
 
         classes_yaml = args.classes_yaml.expanduser().resolve()
         write_classes_yaml(classes_yaml, classes, args.force_yaml)
@@ -700,6 +797,7 @@ def main() -> int:
                 classes=classes,
                 train_ratio=args.train_ratio,
                 seed=args.seed,
+                single_group_policy=args.single_group_policy,
             )
             print(f"Prepared dataset YAML: {output_dataset / 'data.yaml'}")
             print(
