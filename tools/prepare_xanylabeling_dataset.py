@@ -53,7 +53,7 @@ IMAGES_DIR = Path(r"I:\youyan\camera_B_20260920_083913")
 
 # Run this script twice, changing only this value between "detect" and
 # "segment". Each profile keeps only its own classes and shape type.
-TRAINING_PROFILE = "segment"
+TRAINING_PROFILE = "detect"
 TASK_TYPE = TRAINING_PROFILE
 
 DETECT_CLASSES = [
