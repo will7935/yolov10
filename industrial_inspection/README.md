@@ -134,11 +134,15 @@ SOURCE_VIDEO = Path(r"I:\youyan\camera_B_20260918_112330.avi")
 MODEL_WEIGHTS = Path(r"I:\youyan\yolo_dataset\runs\yolov10s_detect_grouped\weights\best.pt")
 OUTPUT_ROOT = Path(r"I:\youyan\video_results")
 MAX_FRAMES = 0        # 0 处理整段；300 先试跑 300 帧
-SHOW_PREVIEW = True  # 显示检测窗口
+UI_ENABLED = True    # 使用 UI7V 的界面和视频显示
+SHOW_PREVIEW = False # 仅关闭 UI 后控制 OpenCV 预览
 ```
 
 在 PyCharm 中将项目解释器选为 `D:\Anaconda\envs\youyan311\python.exe`，
 右键 `predict_video.py` → Run。运行配置的脚本参数留空。
+默认打开 `UI7V.py` 的 PyQt5 界面，点击“开始检测”启动本地视频推理，
+点击“停止检测”或关闭窗口会在当前帧完成后保存已有结果。左侧显示检测数量、运行日志和错误，
+右侧按比例显示检测画面。需要在该解释器中安装 `PyQt5`；本地视频界面不依赖原 UI 的 `ABCDE`、`haxi` 模块。
 配置中的输入路径必须指向具体视频文件，输出根目录可已存在；每次运行自动创建新的子目录。
 无需手动设置工作目录。`CONFIDENCE`、`IMAGE_SIZE`、`DEVICE`、`FRAME_STRIDE` 也可在配置区修改。
 
@@ -170,7 +174,8 @@ Set-Location E:\GitHub\yolov10
 | 参数 | 用途 |
 | --- | --- |
 | `--max-frames 300` | 仅处理 300 帧试跑；默认 0 表示整段 |
-| `--show` | 显示实时预览，按 Q / Escape 停止 |
+| `--no-ui` | 直接运行命令行批处理，不打开 PyQt5 界面 |
+| `--no-ui --show` | 命令行模式显示 OpenCV 预览，按 Q / Escape 停止 |
 | `--conf 0.35` | 提高检测置信度门槛；降低可增加检出，也可能增加误报 |
 | `--device cpu` | 使用 CPU，默认有 CUDA 时使用 GPU 0 |
 | `--stride 2` | 每两帧处理一帧，输出 FPS 同时减半以保持播放时长近似一致 |

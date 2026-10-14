@@ -1,4 +1,4 @@
-"""Run YOLOv10 on one local video and stream detections to disk."""
+"""Detect a local video with the UI7V interface and stream results to disk."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+# 将项目根目录加入搜索路径，便于在编辑器中直接运行脚本并导入本地模块。
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
@@ -33,12 +34,13 @@ MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs
 OUTPUT_ROOT = Path(r"I:\youyan\test_dataset")
 # 例如改为：OUTPUT_ROOT = Path(r"I:\youyan\video_results")
 
-CONFIDENCE = 0.5
-IMAGE_SIZE = 1280
+CONFIDENCE = 0.35        # 检测分数门槛；降低可减少部分漏检，也可能增加误报，不等于准确率
+IMAGE_SIZE = 1280        # 推理输入尺寸；输出视频和记录坐标仍使用原图分辨率
 DEVICE = "0"          # "auto" 自动选择 GPU/CPU；"0" 使用 GPU 0；"cpu" 使用 CPU
 FRAME_STRIDE = 1         # 1 = 逐帧；2 = 每两帧处理一帧
 MAX_FRAMES = 0           # 0 = 整段视频；300 = 只处理 300 帧试跑
-SHOW_PREVIEW = False     # True = 显示检测窗口，按 Q / Escape 停止
+UI_ENABLED = True       # True = UI7V 界面，点击开始/停止；False = 命令行批处理
+SHOW_PREVIEW = False     # 仅命令行模式：True 显示 OpenCV 窗口，Q / Escape 停止
 DISPLAY_STYLE = "point" # "point"：中心点＋标注；"box"：原来的矩形框＋标注
 SHOW_LABELS = True       # True：显示类别名；False：只画点/框，同时隐藏置信度文字
 SHOW_CONFIDENCE = True   # 显示标签时，True：附带置信度；False：只显示类别名
@@ -64,6 +66,8 @@ def load_detection_model(weights):
     from ultralytics import YOLO, YOLOv10
     from ultralytics.nn.tasks import YOLOv10DetectionModel
 
+    # 根据权重内部架构选择预测器，不能靠目录名或 best.pt 文件名判断版本。
+    # YOLOv8 与 YOLOv10 后处理不同，加载类错误可能导致重复框。
     model = YOLO(str(weights.resolve()))
     if isinstance(model.model, YOLOv10DetectionModel) and not isinstance(model, YOLOv10):
         model = YOLOv10(str(weights.resolve()))
@@ -78,11 +82,13 @@ def slot_keep_indices(boxes, names, threshold):
     Hands/guns/handles can overlap valid slots and must not suppress them.
     This is geometric deduplication, not an occupancy correctness guarantee.
     """
+    # 只对空槽/满槽做跨类别去重；手、水枪、把手与槽位重叠时仍需保留。
     slot_ids = {int(i) for i, name in names.items()
                 if name in {"wafer_slot_empty", "wafer_slot_filled"}}
     classes = boxes.cls.tolist()
     coords = boxes.xyxy.tolist()
     scores = boxes.conf.tolist()
+    # 高分框优先保留，后续框只与已经保留的槽位比较。
     candidates = sorted((i for i, cls in enumerate(classes) if int(cls) in slot_ids),
                         key=lambda i: scores[i], reverse=True)
     kept_slots = []
@@ -91,18 +97,21 @@ def slot_keep_indices(boxes, names, threshold):
         a = coords[i]
         for j in kept_slots:
             b = coords[j]
+            # IoU = 交集面积 / 并集面积；阈值过低可能把相邻真实槽位误当成重复。
             intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
             union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - intersection
             if union > 0 and intersection / union > threshold:
                 suppressed.append(i)
                 break
         else:
+            # for-else：与所有保留框比较后均未触发 break，才接纳该槽位框。
             kept_slots.append(i)
     removed = set(suppressed)
     return [i for i in range(len(boxes)) if i not in removed], suppressed
 
 
-def main() -> None:
+def parse_args(argv=None):
+    # 1. 参数与输入检查：直接运行时使用顶部配置，也支持命令行临时覆盖。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=SOURCE_VIDEO, help="Input video file")
     parser.add_argument("--weights", type=Path, default=MODEL_WEIGHTS)
@@ -112,6 +121,8 @@ def main() -> None:
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--stride", type=int, default=FRAME_STRIDE, help="Process every Nth frame; output FPS is reduced accordingly")
     parser.add_argument("--max-frames", type=int, default=MAX_FRAMES, help="Maximum processed frames, 0 means entire video")
+    parser.add_argument("--ui", action=argparse.BooleanOptionalAction, default=UI_ENABLED,
+                        help="Use the UI7V interface; --no-ui runs the command-line batch mode")
     parser.add_argument("--show", action=argparse.BooleanOptionalAction, default=SHOW_PREVIEW,
                         help="Show preview; press Q or Escape to stop")
     parser.add_argument("--nms-iou", type=float, default=NMS_IOU)
@@ -128,7 +139,8 @@ def main() -> None:
     parser.add_argument("--roi-file", type=Path, default=SLOT_ROI_FILE)
     parser.add_argument("--reselect-roi", action=argparse.BooleanOptionalAction, default=ROI_RESELECT)
     parser.add_argument("--roi-select-frame", type=int, default=ROI_SELECT_FRAME)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    # 在加载模型和创建输出目录之前检查参数，便于及早定位路径或配置错误。
     if args.device == "auto":
         args.device = "0" if torch.cuda.is_available() else "cpu"
     if not 0 < args.conf < 1 or args.stride < 1 or args.max_frames < 0 or args.imgsz < 32:
@@ -139,17 +151,56 @@ def main() -> None:
         parser.error("Require display-style box/point, point-radius 1..20, point-font-scale 0.1..2")
     if not args.source.is_file() or not args.weights.is_file():
         parser.error("Input video and weights must exist")
+    return args
 
-    # The trusted official/self-trained checkpoints in this older repository
-    # contain a serialized model, not only tensors (PyTorch 2.6+ compatibility).
+
+def prepare_slot_roi(args):
+    """Prepare interactive ROI on the GUI thread before starting inference."""
+    if not args.slot_roi:
+        return None
+    roi_path = args.roi_file or args.source.with_name(args.source.stem + "_slot_roi.json")
+    cap = cv2.VideoCapture(str(args.source.resolve()))
+    try:
+        ok, reference = cap.read()
+        if not ok:
+            raise RuntimeError("Cannot read video to initialize slot ROI")
+        height, width = reference.shape[:2]
+    finally:
+        cap.release()
+    if args.reselect_roi or not roi_path.is_file():
+        select_roi(args.source, roi_path, args.roi_select_frame)
+    return load_roi(roi_path, (width, height))
+
+
+def run_prediction(args, *, on_frame=None, on_log=None, should_stop=None, roi_polygon=None):
+    """Process every selected frame; callbacks connect the same pipeline to Qt."""
+    def log(message):
+        print(message, flush=True)
+        if on_log is not None:
+            on_log(message)
+
+    def stopped():
+        return should_stop is not None and should_stop()
+
+    if args.slot_roi and roi_polygon is None:
+        roi_polygon = prepare_slot_roi(args)
+
+    # 2. 加载模型：兼容 PyTorch 2.6+ 默认 weights_only=True 的变化。
+    # 本项目权重包含序列化模型对象，因此仅对可信的本地权重使用完整加载。
     original_load = torch.load
 
     def trusted_load(*load_args, **load_kwargs):
         load_kwargs.setdefault("weights_only", False)
         return original_load(*load_args, **load_kwargs)
 
+    log(f"Loading model: {args.weights.resolve()}")
     torch.load = trusted_load
-    model, architecture = load_detection_model(args.weights)
+    try:
+        model, architecture = load_detection_model(args.weights)
+    finally:
+        torch.load = original_load
+    log(f"{architecture} detection engine ready")
+    # 3. 初始化视频与运行统计；read_frames 含跳过帧，processed 只计实际推理帧。
     cap = cv2.VideoCapture(str(args.source.resolve()))
     writer = None
     processed = 0
@@ -157,7 +208,6 @@ def main() -> None:
     status = "failed"
     suppressed_total = 0
     roi_excluded_total = 0
-    roi_polygon = None
     roi_path = args.roi_file or args.source.with_name(args.source.stem + "_slot_roi.json")
     started = time.perf_counter()
     output = args.output_dir or OUTPUT_ROOT / (
@@ -170,19 +220,10 @@ def main() -> None:
         if not math.isfinite(fps) or fps <= 0:
             raise RuntimeError("Video has invalid FPS; repair the file before inference")
         source_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if args.slot_roi:
-            ok, reference = cap.read()
-            if not ok:
-                raise RuntimeError("Cannot read video to initialize slot ROI")
-            ref_height, ref_width = reference.shape[:2]
-            cap.release()
-            if args.reselect_roi or not roi_path.is_file():
-                select_roi(args.source, roi_path, args.roi_select_frame)
-            roi_polygon = load_roi(roi_path, (ref_width, ref_height))
-            cap = cv2.VideoCapture(str(args.source.resolve()))
-            if not cap.isOpened():
-                raise RuntimeError("Cannot reopen video after ROI setup")
-            print(f"Using slot ROI: {roi_path.resolve()}", flush=True)
+        # ROI 已在推理前准备好；区域只是位置筛选，不能自动跟随门体位置。
+        if roi_polygon is not None:
+            log(f"Using slot ROI: {roi_path.resolve()}")
+        # 5. 创建独立结果目录，记录本次配置；已有目录不会被覆盖。
         output.mkdir(parents=True, exist_ok=False)
         names = dict(model.names)
         summary = {"source": str(args.source.resolve()), "weights": str(args.weights.resolve()),
@@ -200,23 +241,32 @@ def main() -> None:
                    "slot_roi_file": str(roi_path.resolve()) if args.slot_roi else None,
                    "slot_roi_polygon_normalized": roi_polygon.tolist() if roi_polygon is not None else None,
                    "slot_roi_filter_rule": "slot_box_center_inside_polygon",
-                   "classes": names, "output_video": str((output / "annotated.mp4").resolve()),
+                   "classes": names, "output_dir": str(output.resolve()),
+                   "output_video": str((output / "annotated.mp4").resolve()),
                    "timestamp_method": "zero-based source_frame / source_fps; constant-frame-rate video",
                    "audio_included": False}
+        # JSONL 每个已处理帧一行，含最终检测和被过滤的框；CSV 保存每帧类别框数。
+        # 边推理边写入，避免整段视频结果驻留内存；utf-8-sig 方便 Excel 读取 CSV。
         with (output / "detections.jsonl").open("w", encoding="utf-8") as json_file, (
             output / "frame_counts.csv"
         ).open("w", encoding="utf-8-sig", newline="") as csv_file:
             counts_writer = csv.DictWriter(csv_file, fieldnames=["source_frame", "time_seconds", *names.values()])
             counts_writer.writeheader()
+            # 6. 逐帧流程：读帧 → 全图检测 → ROI 筛选 → 槽位去重 → 保存与绘制。
             while True:
+                if stopped():
+                    status = "user_stopped"
+                    break
                 ok, frame = cap.read()
                 if not ok:
                     status = "end_of_stream"
                     break
                 index = read_frames
                 read_frames += 1
+                # 源帧号从 0 开始；跳帧后仍使用原帧号计算源视频时间。
                 if index % args.stride:
                     continue
+                # 首个处理帧确定输出尺寸；帧率除以 stride，保持采样视频的播放时长。
                 if writer is None:
                     height, width = frame.shape[:2]
                     writer = cv2.VideoWriter(str(output / "annotated.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
@@ -224,11 +274,13 @@ def main() -> None:
                     if not writer.isOpened():
                         raise RuntimeError("Cannot create MP4 video writer")
                     summary["frame_size"] = [width, height]
+                # 全图检测保留手、把手、水枪；YOLOv8 在此执行同类别 NMS。
                 result = model.predict(frame, imgsz=args.imgsz, conf=args.conf, device=args.device,
                                        iou=args.nms_iou, agnostic_nms=False, verbose=False, save=False)[0]
                 raw_box_count = len(result.boxes)
                 roi_excluded = []
                 if roi_polygon is not None:
+                    # 只排除中心点位于 ROI 外的槽位，其他类别不受限制；保留排除记录供复核。
                     raw_boxes = result.boxes.cpu()
                     keep, excluded = filter_slot_indices(raw_boxes, names, roi_polygon, (frame.shape[1], frame.shape[0]))
                     roi_excluded = [{"class_name": names[int(raw_boxes.cls[i].item())],
@@ -238,6 +290,7 @@ def main() -> None:
                     result = result[keep]
                 suppressed_objects = []
                 if args.slot_deduplicate:
+                    # 对 ROI 内空/满槽再去重；高分优先仅是几何处理，不保证空满判断正确。
                     raw_boxes = result.boxes.cpu()
                     keep, suppressed = slot_keep_indices(raw_boxes, names, args.slot_duplicate_iou)
                     suppressed_objects = [{"class_name": names[int(raw_boxes.cls[i].item())],
@@ -245,11 +298,13 @@ def main() -> None:
                                            "xyxy": raw_boxes.xyxy[i].tolist()} for i in suppressed]
                     suppressed_total += len(suppressed)
                     result = result[keep]
+                # 统一最终结果，供 JSON、CSV 和显示共用；xyxy 是原图像素坐标。
                 boxes = result.boxes.cpu()
                 objects = [{"class_id": int(cls), "class_name": names[int(cls)],
                             "confidence": round(float(conf), 6), "xyxy": [round(float(v), 2) for v in xyxy]}
                            for xyxy, cls, conf in zip(boxes.xyxy.tolist(), boxes.cls.tolist(), boxes.conf.tolist())]
                 timestamp = round(index / fps, 6)
+                # 这里统计的是单帧检测框数，尚不是逐槽稳定状态、晶圆总量或放入次数。
                 counts = Counter(obj["class_name"] for obj in objects)
                 json_file.write(json.dumps({"source_frame": index, "time_seconds": timestamp,
                                             "raw_box_count": raw_box_count,
@@ -258,6 +313,7 @@ def main() -> None:
                                             "detections": objects}, ensure_ascii=False) + "\n")
                 counts_writer.writerow({"source_frame": index, "time_seconds": timestamp,
                                         **{name: counts[name] for name in names.values()}})
+                # 7. 可视化：点模式在框中心绘制标注；显示开关不改变检测与计数。
                 if args.display_style == "point":
                     plotted = draw_detection_points(frame, objects, show_labels=args.show_labels,
                         show_confidence=args.show_confidence, radius=args.point_radius,
@@ -269,10 +325,17 @@ def main() -> None:
                     draw_roi(plotted, roi_polygon)
                 writer.write(plotted)
                 processed += 1
+                if on_frame is not None:
+                    on_frame(plotted, {"status": f"已处理 {processed} 帧 · 视频 {timestamp:.2f}s",
+                                       "result": ", ".join(f"{name}: {count}" for name, count in counts.items()) or "未检测到目标",
+                                       "frame_id": processed, "source_frame": index,
+                                       "time_seconds": timestamp, "counts": dict(counts)})
+                # 每 100 个处理帧报告进度，避免逐帧打印拖慢推理。
                 if processed == 1 or processed % 100 == 0:
                     elapsed = time.perf_counter() - started
-                    print(f"Processed {processed} frames, source time {timestamp:.2f}s, "
-                          f"average {processed / elapsed:.1f} frames/s", flush=True)
+                    log(f"Processed {processed} frames, source time {timestamp:.2f}s, "
+                        f"average {processed / elapsed:.1f} frames/s")
+                # 预览按键或处理帧数上限可提前停止，结束原因写入 summary.json。
                 if args.show:
                     cv2.imshow("YOLO detection (Q/Escape to stop)", plotted)
                     if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
@@ -282,8 +345,10 @@ def main() -> None:
                     status = "frame_limit"
                     break
     except KeyboardInterrupt:
+        # Ctrl+C 按已处理部分收尾，视频写入器仍需释放才能完成文件封装。
         status = "interrupted"
     finally:
+        # 8. 释放资源并保存摘要；异常退出时也保留已有进度，其他异常继续向外抛出。
         cap.release()
         if writer is not None:
             writer.release()
@@ -295,10 +360,26 @@ def main() -> None:
                            roi_excluded_slot_boxes=roi_excluded_total,
                            elapsed_seconds=round(time.perf_counter() - started, 3))
             (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    if processed == 0:
+    if processed == 0 and status != "user_stopped":
         raise RuntimeError("No video frames were processed")
-    print(f"Finished ({status}). Results: {output.resolve()}", flush=True)
+    log(f"Finished ({status}). Results: {output.resolve()}")
+    return summary
+
+
+def main() -> None:
+    args = parse_args()
+    if args.ui:
+        try:
+            from industrial_inspection.tools.predict_video_ui import launch_ui
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("PyQt5"):
+                raise RuntimeError("UI mode requires PyQt5: install it with 'pip install PyQt5', or use --no-ui") from exc
+            raise
+        launch_ui(args, run_prediction, prepare_slot_roi)
+    else:
+        run_prediction(args)
 
 
 if __name__ == "__main__":
+    # 直接运行打开 UI7V 界面；--no-ui 保留批处理，被导入时不会自动执行。
     main()
