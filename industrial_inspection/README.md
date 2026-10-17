@@ -193,23 +193,22 @@ Set-Location E:\GitHub\yolov10
 
 ### 视频标签文字显示
 
-支持点标注，默认 `DISPLAY_STYLE="point"`。每个目标在检测框中心画一个彩色点，
-附近显示短名称（empty / filled / hand / handle / gun），并尝试避开其他标签。
+默认 `DISPLAY_STYLE="point"`。每个目标在检测框中心只画一个彩色点，
+画面左上角固定显示所有类别的颜色图例（hand / handle / gun / empty / filled）。
+识别点旁不显示名称、置信度或连线；图例颜色与识别点一致，无检测目标时也保留图例。
 点不代表模型预测的关键点；只是现有检测框中心的可视化。
 
 ```python
 DISPLAY_STYLE = "point"  # "box" 恢复原矩形框显示
 POINT_RADIUS = 4
-POINT_FONT_SCALE = 0.4
-SHOW_LABELS = True
-SHOW_CONFIDENCE = False  # 点旁只显示短名称，更简洁
+POINT_FONT_SCALE = 0.4   # 左上角图例文字大小
 ```
 
-`POINT_LABEL_NAMES` 可修改点模式的显示名。点/框切换作用于视频和实时预览，
+`POINT_LABEL_NAMES` 可修改图例的显示名。点/框切换作用于视频和实时预览，
 检测、ROI、去重、计数和 JSON 中的原始 xyxy 坐标保持原有逻辑。
-点模式中 `SHOW_LABELS=False` 只画点；框模式中只画框。
+`SHOW_LABELS` 和 `SHOW_CONFIDENCE` 只控制框模式的标注，点模式始终显示点与图例。
 
-在 `tools/predict_video.py` 顶部直接设置，无需终端：
+框模式可在 `tools/predict_video.py` 顶部直接设置，无需终端：
 
 ```python
 SHOW_LABELS = False       # False：只画框；True：显示类别名

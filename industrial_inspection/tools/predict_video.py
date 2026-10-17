@@ -20,7 +20,7 @@ import cv2
 import torch
 
 from industrial_inspection.tools.slot_roi import draw_roi, filter_slot_indices, load_roi, select_roi
-from industrial_inspection.tools.detection_display import draw_detection_points
+from industrial_inspection.tools.detection_display import draw_detection_legend, draw_detection_points
 
 
 # =============================================================================
@@ -38,16 +38,16 @@ CONFIDENCE = 0.35        # 检测分数门槛；降低可减少部分漏检，�
 IMAGE_SIZE = 1280        # 推理输入尺寸；输出视频和记录坐标仍使用原图分辨率
 DEVICE = "0"          # "auto" 自动选择 GPU/CPU；"0" 使用 GPU 0；"cpu" 使用 CPU
 FRAME_STRIDE = 1         # 1 = 逐帧；2 = 每两帧处理一帧
-MAX_FRAMES = 0           # 0 = 整段视频；300 = 只处理 300 帧试跑
+MAX_FRAMES = 1000           # 0 = 整段视频；300 = 只处理 300 帧试跑
 UI_ENABLED = True       # True = UI7V 界面，点击开始/停止；False = 命令行批处理
 SHOW_PREVIEW = False     # 仅命令行模式：True 显示 OpenCV 窗口，Q / Escape 停止
-DISPLAY_STYLE = "point" # "point"：中心点＋标注；"box"：原来的矩形框＋标注
-SHOW_LABELS = True       # True：显示类别名；False：只画点/框，同时隐藏置信度文字
-SHOW_CONFIDENCE = True   # 显示标签时，True：附带置信度；False：只显示类别名
+DISPLAY_STYLE = "point" # "point"：中心点＋左上角颜色图例；"box"：矩形框＋标注
+SHOW_LABELS = True       # 仅框模式：True 显示类别名；False 只画框
+SHOW_CONFIDENCE = True   # 仅框模式：显示标签时附带置信度
 POINT_RADIUS = 4         # 点半径，单位像素
-POINT_FONT_SCALE = 0.4   # 点标注文字大小
-# 点模式使用简短名称；修改右侧显示名即可，JSON/CSV 仍记录模型原类别名。
-POINT_LABEL_NAMES = {"hand": "hand", "hatch_handle": "handle", "water_gun": "gun",
+POINT_FONT_SCALE = 0.4   # 左上角图例文字大小
+# 图例使用简短名称；修改右侧显示名即可，JSON/CSV 仍记录模型原类别名。
+POINT_LABEL_NAMES = {"hand": "hand", "hatch_handle": "handle", "water_gun": "water_gun",
                      "wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}
 NMS_IOU = 0.70          # YOLOv8 同类别 NMS；YOLOv10 的原生后处理不使用此阈值
 SLOT_DEDUPLICATE = True # 对空槽/满槽一起去重，仅保留高度重叠框中分数较高者
@@ -127,9 +127,9 @@ def parse_args(argv=None):
                         help="Show preview; press Q or Escape to stop")
     parser.add_argument("--nms-iou", type=float, default=NMS_IOU)
     parser.add_argument("--show-labels", action=argparse.BooleanOptionalAction, default=SHOW_LABELS,
-                        help="Draw class labels; when disabled, draw markers without text")
+                        help="Draw class labels in box mode; point mode always uses a color legend")
     parser.add_argument("--show-confidence", action=argparse.BooleanOptionalAction, default=SHOW_CONFIDENCE,
-                        help="Include confidence in visible class labels")
+                        help="Include confidence in box-mode class labels")
     parser.add_argument("--display-style", choices=("box", "point"), default=DISPLAY_STYLE)
     parser.add_argument("--point-radius", type=int, default=POINT_RADIUS)
     parser.add_argument("--point-font-scale", type=float, default=POINT_FONT_SCALE)
@@ -230,7 +230,9 @@ def run_prediction(args, *, on_frame=None, on_log=None, should_stop=None, roi_po
                    "source_fps": fps, "source_frames_reported": source_frames,
                    "output_fps": fps / args.stride, "stride": args.stride,
                    "conf": args.conf, "imgsz": args.imgsz, "device": args.device,
-                   "show_labels": args.show_labels, "show_confidence": args.show_labels and args.show_confidence,
+                   "show_labels": args.display_style == "box" and args.show_labels,
+                   "show_confidence": args.display_style == "box" and args.show_labels and args.show_confidence,
+                   "point_legend": args.display_style == "point", "point_legend_position": "top_left",
                    "display_style": args.display_style,
                    "point_radius": args.point_radius, "point_font_scale": args.point_font_scale,
                    "point_label_names": POINT_LABEL_NAMES, "point_position": "detection_box_center",
@@ -313,16 +315,17 @@ def run_prediction(args, *, on_frame=None, on_log=None, should_stop=None, roi_po
                                             "detections": objects}, ensure_ascii=False) + "\n")
                 counts_writer.writerow({"source_frame": index, "time_seconds": timestamp,
                                         **{name: counts[name] for name in names.values()}})
-                # 7. 可视化：点模式在框中心绘制标注；显示开关不改变检测与计数。
+                # 7. 点模式仅画中心点，类别通过左上角图例说明；不改变检测与计数。
                 if args.display_style == "point":
-                    plotted = draw_detection_points(frame, objects, show_labels=args.show_labels,
-                        show_confidence=args.show_confidence, radius=args.point_radius,
-                        font_scale=args.point_font_scale, label_names=POINT_LABEL_NAMES)
+                    plotted = draw_detection_points(frame, objects, radius=args.point_radius)
                 else:
                     plotted = result.plot(line_width=2, font_size=12,
                                           labels=args.show_labels, conf=args.show_confidence)
                 if roi_polygon is not None and DRAW_SLOT_ROI:
                     draw_roi(plotted, roi_polygon)
+                if args.display_style == "point":
+                    draw_detection_legend(plotted, names, radius=args.point_radius,
+                                          font_scale=args.point_font_scale, label_names=POINT_LABEL_NAMES)
                 writer.write(plotted)
                 processed += 1
                 if on_frame is not None:
