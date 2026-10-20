@@ -6,11 +6,15 @@ import argparse
 import sys
 import threading
 import traceback
+from pathlib import Path
 
 from PyQt5.QtCore import QThread, pyqtSignal
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import (
+    QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QVBoxLayout)
 
 from industrial_inspection.tools.UI7V import MainWindow
+from industrial_inspection.tools.slot_roi import DEFAULT_SLOT_ROI_FILE
 
 
 class VideoPredictionThread(QThread):
@@ -68,6 +72,7 @@ class VideoMainWindow(MainWindow):
         self.image_label.setText("本地视频画面")
         self.start_btn.setText("▶️ 开始检测")
         self.stop_btn.setText("⏹️ 停止检测")
+        self.setup_roi_controls()
         self.status_label.setWordWrap(True)
         self.log_text.document().setMaximumBlockCount(1000)
         self.err_text.document().setMaximumBlockCount(1000)
@@ -78,6 +83,53 @@ class VideoMainWindow(MainWindow):
             self.add_log(f"模型: {args.weights.resolve()}")
             self.add_log("点击开始检测；每次运行保存到独立结果目录。")
 
+    def setup_roi_controls(self):
+        self.roi_controls = QGroupBox("槽位 ROI")
+        layout = QVBoxLayout(self.roi_controls)
+        self.roi_mode = QComboBox()
+        self.roi_mode.addItem("读取配置", "config")
+        self.roi_mode.addItem("手动划分", "manual")
+        initial_mode = "manual" if getattr(self.args, "reselect_roi", False) else "config"
+        self.roi_mode.setCurrentIndex(1 if initial_mode == "manual" else 0)
+        path = Path(getattr(self.args, "roi_file", None) or DEFAULT_SLOT_ROI_FILE)
+        self._roi_mode = initial_mode
+        self._roi_paths = {
+            "config": str(path),
+            "manual": str(path if initial_mode == "manual" else
+                          self.args.source.with_name(self.args.source.stem + "_slot_roi.json"))}
+        layout.addWidget(self.roi_mode)
+        self.roi_path_label = QLabel()
+        layout.addWidget(self.roi_path_label)
+        row = QHBoxLayout()
+        self.roi_path = QLineEdit(self._roi_paths[initial_mode])
+        self.roi_path.setMinimumWidth(0)
+        self.roi_browse = QPushButton("选择文件…")
+        row.addWidget(self.roi_path, 1)
+        row.addWidget(self.roi_browse)
+        layout.addLayout(row)
+        self.roi_mode.currentIndexChanged.connect(self.change_roi_mode)
+        self.roi_browse.clicked.connect(self.choose_roi_file)
+        self.change_roi_mode()
+        self.status_label.parentWidget().layout().insertWidget(2, self.roi_controls)
+        self.roi_controls.setVisible(getattr(self.args, "slot_roi", True))
+
+    def change_roi_mode(self):
+        self._roi_paths[self._roi_mode] = self.roi_path.text()
+        self._roi_mode = self.roi_mode.currentData()
+        self.roi_path.setText(self._roi_paths[self._roi_mode])
+        self.roi_path_label.setText("保存到：" if self._roi_mode == "manual" else "配置文件：")
+
+    def choose_roi_file(self):
+        path = self.roi_path.text()
+        if self.roi_mode.currentData() == "manual":
+            selected, _ = QFileDialog.getSaveFileName(self, "保存 ROI 配置", path, "ROI 配置 (*.json)")
+        else:
+            selected, _ = QFileDialog.getOpenFileName(self, "读取 ROI 配置", path, "ROI 配置 (*.json)")
+        if selected:
+            if self.roi_mode.currentData() == "manual" and not Path(selected).suffix:
+                selected += ".json"
+            self.roi_path.setText(selected)
+
     def start_monitoring(self):
         if self.thread is not None:
             return
@@ -85,8 +137,15 @@ class VideoMainWindow(MainWindow):
             QMessageBox.warning(self, "输出目录已存在", "请使用尚不存在的 --output-dir，或省略该参数自动创建新目录。")
             return
         self.start_btn.setEnabled(False)
+        self.roi_controls.setEnabled(False)
         self.status_label.setText("准备槽位 ROI...")
         try:
+            if getattr(self.args, "slot_roi", True):
+                path = self.roi_path.text().strip()
+                if not path:
+                    raise ValueError("请选择要读取或保存的 ROI 配置文件。")
+                self.args.roi_file = Path(path)
+                self.args.reselect_roi = self.roi_mode.currentData() == "manual"
             # 交互圈选在主线程完成，读取已有 ROI 时不会弹出窗口。
             roi_polygon = self.prepare_roi(self.args)
         except Exception as exc:
@@ -95,8 +154,14 @@ class VideoMainWindow(MainWindow):
                 self.add_log(f"ROI 初始化失败: {exc}")
             self.err_text.append(str(exc))
             self.start_btn.setEnabled(True)
+            self.roi_controls.setEnabled(True)
             QMessageBox.critical(self, "初始化失败", str(exc))
             return
+        if getattr(self.args, "reselect_roi", False):
+            # 本次划分成功后直接复用保存结果，下次启动无需再画。
+            self._roi_paths["config"] = str(self.args.roi_file)
+            self.roi_mode.setCurrentIndex(0)
+            self.args.reselect_roi = False
         if self.group_completion_log_only:
             self.log_text.clear()
         self.thread = VideoPredictionThread(self.args, self.predict, roi_polygon, self)
@@ -131,9 +196,15 @@ class VideoMainWindow(MainWindow):
 
     def show_result(self, summary):
         reasons = {"end_of_stream": "视频检测完成", "frame_limit": "已达到处理帧数上限",
+                   "hatch_closed": "舱门已关闭，上料检测结束",
                    "user_stopped": "检测已停止", "interrupted": "检测已中断"}
         self.status_label.setText(f"{reasons.get(summary['status'], summary['status'])}\n"
                                   f"已处理 {summary['processed_frames']} 帧")
+        fullness = summary.get('loading_fullness_report')
+        if fullness is not None:
+            label = '最终结果' if fullness['finalized'] else '当前统计（未确认关门）'
+            self.status_label.setText(self.status_label.text()+
+                f"\n{label}：{fullness['result']}（{fullness['confirmed_filled_count']}/20）")
         if not self.group_completion_log_only:
             self.add_log(f"结果已保存: {summary['output_dir']}")
 
@@ -149,6 +220,7 @@ class VideoMainWindow(MainWindow):
         thread.deleteLater()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.roi_controls.setEnabled(True)
         if self.close_when_finished:
             self.close()
 

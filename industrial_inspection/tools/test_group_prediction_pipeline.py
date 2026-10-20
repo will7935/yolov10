@@ -37,6 +37,9 @@ class SyntheticModel:
 
 class PipelineTest(unittest.TestCase):
     def setUp(self):
+        hatch_control=patch.object(predict,'HATCH_CONTROL_ENABLED',False)
+        hatch_control.start()
+        self.addCleanup(hatch_control.stop)
         self.auto_load=patch.object(predict,'AUTO_LOAD_AFTER_UNLOAD',False)
         self.auto_load.start()
         self.addCleanup(self.auto_load.stop)
@@ -53,7 +56,7 @@ class PipelineTest(unittest.TestCase):
         before=boxes(old)+boxes(incoming,visible=(0,),filled=(0,))
         after=boxes(old)+boxes(incoming,visible=(0,))
         frames=[boxes()]*6+[before]*2+[after]*2+[
-            boxes(old)+boxes(incoming,visible=(1,2,3),filled=(1,2,3))]*3
+            boxes(old)+boxes(incoming,visible=(1,2,3),filled=(1,2,3))]*5
         with tempfile.TemporaryDirectory(prefix='wafer_incremental_entry_') as directory:
             root=Path(directory)
             source=root/'synthetic.mp4'

@@ -185,8 +185,9 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(result['slots'][0]['state'],'empty')
         self.assertEqual(result['initialization']['buffered_event_count'],1)
         self.assertEqual(result['new_events'],[])
-        # 首槽已遮挡，其余三槽才出现：不要求四槽同帧，也不等待停稳。
-        result=self.step(s,boxes(old)+boxes(incoming,visible=(1,2,3),filled=(1,2,3)))
+        # 首槽已遮挡，其余三槽才出现：不要求四槽同帧，三槽支持停稳后正式编号。
+        for _ in range(4):
+            result=self.step(s,boxes(old)+boxes(incoming,visible=(1,2,3),filled=(1,2,3)))
         self.assertEqual((result['group_id'],result['group_status']),(2,'active'))
         self.assertEqual(result['slot_numbering_status'],'final')
         event=result['new_events'][0]
@@ -208,7 +209,8 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(result['slots'][0]['state'],'filled')
         for _ in range(2):
             self.step(s,boxes(old)+boxes(incoming,visible=(3,)))
-        result=self.step(s,boxes(old)+boxes(incoming,visible=(0,1,2)))
+        for _ in range(4):
+            result=self.step(s,boxes(old)+boxes(incoming,visible=(0,1,2)))
         self.assertEqual(result['new_events'][0]['slot_id'],4)
         self.assertEqual(result['slots'][3]['last_confirmed_state'],'empty')
         np.testing.assert_allclose(s.tracker.points,incoming[[0,2,1,3]])
@@ -245,7 +247,7 @@ class GroupSequenceTests(unittest.TestCase):
             self.assertEqual(result['slots'][0]['state'],'filled')
             self.assertEqual(result['slots'][0]['center_xy'],[230.,200.])
             self.assertEqual(s.departing_seen[3],old_seen)
-        for _ in range(2):
+        for _ in range(4):
             result=self.step(s,boxes(old,visible=(0,1,2))+boxes(incoming,filled=(0,1,2,3)))
         self.assertEqual((result['group_id'],result['group_status']),(2,'active'))
         self.assertTrue(all(slot['state']=='filled' for slot in result['slots']))
@@ -466,8 +468,10 @@ class GroupSequenceTests(unittest.TestCase):
 
     def test_recorded_second_exit_keeps_old_duplicate_out_of_third_group(self):
         data=json.loads((Path(__file__).with_name('fixtures')/'second_roi_transition.json').read_text(encoding='utf-8'))
-        t=SlotGroupTracker(data['initial_centers'],group_id=2,confirm_seconds=.2,minimum_frames=3,match_distance_ratio=.46)
-        s=RoiGroupSequence(t,data['roi_pixels'],exit_min_slots=1,partial_exit_slots=1,exit_direction=(-1,-1))
+        t=SlotGroupTracker(data['initial_centers'],group_id=2,confirm_seconds=.2,minimum_frames=3,
+                           match_distance_ratio=.46,slot2_below_slot3=True)
+        s=RoiGroupSequence(t,data['roi_pixels'],exit_min_slots=1,partial_exit_slots=1,
+                           exit_direction=(-1,-1),entry_seconds=.3)
         first_full=None
         all_full=None
         for row in data['frames']:

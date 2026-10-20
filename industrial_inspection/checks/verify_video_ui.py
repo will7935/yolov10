@@ -87,6 +87,19 @@ class VideoWindowTests(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         self.assertIn("test inference started", window.log_text.toPlainText())
 
+    def test_hatch_fullness_result_is_visible_after_completion_or_early_stop(self):
+        window = self.make_window(lambda *args, **kwargs: None)
+        summary = self.summary('hatch_closed', 10)
+        summary['loading_fullness_report'] = {'finalized': True, 'result': '已放满',
+                                            'confirmed_filled_count': 20}
+        window.show_result(summary)
+        self.assertIn('舱门已关闭', window.status_label.text())
+        self.assertIn('最终结果：已放满（20/20）', window.status_label.text())
+        summary.update(status='frame_limit', loading_fullness_report={
+            'finalized': False, 'result': '未放满', 'confirmed_filled_count': 12})
+        window.show_result(summary)
+        self.assertIn('当前统计（未确认关门）：未放满（12/20）', window.status_label.text())
+
     def test_stop_and_close_finish_worker_before_window_is_destroyed(self):
         def predict(args, *, on_frame, on_log, should_stop, roi_polygon):
             count = 0
@@ -130,7 +143,64 @@ class VideoWindowTests(unittest.TestCase):
             window.start_btn.click()
         self.assertIsNone(window.thread)
         self.assertTrue(window.start_btn.isEnabled())
+        self.assertTrue(window.roi_controls.isEnabled())
         self.assertEqual(calls, [])
+
+    def test_selected_roi_configuration_reaches_preparation_and_worker(self):
+        prepared, detected = [], []
+        polygon = np.array([[.1, .1], [.9, .1], [.9, .9], [.1, .9]])
+
+        def prepare_roi(args):
+            prepared.append((args.roi_file, args.reselect_roi))
+            return polygon
+
+        def predict(args, *, roi_polygon, **kwargs):
+            detected.append((args.roi_file, roi_polygon))
+            return self.summary("frame_limit", 1)
+
+        window = self.make_window(predict, prepare_roi)
+        with patch("industrial_inspection.tools.predict_video_ui.QFileDialog.getOpenFileName",
+                   return_value=("D:/calibrations/custom.json", "ROI 配置 (*.json)")):
+            window.roi_browse.click()
+        window.start_btn.click()
+        self.wait_for(lambda: window.thread is None)
+        self.assertEqual(prepared, [(Path("D:/calibrations/custom.json"), False)])
+        self.assertEqual(detected[0][0], prepared[0][0])
+        np.testing.assert_array_equal(detected[0][1], polygon)
+
+    def test_manual_roi_saves_beside_video_and_is_reused_on_restart(self):
+        prepared = []
+
+        def prepare_roi(args):
+            prepared.append((args.roi_file, args.reselect_roi))
+            return np.array([[0, 0], [1, 0], [1, 1], [0, 1]])
+
+        window = self.make_window(lambda *args, **kwargs: self.summary("frame_limit", 1), prepare_roi)
+        original_path = window.roi_path.text()
+        window.roi_mode.setCurrentIndex(1)
+        self.assertEqual(Path(window.roi_path.text()), Path("test_slot_roi.json"))
+        window.roi_mode.setCurrentIndex(0)
+        self.assertEqual(window.roi_path.text(), original_path)
+        window.roi_mode.setCurrentIndex(1)
+        for _ in range(2):
+            window.start_btn.click()
+            self.wait_for(lambda: window.thread is None)
+            self.assertTrue(window.roi_controls.isEnabled())
+        self.assertEqual(prepared, [(Path("test_slot_roi.json"), True),
+                                    (Path("test_slot_roi.json"), False)])
+        self.assertEqual(window.roi_mode.currentData(), "config")
+
+    def test_manual_save_dialog_can_choose_target_or_be_cancelled(self):
+        window = self.make_window(lambda *args, **kwargs: None)
+        window.roi_mode.setCurrentIndex(1)
+        with patch("industrial_inspection.tools.predict_video_ui.QFileDialog.getSaveFileName",
+                   return_value=("D:/calibrations/drawn", "ROI 配置 (*.json)")):
+            window.roi_browse.click()
+        self.assertEqual(window.roi_path.text(), "D:/calibrations/drawn.json")
+        with patch("industrial_inspection.tools.predict_video_ui.QFileDialog.getSaveFileName",
+                   return_value=("", "")):
+            window.roi_browse.click()
+        self.assertEqual(window.roi_path.text(), "D:/calibrations/drawn.json")
 
 
 if __name__ == "__main__":

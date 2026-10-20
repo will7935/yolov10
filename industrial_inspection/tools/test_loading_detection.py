@@ -136,6 +136,11 @@ class LoadingEvidenceTests(unittest.TestCase):
 
 
 class LoadingPipelineTests(unittest.TestCase):
+    def setUp(self):
+        hatch_control = patch.object(predict, 'HATCH_CONTROL_ENABLED', False)
+        hatch_control.start()
+        self.addCleanup(hatch_control.stop)
+
     def run_case(self, *, visual_fill, group_id=1, max_frames=0):
         filled=set()
         frames=[boxes(),boxes()]

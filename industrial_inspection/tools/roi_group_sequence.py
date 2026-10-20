@@ -23,7 +23,7 @@ class RoiGroupSequence:
                  partial_exit_slots=2, minimum_motion_ratio=.5,
                  motion_pause_ratio=.18, entry_seconds=.5,
                  entry_stability_ratio=.12, entry_match_distance_px=40, exit_direction=None,
-                 auto_load_after_unload=False):
+                 auto_load_after_unload=False, entry_birth_fraction=.6):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
@@ -36,6 +36,8 @@ class RoiGroupSequence:
             raise ValueError("运动暂停比例须小于退出位移比例；停稳比例须在0..0.5之间")
         if not np.isfinite(entry_match_distance_px) or entry_match_distance_px <= 0:
             raise ValueError("新组逐点匹配距离须为正有限像素值")
+        if not np.isfinite(entry_birth_fraction) or not 0 < entry_birth_fraction <= 1:
+            raise ValueError("新轨迹入口深度比例须在0..1之间")
         self.enabled, self.buffer_px, self.margin = enabled, buffer_px, boundary_margin_px
         self.auto_load_after_unload = bool(auto_load_after_unload)
         self.exit_seconds, self.exit_min_slots = exit_seconds, exit_min_slots
@@ -43,6 +45,9 @@ class RoiGroupSequence:
         self.motion_pause_ratio, self.entry_seconds = motion_pause_ratio, entry_seconds
         self.entry_stability_ratio = entry_stability_ratio
         self.entry_match_distance_px = float(entry_match_distance_px)
+        self.entry_birth_fraction = float(entry_birth_fraction)
+        self._entry_rejected = []
+        self._entry_revision = 0
         self.configured_direction = None
         if exit_direction is not None:
             direction = np.asarray(exit_direction,dtype=float)
@@ -81,6 +86,60 @@ class RoiGroupSequence:
     def _distance(self, point):
         return cv2.pointPolygonTest(self.contour,tuple(float(v) for v in point),True)
 
+    def _entry_progress(self, point):
+        """沿已核实转位方向计算ROI内进度：入口为0，出口为1。"""
+        if self.configured_direction is None:
+            return None
+        polygon = self.contour.astype(float)
+        edges = np.roll(polygon, -1, axis=0)-polygon
+        normals = np.column_stack((-edges[:, 1], edges[:, 0]))
+        normals *= 1 if cv2.contourArea(self.contour, oriented=True) > 0 else -1
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-9)
+        signed = np.sum((np.asarray(point)-polygon)*normals, axis=1)
+        flow = normals @ self.configured_direction
+        entering, leaving = flow > 1e-6, flow < -1e-6
+        entry_distance = np.min(signed[entering]/flow[entering])
+        exit_distance = np.min(signed[leaving]/-flow[leaving])
+        return float(entry_distance/max(entry_distance+exit_distance, 1e-9))
+
+    def _admit_entry_objects(self, objects, tracker, now):
+        """已建立轨迹可走完整个ROI；新身份只能在入口侧建立。"""
+        # 多点模式本身等四槽整体停稳，保留原有完整组初始化路径。
+        if self.state != "entering":
+            return [o for o in objects if o["class_name"] not in SLOT_STATES or self._distance(
+                ((o["xyxy"][0]+o["xyxy"][2])/2, (o["xyxy"][1]+o["xyxy"][3])/2)) >= 0]
+        points = tracker._entry_points
+        if points is None:
+            points = tracker.reference_points
+        elif points:
+            points = [p for p, seen in zip(points, tracker._entry_seen_at)
+                      if now-seen <= tracker.lost_seconds]
+        result = []
+        # 至少两条入口轨迹已建立后，可接收入口处曾被遮挡的其他槽。
+        # 旧组的所有可见中心（含未编号框）由独立退出轨迹持续排除。
+        established_group = points is not None and len(points) >= 2
+        for obj in objects:
+            if obj["class_name"] not in SLOT_STATES:
+                result.append(obj)
+                continue
+            a = obj["xyxy"]
+            center = np.array([(a[0]+a[2])/2, (a[1]+a[3])/2])
+            established = (points is not None and len(points) and
+                np.min(np.linalg.norm(np.asarray(points)-center, axis=1)) <= self.entry_match_distance_px)
+            distance = self._distance(center)
+            if distance < 0:
+                if established and distance >= -self.buffer_px:
+                    result.append(obj)  # 临时T轨迹也必须看见真实越界，才能继续切组。
+                continue
+            progress = self._entry_progress(center)
+            late_visible = established_group and self._distance(center) >= self.margin
+            if established or progress is None or progress <= self.entry_birth_fraction or late_visible:
+                result.append(obj)
+            else:
+                self._entry_rejected.append({**obj, "center": center.tolist(),
+                    "reason": "new_track_outside_entry_region", "entry_progress": progress})
+        return result
+
     def _new_tracker(self, group_id, *, entry=False, phase=None):
         result = deepcopy(self.tracker)
         result.reset_group(group_id,phase=phase)
@@ -97,7 +156,7 @@ class RoiGroupSequence:
         self._restored_load_groups.add(tracker.group_id)
         previous = next((g for g in self.closed_groups
                          if g["phase"] == "unload" and g["group_id"] == tracker.group_id), None)
-        if previous is None:
+        if previous is None or previous["snapshot"].get("slot_numbering_status") == "provisional":
             return result
         new_events = list(result["new_events"])
         for slot, baseline in zip(tracker.slots, previous["snapshot"]["slots"]):
@@ -106,6 +165,7 @@ class RoiGroupSequence:
                 continue
             if slot.confirmed == "unknown":
                 slot.confirmed, slot.evidence_time = "empty", baseline["last_confirmed_at"]
+                slot.confirmed_since = slot.confirmed_at = baseline["last_confirmed_at"]
                 slot.confirmation_source = "previous_unload_yolo"
             elif slot.confirmed == "filled":
                 # 上料在正式编号前已完成时，空和满都必须有实际检测依据。
@@ -113,8 +173,9 @@ class RoiGroupSequence:
                 event = {"group_id":tracker.group_id,"slot_id":slot.slot_id,"phase":"load",
                     "from":"empty","to":"filled","action":"load","expected_action":True,
                     "time_lower":baseline["last_confirmed_at"],
-                    "time_upper":slot.candidate_since if slot.candidate == "filled" else slot.evidence_time,
-                    "confirmed_at":slot.evidence_time,"reported_at":float(now),
+                    "time_upper":slot.confirmed_since if slot.confirmed_since is not None else slot.evidence_time,
+                    "confirmed_at":slot.confirmed_at if slot.confirmed_at is not None else slot.evidence_time,
+                    "reported_at":float(now),
                     "recovered_before_initialization":True,"reason":"detected_after_unload_baseline"}
                 tracker.events.append(event)
                 new_events.append(event)
@@ -277,6 +338,8 @@ class RoiGroupSequence:
     def _close(self, now):
         self._finish_departing_load(now)
         snap = self.tracker.snapshot()
+        if self.tracker.points is None:
+            snap["provisional_events"] = deepcopy(self.tracker._entry_events)
         snap["group_assignment"] = "roi_exit_sequence"
         order = snap["order_result"]
         operation = "fail" if order == "fail" else ("pass" if order == "pass" and snap["all_four_target_previously_verified"] else "pending")
@@ -289,14 +352,16 @@ class RoiGroupSequence:
         self._group_events.append(record)
         # 组号立即切换，但旧组保留一个丢失时限供旋转后的填充框核验。
         # 旧框仍由原有退出点关联排除，不会参与下一组的编号。
-        if self.tracker.phase == "load" and any(s.confirmed == "empty" for s in self.tracker.slots):
+        if (self.tracker.points is not None and self.tracker.phase == "load"
+                and any(s.confirmed == "empty" for s in self.tracker.slots)):
             self.departing_load_tracker = self.tracker
             self.departing_load_deadline = now+self.tracker.lost_seconds
             self.departing_points = self.tracker.points.copy()
             self.departing_seen = np.full(4, now)
             self.departing_gate = self.entry_match_distance_px
         self.closed_at = now
-        self.departed_points = self.tracker.reference_points.copy()
+        self.departed_points = np.asarray(self.tracker._entry_points if self.tracker.points is None
+                                          else self.tracker.reference_points).copy()
         self.departed_velocity = np.zeros(2)
         if len(self.center_history) >= 2:
             t0,c0 = self.center_history[0]
@@ -350,9 +415,8 @@ class RoiGroupSequence:
         # 旧组的局部补检不能在同帧换组后成为下一组的新轨迹。
         objects = [o for o in objects if o.get("detection_source") != "local_crop"]
         if self.state == "entering" or self.departing_points is not None:
-            return [o for o in self._exclude_departing(objects, now) if o["class_name"] not in SLOT_STATES
-                or self._distance(((o["xyxy"][0]+o["xyxy"][2])/2,
-                                   (o["xyxy"][1]+o["xyxy"][3])/2)) >= 0]
+            tracker = self.tracker if self.state == "entering" else self.pending_tracker
+            return self._admit_entry_objects(self._exclude_departing(objects, now), tracker, now)
         inside,others = [],[]
         # 沿已确认退出方向短时预测旧组尾部，只作排除，不把预测当成检测证据。
         age = now-self.closed_at
@@ -369,7 +433,7 @@ class RoiGroupSequence:
             if age <= self.tracker.lost_seconds and np.min(np.linalg.norm(old-point,axis=1)) <= gate:
                 continue
             inside.append(obj)
-        return inside+others
+        return self._admit_entry_objects(inside+others, self.pending_tracker, now)
 
     def _exclude_departing(self, objects, now):
         """旧组退出后继续沿用旧身份匹配，残留点不能成为下一组的初始槽。"""
@@ -409,7 +473,8 @@ class RoiGroupSequence:
                     self.departing_points[live[row]] = candidates[col]["center"]
                     self.departing_seen[live[row]] = now
                     old_boxes.append(candidates[col])
-                    old_matches[int(live[row])] = candidates[col]
+                    if live[row] < 4:
+                        old_matches[int(live[row])] = candidates[col]
         self._verify_departing_load(old_matches, objects, now)
         result = []
         for obj in objects:
@@ -427,15 +492,25 @@ class RoiGroupSequence:
             result.append(obj)
         return result
 
-    def _start_immediate_next(self, now):
-        self.departing_points = self.tracker.points.copy()
-        self.departing_seen = np.full(4, now)
+    def _start_immediate_next(self, now, objects):
+        self.departing_points = np.asarray(self.tracker._entry_points if self.tracker.points is None
+                                          else self.tracker.points).copy()
+        # 匹配失败不等于新组：切组帧中出口侧的所有整图中心都保留为旧组尾部。
+        # 额外中心仅隔离，不伪造槽号或参与旧组空满核验。
+        for obj in self.tracker._candidates([o for o in objects if o.get("detection_source") != "local_crop"]):
+            center = np.asarray(obj["center"])
+            progress = self._entry_progress(center)
+            if (self._distance(center) >= 0 and progress is not None and progress > self.entry_birth_fraction
+                    and np.min(np.linalg.norm(self.departing_points-center, axis=1)) > 2):
+                self.departing_points = np.vstack((self.departing_points, center))
+        self.departing_seen = np.full(len(self.departing_points), now)
         # 进入时用明确的像素门限，避免旧组退出时透视压缩把新点匹配距离缩得过小。
         gate = self.entry_match_distance_px
         self.departing_gate = gate
         self.tracker = self.pending_tracker
         self.pending_tracker = None
         self.tracker.start_incremental_entry(gate)
+        self._entry_revision = self.tracker._entry_revision
         self.state = "entering"
         self.inside_seen, self.crossed = {}, {}
         self.direction = self.exit_since = None
@@ -444,12 +519,38 @@ class RoiGroupSequence:
             "phase": self.tracker.phase, "at": now, "reason": "single_slot_roi_exit"})
 
     def _update_immediate_entry(self, objects, now, enabled):
+        original = objects
         objects = self._entry_objects(objects, now)
         self._entry_count = len(self.tracker._candidates(objects))
         result = self.tracker.update(objects, now, observations_enabled=enabled, roi_contour=self.contour)
+        if self._entry_revision != self.tracker._entry_revision:
+            self.inside_seen, self.crossed = {}, {}
+            self._entry_revision = self.tracker._entry_revision
         if self.tracker.points is not None:
             result = self._restore_load_baseline(result, now)
             self._arm(now)
+        else:
+            # 个别槽始终遮挡时不能虚构正式槽号，也不能因此错过下一物理组。
+            for i, seen in enumerate(self.tracker._entry_seen_at):
+                if seen != now:
+                    continue
+                point = self.tracker._entry_points[i]
+                distance = self._distance(point)
+                if distance >= self.margin:
+                    self.inside_seen[i] = (now, point.copy())
+                elif distance <= -self.margin and i in self.inside_seen:
+                    at, previous = self.inside_seen[i]
+                    if now-at <= self.tracker.lost_seconds:
+                        self.crossed[i] = {"at": now, "delta": point-previous}
+            if self.crossed:
+                self._required_crossings = 1
+                self._group_events.append({"type": "group_exiting", "group_id": self.tracker.group_id,
+                    "phase": self.tracker.phase, "at": now, "slot_numbering_status": "provisional",
+                    "moving_slot_ids": [i+1 for i in sorted(self.crossed)]})
+                self._close(now)
+                if self.state != "sequence_complete":
+                    self._start_immediate_next(now, original)
+                    return self._update_immediate_entry(original, now, enabled)
         return result
 
     def _update_entry(self, objects, now, enabled):
@@ -475,6 +576,7 @@ class RoiGroupSequence:
         self.last_time = float(now)
         self._group_events = []
         self._deferred_new_events = []
+        self._entry_rejected = []
         self._observations_enabled = observations_enabled
         self._hands = [o for o in objects if o["class_name"] == "hand"]
         result = None
@@ -499,7 +601,7 @@ class RoiGroupSequence:
                 self._close(now)
                 if self.exit_min_slots == 1 and self.state != "sequence_complete":
                     closing_events = result["new_events"]
-                    self._start_immediate_next(now)
+                    self._start_immediate_next(now, objects)
                     result = self._update_immediate_entry(objects, now, observations_enabled)
                     result["new_events"] = closing_events + result["new_events"]
         if result is None:
@@ -536,6 +638,7 @@ class RoiGroupSequence:
                 "required_exit_slots": self._required_crossings,
                 "motion_support_slot_ids": list(self._motion_support),
                 "entry_candidate_count": self._entry_count,
+                "entry_rejected_slot_detections": deepcopy(self._entry_rejected),
                 "pending_initialization": deepcopy(self.pending_tracker.initialization)
                     if self.pending_tracker is not None else None}
 

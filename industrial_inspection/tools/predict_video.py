@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT))
 import cv2
 import torch
 
-from industrial_inspection.tools.slot_roi import draw_roi, filter_slot_indices, load_roi, select_roi
+from industrial_inspection.tools.slot_roi import (
+    DEFAULT_SLOT_ROI_FILE, draw_roi, filter_slot_indices, load_roi, select_roi)
 from industrial_inspection.tools.detection_display import draw_detection_legend, draw_detection_points
 
 
@@ -27,7 +28,7 @@ from industrial_inspection.tools.detection_display import draw_detection_legend,
 # 用户配置：在这里修改，然后在 PyCharm / VS Code 中直接运行此文件。
 # Windows 路径请保留 r 前缀，避免反斜杠被解释为转义字符。
 # =============================================================================
-SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\camera_B_20260924_021033.avi")
+SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\camera_B_20260925_023006.avi")
 MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp3.3\weights\best.pt")
 
 # 每次在此目录内新建“视频名_时间”文件夹，可重复运行而不覆盖结果。
@@ -38,7 +39,7 @@ CONFIDENCE = 0.35        # 检测分数门槛；降低可减少部分漏检，�
 IMAGE_SIZE = 1280        # 推理输入尺寸；输出视频和记录坐标仍使用原图分辨率
 DEVICE = "0"          # "auto" 自动选择 GPU/CPU；"0" 使用 GPU 0；"cpu" 使用 CPU
 FRAME_STRIDE = 1         # 1 = 逐帧；2 = 每两帧处理一帧
-MAX_FRAMES = 1000           # 0 = 整段视频；300 = 只处理 300 帧试跑
+MAX_FRAMES = 0           # 0 = 整段视频；300 = 只处理 300 帧试跑
 UI_ENABLED = True       # True = UI7V 界面，点击开始/停止；False = 命令行批处理
 SHOW_PREVIEW = False     # 仅命令行模式：True 显示 OpenCV 窗口，Q / Escape 停止
 DISPLAY_STYLE = "point" # "point"：中心点＋左上角颜色图例；"box"：矩形框＋标注
@@ -53,9 +54,9 @@ NMS_IOU = 0.70          # YOLOv8 同类别 NMS；YOLOv10 的原生后处理不�
 SLOT_DEDUPLICATE = True # 对空槽/满槽一起去重，仅保留高度重叠框中分数较高者
 SLOT_DUPLICATE_IOU = 0.85 # 越低越容易误删相邻槽；建议先保持保守的 0.85
 SLOT_ROI_ENABLED = True   # True：只输出所选区域内的槽位；其他类别仍检测全画面
-# 同一视频自动复用标定文件；换视频默认重新圈选，避免套用错误门体位置。
-SLOT_ROI_FILE = None      # None：使用视频旁的 <视频名>_slot_roi.json
-ROI_RESELECT = False     # True：本次重新圈选，覆盖该视频保存的 ROI
+# 默认使用第一次验证通过的ROI；界面可选手动划分或读取其他JSON配置。
+SLOT_ROI_FILE = DEFAULT_SLOT_ROI_FILE  # 项目内 configs/slot_roi.json；None也使用此默认文件
+ROI_RESELECT = False     # 仅显式设为True时重新圈选并更新所选ROI配置
 ROI_SELECT_FRAME = 0     # 初始预览帧号；窗口滑块可选槽位清楚、舱门打开的一帧
 DRAW_SLOT_ROI = True      # 在输出视频中画出区域边界
 # =============================================================================
@@ -136,7 +137,8 @@ def parse_args(argv=None):
     parser.add_argument("--slot-deduplicate", action=argparse.BooleanOptionalAction, default=SLOT_DEDUPLICATE)
     parser.add_argument("--slot-duplicate-iou", type=float, default=SLOT_DUPLICATE_IOU)
     parser.add_argument("--slot-roi", action=argparse.BooleanOptionalAction, default=SLOT_ROI_ENABLED)
-    parser.add_argument("--roi-file", type=Path, default=SLOT_ROI_FILE)
+    parser.add_argument("--roi-file", type=Path, default=SLOT_ROI_FILE,
+                        help="Shared ROI calibration; defaults to the first validated slot ROI")
     parser.add_argument("--reselect-roi", action=argparse.BooleanOptionalAction, default=ROI_RESELECT)
     parser.add_argument("--roi-select-frame", type=int, default=ROI_SELECT_FRAME)
     args = parser.parse_args(argv)
@@ -155,10 +157,10 @@ def parse_args(argv=None):
 
 
 def prepare_slot_roi(args):
-    """Prepare interactive ROI on the GUI thread before starting inference."""
+    """Load the shared calibration; only an explicit reselection opens the GUI."""
     if not args.slot_roi:
         return None
-    roi_path = args.roi_file or args.source.with_name(args.source.stem + "_slot_roi.json")
+    roi_path = Path(args.roi_file or DEFAULT_SLOT_ROI_FILE)
     cap = cv2.VideoCapture(str(args.source.resolve()))
     try:
         ok, reference = cap.read()
@@ -167,8 +169,10 @@ def prepare_slot_roi(args):
         height, width = reference.shape[:2]
     finally:
         cap.release()
-    if args.reselect_roi or not roi_path.is_file():
+    if args.reselect_roi:
         select_roi(args.source, roi_path, args.roi_select_frame)
+    elif not roi_path.is_file():
+        raise FileNotFoundError(f"找不到ROI配置：{roi_path}。请选择已有配置，或使用手动划分 / --reselect-roi 重新标定。")
     return load_roi(roi_path, (width, height))
 
 
@@ -208,7 +212,7 @@ def run_prediction(args, *, on_frame=None, on_log=None, should_stop=None, roi_po
     status = "failed"
     suppressed_total = 0
     roi_excluded_total = 0
-    roi_path = args.roi_file or args.source.with_name(args.source.stem + "_slot_roi.json")
+    roi_path = Path(args.roi_file or DEFAULT_SLOT_ROI_FILE)
     started = time.perf_counter()
     output = args.output_dir or OUTPUT_ROOT / (
         args.source.stem + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))

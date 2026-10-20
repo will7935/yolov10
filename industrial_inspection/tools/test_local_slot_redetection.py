@@ -20,6 +20,9 @@ from industrial_inspection.tools.test_roi_group_sequence import POINTS, ROI, box
 
 class LocalRedetectionTests(unittest.TestCase):
     def setUp(self):
+        hatch_control = patch.object(predict, 'HATCH_CONTROL_ENABLED', False)
+        hatch_control.start()
+        self.addCleanup(hatch_control.stop)
         self.frame=np.zeros((480,640,3),dtype=np.uint8)
         self.args=argparse.Namespace(conf=.35,device='cpu',nms_iou=.7)
         self.sequence=RoiGroupSequence(SlotGroupTracker(POINTS,group_id=2),ROI,

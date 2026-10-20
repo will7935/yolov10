@@ -1,0 +1,13 @@
+{
+  "coordinate_system": "normalized_xy",
+  "polygon": [
+    [0.4359374940395355, 0.3270833194255829],
+    [0.981249988079071, 0.5020833611488342],
+    [0.989062488079071, 0.8062499761581421],
+    [0.46875, 0.668749988079071]
+  ],
+  "reference_frame_size": [640, 480],
+  "source": "camera_B_20260924_021033.avi",
+  "reference_frame": 0,
+  "filter_rule": "slot_box_center_inside_polygon"
+}

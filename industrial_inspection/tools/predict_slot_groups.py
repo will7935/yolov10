@@ -22,6 +22,8 @@ from industrial_inspection.tools.detection_display import draw_detection_points
 from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, SlotGroupTracker
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
 from industrial_inspection.tools.slot_roi import draw_roi, pixel_polygon
+from industrial_inspection.tools.hatch_loading_inspection import (
+    HatchHandleMonitor, HatchLoadingInspection, format_fullness_report)
 
 
 # =============================================================================
@@ -38,10 +40,27 @@ UI_ENABLED = True             # True：沿用 UI7V；False：OpenCV 预览/批�
 SHOW_PREVIEW = True           # 仅 UI_ENABLED=False 时生效；Q退出、空格暂停
 MAX_FRAMES = 0                # 处理整段视频，避免在自动上料前被试跑帧数截断
 FRAME_STRIDE = 1
+SLOT_ROI_FILE = base.SLOT_ROI_FILE  # 默认第一次ROI；可改成需要读取或保存的JSON配置路径
+ROI_RESELECT = base.ROI_RESELECT   # True：手动划分并保存；False：读取配置，也可在界面切换
+ROI_SELECT_FRAME = base.ROI_SELECT_FRAME
 
 CURRENT_GROUP_ID = 1          # 视频起始实际组号，1..5；之后按确认的换组次数递增
 PROCESS_PHASE = "unload"     # 起始工序；默认下料五组后自动上料，纯上料片段可设"load"
 AUTO_LOAD_AFTER_UNLOAD = True # 下料G5退出后自动回到G1开始上料；上料G5退出后结束
+HATCH_CONTROL_ENABLED = True # 开门后启动现有上下料流程；关门结束并核验本轮20槽
+# 本相机把手框中心的归一化位置；换机位时须重新标定，不能把漏检当作关门。
+HATCH_OPEN_POLYGON = ((.39,.01),(.495,.01),(.495,.18),(.39,.18))
+HATCH_CLOSED_POLYGON = ((.495,.18),(.72,.18),(.72,.49),(.495,.49))
+HATCH_CONFIRM_SECONDS = .3
+HATCH_MIN_CONFIRM_FRAMES = 3
+HATCH_MAX_GAP_SECONDS = .25
+# 把手位置会因视频机位和门体姿态改变。先用稳定关门位置建立基准，
+# 再按归一化中心距离判断；长时间完全漏检表示把手已离开画面。
+HATCH_DISTANCE_MODE = True
+HATCH_CLOSED_DISTANCE_MAX = .08
+HATCH_OPEN_DISTANCE_MIN = .14
+HATCH_MISSING_OPEN_SECONDS = 1.0
+HATCH_REFERENCE_UPDATE_ALPHA = .05
 CLOCKWISE_ORDER = (1,3,4,2)    # 按实物确认后填写；允许从任意槽开始
 GROUP_TRACKING_ENABLED = True
 AUTO_GROUP_SWITCH = True      # 单点真实越界即切到下一组并逐点记录；False保持单组模式
@@ -51,9 +70,11 @@ EXIT_MIN_SLOTS = 1            # 任意一个已编号槽实际越出ROI即触发
 PARTIAL_EXIT_MIN_SLOTS = 1    # 单点换组模式下同样只需要一个越界槽
 EXIT_MIN_MOTION_RATIO = .5    # 多点换组规则的组中心位移比例；单点换组时不参与触发
 MOTION_PAUSE_RATIO = .18      # 多点换组规则的共同外移门限；单点换组时不参与触发
-NEXT_GROUP_STABLE_SECONDS = .3 # 仅多点换组模式使用；单点换组收齐四条轨迹即启用正式槽号
+NEXT_GROUP_STABLE_SECONDS = .3 # 收齐四条近期轨迹且几何停稳后启用S号；此前T号照常记录空满
 NEXT_GROUP_STABILITY_RATIO = .12 # 停稳期间各槽偏离起始位置不得超过最小槽间距×此比例
 NEXT_GROUP_MATCH_DISTANCE_PX = 40 # 新点/旧组残留点逐帧匹配的最大距离（像素）
+NEXT_GROUP_ENTRY_FRACTION = .6 # 沿EXIT_DIRECTION从入口到出口的前60%允许建立新轨迹
+SLOT2_BELOW_SLOT3 = True      # 左上S1、顺时针1→3→4→2，y辅助核验S2通常在S3下方；编号后不重排
 EXIT_DIRECTION = (-1, -1)     # 本视频已核实旧组从右下ROI向左上退出；None可恢复自动方向判断
 
 # 每轮五组按顺序计数；自动模式运行五组下料再五组上料。
@@ -61,11 +82,11 @@ START_FRAME = None            # None：从第0帧开始；数字：指定当前�
 END_FRAME = None              # 不包含该帧；例如1800表示到1799帧，None表示视频结尾
 INITIALIZATION_SECONDS = .3   # 候选四槽已分别可靠看见，至少三槽持续支持稳定几何后启用编号
 MIN_INITIALIZATION_FRAMES = 2 # 同时满足最少帧数；编号后不再按x重新排序
-INITIALIZATION_HISTORY_SECONDS = 5.0 # 确认前仅保留窗口内有原/新状态证据的取放；超出窗口不补报
+INITIALIZATION_HISTORY_SECONDS = 5.0 # 基线及可靠临时轨迹有效期；未获多帧支持的点按IDENTITY_LOST_SECONDS清理
 
 MATCH_DISTANCE_RATIO = .46    # 匹配门限=最近两槽间距×此比例；放宽以容纳空/满框中心偏移，必须小于0.5
 CONFIRM_SECONDS = .2          # 空/满持续达到该时间且满足帧数，才确认状态
-MIN_CONFIRM_FRAMES = 3
+MIN_CONFIRM_FRAMES = 2
 IDENTITY_LOST_SECONDS = 1.2   # 连续无匹配超时，锁定为unknown，避免下一组继承旧编号
 CONFLICT_CONF_MARGIN = .15    # 同位置空/满分数差小于该值时，输出unknown
 HAND_OVERLAP_RATIO = .2       # 手遮挡槽框达到此比例，或覆盖中心时，暂停该槽状态确认
@@ -88,12 +109,15 @@ GROUP_TEXT = {"initializing": "等待四槽初始化","active": "操作中","exi
               "sequence_complete": "本工序结束(G5)","identity_uncertain": "组身份待确认"}
 
 
-def build_args():
-    args = base.parse_args(["--source",str(SOURCE_VIDEO),"--weights",str(MODEL_WEIGHTS)])
-    args.source,args.weights = Path(SOURCE_VIDEO),Path(MODEL_WEIGHTS)
-    args.conf,args.imgsz,args.device = CONFIDENCE,IMAGE_SIZE,DEVICE
-    args.ui,args.show,args.max_frames,args.stride = UI_ENABLED,SHOW_PREVIEW,MAX_FRAMES,FRAME_STRIDE
-    args.output_dir = None
+def build_args(argv=None):
+    defaults = ["--source",str(SOURCE_VIDEO),"--weights",str(MODEL_WEIGHTS),
+        "--conf",str(CONFIDENCE),"--imgsz",str(IMAGE_SIZE),"--device",str(DEVICE),
+        "--ui" if UI_ENABLED else "--no-ui", "--show" if SHOW_PREVIEW else "--no-show",
+        "--max-frames",str(MAX_FRAMES),"--stride",str(FRAME_STRIDE),
+        "--roi-file",str(SLOT_ROI_FILE or base.DEFAULT_SLOT_ROI_FILE),
+        "--reselect-roi" if ROI_RESELECT else "--no-reselect-roi",
+        "--roi-select-frame",str(ROI_SELECT_FRAME)]
+    args = base.parse_args(defaults + list(argv or []))
     args.slot_roi = True
     args.group_completion_log_only = True
     if not GROUP_TRACKING_ENABLED:
@@ -133,7 +157,8 @@ def prepare_context(args):
     if not 0 <= start_frame < total or END_FRAME is not None and END_FRAME <= start_frame:
         raise ValueError("开始帧超出视频范围，或结束帧不大于开始帧")
     make_sequence(polygon,(w,h))  # 提前验证配置，推理线程中才开始收集YOLO中心。
-    return {"polygon": polygon,"size": (w,h),"start_frame": start_frame}
+    return {"polygon": polygon,"size": (w,h),"start_frame": start_frame,
+            "roi_file": str(Path(args.roi_file or base.DEFAULT_SLOT_ROI_FILE).resolve())}
 
 
 def make_tracker():
@@ -145,7 +170,8 @@ def make_tracker():
         initialization_history_seconds=INITIALIZATION_HISTORY_SECONDS,
         load_hand_contact_enabled=LOAD_HAND_CONTACT_ENABLED,
         load_hand_contact_seconds=LOAD_HAND_CONTACT_SECONDS,
-        load_hand_contact_min_frames=LOAD_HAND_CONTACT_MIN_FRAMES)
+        load_hand_contact_min_frames=LOAD_HAND_CONTACT_MIN_FRAMES,
+        slot2_below_slot3=SLOT2_BELOW_SLOT3)
 
 
 def make_sequence(polygon,size):
@@ -155,7 +181,8 @@ def make_sequence(polygon,size):
         partial_exit_slots=PARTIAL_EXIT_MIN_SLOTS,minimum_motion_ratio=EXIT_MIN_MOTION_RATIO,
         motion_pause_ratio=MOTION_PAUSE_RATIO,entry_seconds=NEXT_GROUP_STABLE_SECONDS,
         entry_stability_ratio=NEXT_GROUP_STABILITY_RATIO,entry_match_distance_px=NEXT_GROUP_MATCH_DISTANCE_PX,
-        exit_direction=EXIT_DIRECTION,auto_load_after_unload=AUTO_LOAD_AFTER_UNLOAD)
+        exit_direction=EXIT_DIRECTION,auto_load_after_unload=AUTO_LOAD_AFTER_UNLOAD,
+        entry_birth_fraction=NEXT_GROUP_ENTRY_FRACTION)
 
 
 def recover_missing_slots(model, frame, objects, sequence, args):
@@ -230,7 +257,7 @@ def build_process_report(summary, phase=None):
     snapshots = {g["group_id"]: g["snapshot"] for g in summary["closed_groups"]
                  if g["snapshot"]["phase"] == phase}
     current = summary["final_group_snapshot"]
-    if summary["processed_frames"] and current["phase"] == phase and current["group_id"] not in snapshots:
+    if summary.get("inspection_processed_frames",summary["processed_frames"]) and current["phase"] == phase and current["group_id"] not in snapshots:
         snapshots[current["group_id"]] = current
     target = "empty" if phase == "unload" else "filled"
     groups = []
@@ -263,16 +290,25 @@ def format_process_report(report):
     return "\n".join(lines)
 
 
-def overlay_status(frame,snapshot,show_text=True):
+def overlay_status(frame,snapshot,show_text=True,inspection=None):
     """左上角仅显示当前组是否完成工序；槽位状态保留在各中心点旁。"""
     colors = {"empty": (0,165,255),"filled": (40,220,80),"unknown": (160,160,160)}
     h,w = frame.shape[:2]
-    panel_width,panel_height = min(w,310),min(h,32)
+    panel_width,panel_height = min(w,420 if inspection is not None else 310),min(h,32)
     panel = frame[:panel_height,:panel_width]
     panel[:] = cv2.addWeighted(panel,.2,np.full_like(panel,20),.8,0)
     complete = process_completed(snapshot)
     action = "Unload" if snapshot["phase"] == "unload" else "Load"
     header = f"G{snapshot['group_id']} {action}: {'completed' if complete else 'not completed'}"
+    if inspection is not None:
+        fullness = inspection['fullness']
+        if inspection['status'] == 'waiting_open':
+            header = 'Hatch: waiting for open'
+        elif inspection['status'] == 'completed':
+            header = f"Load finished: {'FULL' if fullness['all_filled'] else 'NOT FULL'} ({fullness['confirmed_filled_count']}/20)"
+        elif snapshot['phase'] == 'load':
+            group = fullness['groups'][snapshot['group_id']-1]
+            header = f"G{snapshot['group_id']} Load: {group['filled_count']}/4 | total: {fullness['confirmed_filled_count']}/20"
     cv2.putText(frame,header,(7,22),cv2.FONT_HERSHEY_SIMPLEX,.52,
                 (40,220,80) if complete else (0,165,255),1,cv2.LINE_AA)
     for slot in snapshot["slots"]:
@@ -319,6 +355,10 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
             on_log(message)
     group_completion = {}
     def log_group_completion(snapshot):
+        # 新流程的上料日志由占用核验发布，避免首次已满但无取放事件时
+        # 同时输出“已放满”和旧事件统计中的“上料未完成”。
+        if HATCH_CONTROL_ENABLED and snapshot['phase'] == 'load':
+            return
         group_id,complete = snapshot["group_id"],process_completed(snapshot)
         key = (snapshot["phase"], group_id)
         if group_completion.get(key) is None or group_completion[key] != complete:
@@ -336,16 +376,34 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         torch.load = original_load
     sequence = make_sequence(polygon,context["size"])
     tracker = sequence.tracker
+    inspection = HatchLoadingInspection(HatchHandleMonitor(HATCH_OPEN_POLYGON, HATCH_CLOSED_POLYGON,
+        confirm_seconds=HATCH_CONFIRM_SECONDS, minimum_frames=HATCH_MIN_CONFIRM_FRAMES,
+        maximum_gap_seconds=HATCH_MAX_GAP_SECONDS, confidence=args.conf,
+        distance_mode=HATCH_DISTANCE_MODE, closed_distance_max=HATCH_CLOSED_DISTANCE_MAX,
+        open_distance_min=HATCH_OPEN_DISTANCE_MIN,
+        missing_open_seconds=HATCH_MISSING_OPEN_SECONDS,
+        reference_update_alpha=HATCH_REFERENCE_UPDATE_ALPHA)) if HATCH_CONTROL_ENABLED else None
+    sequence_finished = False
     output = args.output_dir or Path(OUTPUT_ROOT)/(args.source.stem+"_slots_"+datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     output.mkdir(parents=True,exist_ok=False)
     cap,writer = cv2.VideoCapture(str(args.source)),None
     processed,index,status = 0,context["start_frame"],"failed"
+    inspection_processed = 0
     started = time.perf_counter()
     summary = {"source": str(args.source.resolve()),"weights": str(args.weights.resolve()),
         "output_dir": str(output.resolve()),"output_video": str((output/"annotated.mp4").resolve()),
         "architecture": architecture,"conf": args.conf,"imgsz": args.imgsz,"stride": args.stride,
         "group_id": CURRENT_GROUP_ID,"group_count": 5,"phase": PROCESS_PHASE,"clockwise_order": CLOCKWISE_ORDER,
         "auto_load_after_unload": sequence.auto_load_after_unload,
+        "hatch_control_config": {"enabled": HATCH_CONTROL_ENABLED,
+            "open_polygon_normalized": HATCH_OPEN_POLYGON, "closed_polygon_normalized": HATCH_CLOSED_POLYGON,
+            "confirm_seconds": HATCH_CONFIRM_SECONDS, "minimum_frames": HATCH_MIN_CONFIRM_FRAMES,
+            "maximum_gap_seconds": HATCH_MAX_GAP_SECONDS,
+            "distance_mode": HATCH_DISTANCE_MODE,
+            "closed_distance_max": HATCH_CLOSED_DISTANCE_MAX,
+            "open_distance_min": HATCH_OPEN_DISTANCE_MIN,
+            "missing_open_seconds": HATCH_MISSING_OPEN_SECONDS,
+            "reference_update_alpha": HATCH_REFERENCE_UPDATE_ALPHA},
         "automatic_grouping_implemented": True,"automatic_grouping_enabled": AUTO_GROUP_SWITCH,
         "group_assignment": "roi_exit_sequence" if AUTO_GROUP_SWITCH else "configured",
         "group_switch_config": {"exit_confirm_seconds": EXIT_CONFIRM_SECONDS,
@@ -354,12 +412,22 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
             "partial_exit_min_slots": PARTIAL_EXIT_MIN_SLOTS,"min_motion_ratio": EXIT_MIN_MOTION_RATIO,
             "motion_pause_ratio": MOTION_PAUSE_RATIO,"entry_seconds": NEXT_GROUP_STABLE_SECONDS,
             "entry_stability_ratio": NEXT_GROUP_STABILITY_RATIO,
-            "entry_match_distance_px": NEXT_GROUP_MATCH_DISTANCE_PX,"exit_direction": EXIT_DIRECTION},
+            "entry_match_distance_px": NEXT_GROUP_MATCH_DISTANCE_PX,"exit_direction": EXIT_DIRECTION,
+            "entry_birth_fraction": NEXT_GROUP_ENTRY_FRACTION},
         "center_source": "yolo_box_centers","initialization_seconds": INITIALIZATION_SECONDS,
         "min_initialization_frames": MIN_INITIALIZATION_FRAMES,
         "initialization_history_seconds": INITIALIZATION_HISTORY_SECONDS,
+        "initialization_event_retention": "until_numbering_or_track_invalidation",
+        "entry_track_confirmation": {
+            "seconds": max(CONFIRM_SECONDS, INITIALIZATION_SECONDS),
+            "minimum_frames": max(2, MIN_CONFIRM_FRAMES, MIN_INITIALIZATION_FRAMES),
+            "unsupported_timeout_seconds": min(IDENTITY_LOST_SECONDS, INITIALIZATION_HISTORY_SECONDS),
+            "hidden_track_requires_confirmed_identity": True,
+            "stale_association_rejects_opposing_motion": True},
         "initialization_stability_ratio": tracker.initialization_stability_ratio,
-        "numbering_method": "initial_x_ascending_y_tiebreak_then_track",
+        "numbering_method": "stable_reference_clockwise_geometry_with_y_constraint" if SLOT2_BELOW_SLOT3 else "stable_x_then_track",
+        "slot2_below_slot3": SLOT2_BELOW_SLOT3,
+        "slot_roi_file": context.get("roi_file"),
         "roi_polygon_normalized": polygon.tolist(),"roi_tracking_margin_px": ROI_TRACKING_MARGIN_PX,
         "confirm_seconds": CONFIRM_SECONDS,"min_confirm_frames": MIN_CONFIRM_FRAMES,
         "load_hand_contact_config": {"enabled": LOAD_HAND_CONTACT_ENABLED,
@@ -383,6 +451,17 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
             records = stack.enter_context((output/"slot_states.jsonl").open("w",encoding="utf-8"))
             events = stack.enter_context((output/"slot_events.jsonl").open("w",encoding="utf-8"))
             group_events = stack.enter_context((output/"group_events.jsonl").open("w",encoding="utf-8"))
+            inspection_events = stack.enter_context((output/"inspection_events.jsonl").open("w",encoding="utf-8"))
+            def publish_inspection_events(items):
+                for item in items:
+                    inspection_events.write(json.dumps(item,ensure_ascii=False)+"\n")
+                    if item.get('inspection_started'):
+                        log('舱门把手已打开：开始检测，按下料→上料流程执行。' if tracker.phase == 'unload'
+                            else '舱门把手已打开：开始上料检测。')
+                    elif item['type'] == 'group_fullness':
+                        log(f"游星片{item['group_id']}：{item['result']}（{item['filled_count']}/4）")
+                    elif item['type'] == 'loading_fullness_final':
+                        log(f"上料检测结束：{item['result']}（{item['confirmed_filled_count']}/20）")
             csv_file = stack.enter_context((output/"slot_states.csv").open("w",encoding="utf-8-sig",newline=""))
             fields = ["source_frame","time_seconds","group_id","slot_id","phase","state","observation",
                       "last_confirmed_state","confidence","center_x","center_y","reason","order_result","group_status",
@@ -416,11 +495,25 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                     for c,score,xy in zip(boxes.cls.tolist(),boxes.conf.tolist(),boxes.xyxy.tolist())]
                 timestamp = source_frame/fps
                 enabled = not any(start <= timestamp < end for start,end in ROTATION_INTERVALS)
-                objects,local_attempts = recover_missing_slots(model,frame,raw,sequence,args) if enabled else (raw,[])
-                snapshot = sequence.update(objects,timestamp,observations_enabled=enabled)
+                if inspection is not None:
+                    publish_inspection_events(inspection.observe_handle(raw,timestamp,(w,h)))
+                if inspection is None or inspection.active:
+                    objects,local_attempts = recover_missing_slots(model,frame,raw,sequence,args) if enabled else (raw,[])
+                    snapshot = sequence.update(objects,timestamp,observations_enabled=enabled)
+                    inspection_processed += 1
+                else:
+                    local_attempts = []
+                    if inspection.closed_at is not None and not sequence_finished:
+                        snapshot = sequence.finish()
+                        sequence_finished = True
+                    else:
+                        snapshot = {**sequence.snapshot(),"new_events":[],"new_group_events":[]}
                 tracker = sequence.tracker
+                if inspection is not None:
+                    publish_inspection_events(inspection.update_fullness(sequence,timestamp))
                 record = {"source_frame": source_frame,"time_seconds": timestamp,**snapshot,
-                          "local_redetection": local_attempts}
+                          "local_redetection": local_attempts,
+                          "inspection": inspection.snapshot() if inspection is not None else None}
                 records.write(json.dumps(record,ensure_ascii=False)+"\n")
                 for event in snapshot["new_events"]:
                     events.write(json.dumps(event,ensure_ascii=False)+"\n")
@@ -428,7 +521,8 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                     group_events.write(json.dumps(event,ensure_ascii=False)+"\n")
                     if event["type"] in ("group_closed", "group_updated"):
                         log_group_completion(event["snapshot"])
-                log_group_completion(snapshot)
+                if inspection is None or inspection.started_at is not None:
+                    log_group_completion(snapshot)
                 for slot in snapshot["slots"]:
                     center = slot["center_xy"] or (None,None)
                     rows.writerow({"source_frame": source_frame,"time_seconds": round(timestamp,6),
@@ -439,20 +533,32 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                 plotted = draw_detection_points(frame,others,radius=POINT_RADIUS)
                 if DRAW_SLOT_ROI:
                     draw_roi(plotted,polygon)
-                overlay_status(plotted,snapshot,SHOW_SLOT_TEXT)
+                overlay_status(plotted,snapshot,SHOW_SLOT_TEXT,inspection.snapshot() if inspection is not None else None)
                 writer.write(plotted)
                 processed += 1
                 slot_label = "临时点" if snapshot["slot_numbering_status"] == "provisional" else "槽"
                 text = "；".join(f"组{s['group_id']}-{slot_label}{s['slot_id']}:{STATE_TEXT[s['state']]}" for s in snapshot["slots"])
+                status_text = f"组{tracker.group_id} {tracker.phase} · {timestamp:.2f}s · {GROUP_TEXT[snapshot['group_status']]} · 顺序{snapshot['order_result']}"
+                if inspection is not None:
+                    if inspection.started_at is None:
+                        status_text = text = '等待舱门把手打开'
+                    elif inspection.closed_at is not None:
+                        report = inspection.report
+                        status_text = text = f"上料检测结束：{report['result']}（{report['confirmed_filled_count']}/20）"
+                    else:
+                        status_text += f" · 已确认放满{inspection.report['confirmed_filled_count']}/20"
                 if on_frame is not None:
-                    identity = GROUP_TEXT[snapshot["group_status"]]
-                    on_frame(plotted,{"status": f"组{tracker.group_id} {tracker.phase} · {timestamp:.2f}s · {identity} · 顺序{snapshot['order_result']}",
+                    on_frame(plotted,{"status": status_text,
                         "result": text,"frame_id": processed,"source_frame": source_frame,"time_seconds": timestamp,
                         "slots": snapshot["slots"],"group_id": tracker.group_id,"phase": tracker.phase,
                         "group_status": snapshot["group_status"],"pending_group_id": snapshot["pending_group_id"],
                         "pending_phase": snapshot["pending_phase"],
                         "pending_initialization": snapshot["pending_initialization"],
-                        "slot_numbering_status": snapshot["slot_numbering_status"]})
+                        "slot_numbering_status": snapshot["slot_numbering_status"],
+                        "inspection": inspection.snapshot() if inspection is not None else None})
+                if inspection is not None and inspection.closed_at is not None:
+                    status = "hatch_closed"
+                    break
                 if args.show:
                     cv2.imshow("Slot groups: Q quit / Space pause",plotted)
                     key = cv2.waitKey(1)&0xff
@@ -467,14 +573,17 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                 if args.max_frames and processed >= args.max_frames:
                     status = "frame_limit"
                     break
-            final = sequence.finish()
+            final = (sequence.finish() if not sequence_finished else
+                     {**sequence.snapshot(),"new_events":[],"new_group_events":[]})
             for event in final["new_events"]:
                 events.write(json.dumps(event,ensure_ascii=False)+"\n")
             for event in final["new_group_events"]:
                 group_events.write(json.dumps(event,ensure_ascii=False)+"\n")
                 log_group_completion(event["snapshot"])
-            if processed:
+            if processed and (inspection is None or inspection.started_at is not None):
                 log_group_completion(final)
+            if inspection is not None and processed:
+                publish_inspection_events(inspection.update_fullness(sequence,timestamp))
     except KeyboardInterrupt:
         status = "interrupted"
     finally:
@@ -484,6 +593,7 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         if args.show:
             cv2.destroyAllWindows()
         summary.update(status=status,processed_frames=processed,elapsed_seconds=round(time.perf_counter()-started,3),
+                       inspection_processed_frames=inspection_processed,
                        final_group_snapshot=sequence.snapshot(),events=sequence.all_events,
                        closed_groups=sequence.closed_groups)
         summary["group_process_report"] = build_process_report(summary)
@@ -492,8 +602,18 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
             phases.append("load")
         summary["group_process_reports"] = {phase:build_process_report(summary,phase) for phase in phases}
         summary["current_phase"] = sequence.tracker.phase
+        if inspection is not None:
+            inspection.update_fullness(sequence, timestamp if processed else 0.)
+            summary['inspection'] = inspection.snapshot()
+            summary['inspection_events'] = inspection.events
+            summary['loading_fullness_report'] = inspection.report
+            (output/'loading_fullness_report.json').write_text(
+                json.dumps(inspection.report,ensure_ascii=False,indent=2),encoding='utf-8')
+            (output/'loading_fullness_report.txt').write_text(format_fullness_report(inspection.report)+'\n',encoding='utf-8')
         report_text = "\n\n".join(format_process_report(report)
                                  for report in summary["group_process_reports"].values())
+        if inspection is not None:
+            report_text += '\n\n'+format_fullness_report(inspection.report)
         (output/"group_process_report.json").write_text(
             json.dumps(summary["group_process_reports"],ensure_ascii=False,indent=2),encoding="utf-8")
         (output/"group_process_report.txt").write_text(report_text+"\n",encoding="utf-8")
@@ -506,7 +626,7 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
 
 
 def main():
-    args = build_args()
+    args = build_args(sys.argv[1:])
     if args.ui:
         from industrial_inspection.tools.predict_video_ui import launch_ui
         launch_ui(args,run_prediction,prepare_context)

@@ -175,6 +175,23 @@ class CycleSequenceTests(unittest.TestCase):
         self.assertEqual(sequence.tracker.events, [])
         self.assertEqual(result["new_events"], [])
 
+    def test_restored_load_uses_first_filled_evidence_after_occlusion_and_reconfirmation(self):
+        sequence = self.previous_unload()
+        tracker = sequence.tracker
+        # 本轮首次看见时已经满，未编号阶段无法立即与下料基线连接。
+        for now in (1., 1.1):
+            tracker.update(boxes(filled=(0,)), now)
+        first_confirmation = tracker.slots[0].evidence_time
+        tracker.update(boxes(visible=(1, 2, 3)), 1.2)
+        for now in (1.3, 1.4):
+            result = tracker.update(boxes(filled=(0,)), now)
+        result = sequence._restore_load_baseline(result, 1.4)
+        event = next(e for e in result['new_events'] if e['slot_id'] == 1)
+        self.assertEqual(event['time_upper'], 1.)
+        self.assertEqual(event['confirmed_at'], first_confirmation)
+        self.assertEqual(event['reported_at'], 1.4)
+        self.assertLessEqual(event['time_upper'], event['confirmed_at'])
+
     def test_incremental_entry_recovers_early_load_without_duplicating_unload_events(self):
         sequence = self.make()
         for _ in range(5):
@@ -182,12 +199,14 @@ class CycleSequenceTests(unittest.TestCase):
         before = deepcopy(sequence.closed_groups)
         # T1在其他三个槽出现前已连续检测为满，正式编号后应补报上料。
         results = self.feed(sequence, [boxes(visible=(0,), filled=(0,))] * 3
-                            + [boxes(filled=range(4))] * 3)
+                            + [boxes(filled=range(4))] * 5)
         load_events = [e for e in sequence.all_events if e["phase"] == "load"]
         self.assertEqual(len(load_events), 4)
         early = [e for e in load_events if e.get("reason") == "detected_after_unload_baseline"]
-        self.assertEqual([e["slot_id"] for e in early], [1])
-        self.assertTrue(early[0]["recovered_before_initialization"])
+        # 停稳后才正式编号，此时四槽都可能已在T阶段确认，均须一次性补报。
+        self.assertEqual([e["slot_id"] for e in early], [1, 2, 3, 4])
+        self.assertTrue(all(e["recovered_before_initialization"] for e in early))
+        self.assertLess(early[0]["time_upper"], min(e["time_upper"] for e in early[1:]))
         self.assertEqual(sequence.tracker.order_result(), "pending")
         self.assertEqual(sequence.closed_groups, before)
         self.assertEqual(len([e for r in results for e in r["new_events"]]), 4)
@@ -234,6 +253,11 @@ class CycleSequenceTests(unittest.TestCase):
 
 
 class CyclePipelineTests(unittest.TestCase):
+    def setUp(self):
+        hatch_control = patch.object(predict, 'HATCH_CONTROL_ENABLED', False)
+        hatch_control.start()
+        self.addCleanup(hatch_control.stop)
+
     def test_default_pipeline_saves_distinct_reports_events_ui_and_logs_for_both_phases(self):
         self.assertTrue(predict.AUTO_LOAD_AFTER_UNLOAD)
         self.assertEqual(predict.MAX_FRAMES, 0)

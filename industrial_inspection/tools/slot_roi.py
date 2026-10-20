@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 SLOT_NAMES = {"wafer_slot_empty", "wafer_slot_filled", "wafer_slot"}
+DEFAULT_SLOT_ROI_FILE = Path(__file__).resolve().parents[1] / "configs" / "slot_roi.json"
 
 
 def validate_polygon(points):

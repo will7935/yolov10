@@ -435,16 +435,17 @@ class AutomaticInitializationTests(unittest.TestCase):
         self.assertEqual(result['identity_status'],'tracking')
         self.assertEqual(t.events,[])
 
-    def test_history_window_drops_old_events_and_stale_baselines(self):
+    def test_history_window_keeps_confirmed_events_but_drops_stale_baselines(self):
         t=SlotGroupTracker(initialization_seconds=1.,initialization_frames=3,
             initialization_history_seconds=.3,confirm_seconds=.1,minimum_frames=2)
         for frame in range(11):
-            # 槽1的旧事件过期；槽2从第2帧起不可见，恢复时不能用过期满槽基线。
+            # 可追踪槽的已确认事件保留；槽2恢复时不能用过期满槽基线。
             visible=range(1,5) if frame<2 or frame>=8 else (1,3,4)
             objects=[detection(i,'filled' if frame<2 else 'empty') for i in visible]
             result=t.update(objects,frame/10)
         self.assertEqual(result['identity_status'],'tracking')
-        self.assertEqual(t.events,[])
+        self.assertEqual([e['slot_id'] for e in t.events], [1, 2, 4])
+        self.assertTrue(all(e['time_upper'] == .2 for e in t.events))
 
     def test_exact_duplicate_is_one_candidate(self):
         t=self.make_auto()
@@ -496,7 +497,8 @@ class AutomaticInitializationTests(unittest.TestCase):
 
 class IncrementalEntryTests(unittest.TestCase):
     def make(self):
-        t=SlotGroupTracker(group_id=2,confirm_seconds=.1,minimum_frames=2,initialization_seconds=10)
+        t=SlotGroupTracker(group_id=2,confirm_seconds=.1,minimum_frames=2,
+                           initialization_seconds=.1,initialization_frames=2)
         t.start_incremental_entry(40)
         return t
 
