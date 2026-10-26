@@ -28,14 +28,15 @@ from industrial_inspection.tools.detection_display import draw_detection_legend,
 # 用户配置：在这里修改，然后在 PyCharm / VS Code 中直接运行此文件。
 # Windows 路径请保留 r 前缀，避免反斜杠被解释为转义字符。
 # =============================================================================
-SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\camera_B_20260925_023006.avi")
-MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp3.3\weights\best.pt")
+SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频1\camera_B_20260924_021033.avi")
+MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp4.2\weights\best.pt")
 
 # 每次在此目录内新建“视频名_时间”文件夹，可重复运行而不覆盖结果。
 OUTPUT_ROOT = Path(r"I:\youyan\test_dataset")
 # 例如改为：OUTPUT_ROOT = Path(r"I:\youyan\video_results")
 
-CONFIDENCE = 0.35        # 检测分数门槛；降低可减少部分漏检，也可能增加误报，不等于准确率
+CONFIDENCE = 0.2        # 检测分数门槛；降低可减少部分漏检，也可能增加误报，不等于准确率
+AUDIT_CONFIDENCE = 0.001 # 置信度审计下限；低于显示门槛的模型候选框也写入 CSV
 IMAGE_SIZE = 1280        # 推理输入尺寸；输出视频和记录坐标仍使用原图分辨率
 DEVICE = "0"          # "auto" 自动选择 GPU/CPU；"0" 使用 GPU 0；"cpu" 使用 CPU
 FRAME_STRIDE = 1         # 1 = 逐帧；2 = 每两帧处理一帧
@@ -111,6 +112,28 @@ def slot_keep_indices(boxes, names, threshold):
     return [i for i in range(len(boxes)) if i not in removed], suppressed
 
 
+def detection_confidence_row(*, source_frame, time_seconds, index, detection, confidence_threshold,
+                             displayed, display_reason, display_style):
+    """Return one audit row for a model detection before display filtering."""
+    x1, y1, x2, y2 = detection["xyxy"]
+    return {
+        "source_frame": source_frame,
+        "time_seconds": time_seconds,
+        "detection_index": index,
+        "class_id": detection["class_id"],
+        "class_name": detection["class_name"],
+        "confidence": round(float(detection["confidence"]), 6),
+        "x1": round(float(x1), 2),
+        "y1": round(float(y1), 2),
+        "x2": round(float(x2), 2),
+        "y2": round(float(y2), 2),
+        "meets_display_confidence": detection["confidence"] >= confidence_threshold,
+        "displayed": displayed,
+        "display_reason": display_reason,
+        "display_style": display_style,
+    }
+
+
 def parse_args(argv=None):
     # 1. 参数与输入检查：直接运行时使用顶部配置，也支持命令行临时覆盖。
     parser = argparse.ArgumentParser(description=__doc__)
@@ -118,6 +141,8 @@ def parse_args(argv=None):
     parser.add_argument("--weights", type=Path, default=MODEL_WEIGHTS)
     parser.add_argument("--output-dir", type=Path, help="New directory; existing directories are never overwritten")
     parser.add_argument("--conf", type=float, default=CONFIDENCE)
+    parser.add_argument("--audit-conf", type=float, default=AUDIT_CONFIDENCE,
+                        help="Lowest model confidence written to detection_confidences.csv")
     parser.add_argument("--imgsz", type=int, default=IMAGE_SIZE)
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--stride", type=int, default=FRAME_STRIDE, help="Process every Nth frame; output FPS is reduced accordingly")
@@ -145,8 +170,9 @@ def parse_args(argv=None):
     # 在加载模型和创建输出目录之前检查参数，便于及早定位路径或配置错误。
     if args.device == "auto":
         args.device = "0" if torch.cuda.is_available() else "cpu"
-    if not 0 < args.conf < 1 or args.stride < 1 or args.max_frames < 0 or args.imgsz < 32:
-        parser.error("Require 0 < conf < 1, stride >= 1, max-frames >= 0, imgsz >= 32")
+    if (not 0 < args.conf < 1 or not 0 < args.audit_conf <= args.conf
+            or args.stride < 1 or args.max_frames < 0 or args.imgsz < 32):
+        parser.error("Require 0 < audit-conf <= conf < 1, stride >= 1, max-frames >= 0, imgsz >= 32")
     if not 0 < args.nms_iou < 1 or not 0 < args.slot_duplicate_iou < 1:
         parser.error("NMS and duplicate IoU thresholds must lie between 0 and 1")
     if args.display_style not in {"box", "point"} or not 1 <= args.point_radius <= 20 or not .1 <= args.point_font_scale <= 2:

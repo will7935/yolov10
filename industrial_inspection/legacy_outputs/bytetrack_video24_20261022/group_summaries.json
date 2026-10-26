@@ -1,0 +1,2200 @@
+[
+  {
+    "type": "group_closed",
+    "group_id": 1,
+    "phase": "unload",
+    "at": 39.05197953137624,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pending",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 1,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "unload",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "yolo_box_centers",
+        "reason": "initialized",
+        "eligible_slot_count": 4,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 22.569350929167786,
+        "initial_centers_xy": [
+          [
+            410.0906066894531,
+            250.52090454101562
+          ],
+          [
+            519.7257690429688,
+            309.78466796875
+          ],
+          [
+            457.5069885253906,
+            225.48765563964844
+          ],
+          [
+            550.3826904296875,
+            275.29205322265625
+          ]
+        ],
+        "provisional_started_at": 21.869108537570696,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0
+      },
+      "slots": [
+        {
+          "group_id": 1,
+          "slot_id": 1,
+          "center_xy": [
+            419.84,
+            229.44
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 37.38217075141395,
+          "last_seen_at": 37.43603555076757,
+          "confirmed_state_since": 34.04255319148936,
+          "confirmed_state_first_confirmed_at": 34.25801238890385,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 1,
+          "slot_id": 2,
+          "center_xy": [
+            510.88,
+            286.05
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 38.29787234042553,
+          "last_seen_at": 38.51333153784002,
+          "confirmed_state_since": 33.07298680312416,
+          "confirmed_state_first_confirmed_at": 33.28844600053865,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 1,
+          "slot_id": 3,
+          "center_xy": [
+            457.87,
+            195.51
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 38.78265553460813,
+          "last_seen_at": 38.78265553460813,
+          "confirmed_state_since": 35.71236197145166,
+          "confirmed_state_first_confirmed_at": 35.927821168866146,
+          "confidence": 0.9450837969779968,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 1,
+          "slot_id": 4,
+          "center_xy": [
+            539.0,
+            258.04
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 38.29787234042553,
+          "last_seen_at": 38.99811473202262,
+          "confirmed_state_since": 31.241583625100994,
+          "confirmed_state_first_confirmed_at": 31.457042822515483,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pending",
+      "confirmed_event_sequence": [
+        4,
+        2,
+        1,
+        3
+      ],
+      "current_target_count": 0,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": []
+    },
+    "events": [
+      {
+        "slot_id": 4,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 31.13385402639375,
+        "time_upper": 31.241583625100994,
+        "confirmed_at": 31.457042822515483,
+        "group_id": 1,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 31.457042822515483,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 2,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 30.649070832211148,
+        "time_upper": 33.07298680312416,
+        "confirmed_at": 33.28844600053865,
+        "group_id": 1,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 33.28844600053865,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 1,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 33.55776999730676,
+        "time_upper": 34.04255319148936,
+        "confirmed_at": 34.25801238890385,
+        "group_id": 1,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 34.25801238890385,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 34.95825478050094,
+        "time_upper": 35.71236197145166,
+        "confirmed_at": 35.927821168866146,
+        "group_id": 1,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 35.927821168866146,
+        "recovered_before_initialization": false
+      }
+    ]
+  },
+  {
+    "type": "group_closed",
+    "group_id": 2,
+    "phase": "unload",
+    "at": 52.30272017236735,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pass",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 2,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "unload",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "incremental_yolo_box_centers",
+        "reason": "four_slot_tracks_stable",
+        "eligible_slot_count": 4,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 42.82251548612981,
+        "initial_centers_xy": [
+          [
+            393.20648193359375,
+            240.12625122070312
+          ],
+          [
+            514.0945892333984,
+            305.7126159667969
+          ],
+          [
+            452.615234375,
+            220.38352966308594
+          ],
+          [
+            547.0708160400391,
+            267.76324462890625
+          ]
+        ],
+        "provisional_started_at": 39.105844330729866,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0,
+        "numbering_reference_centers_xy": [
+          [
+            393.20648193359375,
+            240.12625122070312
+          ],
+          [
+            514.0945892333984,
+            305.7126159667969
+          ],
+          [
+            452.615234375,
+            220.38352966308594
+          ],
+          [
+            547.0708160400391,
+            267.76324462890625
+          ]
+        ]
+      },
+      "slots": [
+        {
+          "group_id": 2,
+          "slot_id": 1,
+          "center_xy": [
+            409.6,
+            245.86
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 50.79450579046593,
+          "last_seen_at": 51.06382978723404,
+          "confirmed_state_since": 47.670347427955825,
+          "confirmed_state_first_confirmed_at": 47.885806625370314,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 2,
+          "slot_id": 2,
+          "center_xy": [
+            492.0,
+            270.07
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 52.03339617559924,
+          "last_seen_at": 52.03339617559924,
+          "confirmed_state_since": 45.838944249932666,
+          "confirmed_state_first_confirmed_at": 46.054403447347156,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 2,
+          "slot_id": 3,
+          "center_xy": [
+            456.04,
+            194.5
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 52.14112577430649,
+          "last_seen_at": 52.14112577430649,
+          "confirmed_state_since": 49.17856180985726,
+          "confirmed_state_first_confirmed_at": 49.394021007271746,
+          "confidence": 0.937567412853241,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 2,
+          "slot_id": 4,
+          "center_xy": [
+            536.8,
+            246.78
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 52.19499057366011,
+          "last_seen_at": 52.19499057366011,
+          "confirmed_state_since": 43.84594667384864,
+          "confirmed_state_first_confirmed_at": 44.061405871263126,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pass",
+      "confirmed_event_sequence": [
+        4,
+        2,
+        1,
+        3
+      ],
+      "current_target_count": 0,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": [
+        {
+          "class_id": 3,
+          "class_name": "wafer_slot_empty",
+          "confidence": 0.7502451539039612,
+          "xyxy": [
+            329.3955993652344,
+            169.05145263671875,
+            437.2261657714844,
+            224.8350830078125
+          ],
+          "center": [
+            383.3108825683594,
+            196.94326782226562
+          ],
+          "conflict": false
+        }
+      ]
+    },
+    "events": [
+      {
+        "slot_id": 4,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 43.19956908160517,
+        "time_upper": 43.84594667384864,
+        "confirmed_at": 44.061405871263126,
+        "group_id": 2,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 44.061405871263126,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 2,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 45.40802585510369,
+        "time_upper": 45.838944249932666,
+        "confirmed_at": 46.054403447347156,
+        "group_id": 2,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 46.054403447347156,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 1,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 47.23942903312685,
+        "time_upper": 47.670347427955825,
+        "confirmed_at": 47.885806625370314,
+        "group_id": 2,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 47.885806625370314,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 48.639913816321034,
+        "time_upper": 49.17856180985726,
+        "confirmed_at": 49.394021007271746,
+        "group_id": 2,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 49.394021007271746,
+        "recovered_before_initialization": false
+      }
+    ]
+  },
+  {
+    "type": "group_closed",
+    "group_id": 3,
+    "phase": "unload",
+    "at": 65.06867761917586,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pass",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 3,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "unload",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "incremental_yolo_box_centers",
+        "reason": "four_slot_tracks_stable",
+        "eligible_slot_count": 4,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 56.82736331807163,
+        "initial_centers_xy": [
+          [
+            398.648193359375,
+            247.3209686279297
+          ],
+          [
+            521.862548828125,
+            311.03753662109375
+          ],
+          [
+            455.4835205078125,
+            224.49459838867188
+          ],
+          [
+            548.3243408203125,
+            266.4509811401367
+          ]
+        ],
+        "provisional_started_at": 52.84136816590358,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0,
+        "numbering_reference_centers_xy": [
+          [
+            398.648193359375,
+            247.3209686279297
+          ],
+          [
+            521.862548828125,
+            311.03753662109375
+          ],
+          [
+            455.4835205078125,
+            224.49459838867188
+          ],
+          [
+            548.3243408203125,
+            266.4509811401367
+          ]
+        ]
+      },
+      "slots": [
+        {
+          "group_id": 3,
+          "slot_id": 1,
+          "center_xy": [
+            382.39,
+            191.02
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 64.96094802046862,
+          "last_seen_at": 64.96094802046862,
+          "confirmed_state_since": 60.05925127928898,
+          "confirmed_state_first_confirmed_at": 60.27471047670347,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 3,
+          "slot_id": 2,
+          "center_xy": [
+            471.22,
+            251.48
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 64.26070562887153,
+          "last_seen_at": 65.01481281982224,
+          "confirmed_state_since": 58.335577699973065,
+          "confirmed_state_first_confirmed_at": 58.551036897387554,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 3,
+          "slot_id": 3,
+          "center_xy": [
+            456.52,
+            193.22
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 64.69162402370051,
+          "last_seen_at": 64.69162402370051,
+          "confirmed_state_since": 61.62133046054403,
+          "confirmed_state_first_confirmed_at": 61.83678965795852,
+          "confidence": 0.918998658657074,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 3,
+          "slot_id": 4,
+          "center_xy": [
+            535.62,
+            243.31
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 64.42230002693239,
+          "last_seen_at": 65.01481281982224,
+          "confirmed_state_since": 57.31214651225424,
+          "confirmed_state_first_confirmed_at": 57.52760570966873,
+          "confidence": 0.7667162418365479,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pass",
+      "confirmed_event_sequence": [
+        4,
+        2,
+        1,
+        3
+      ],
+      "current_target_count": 0,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": []
+    },
+    "events": [
+      {
+        "slot_id": 4,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 55.42687853487745,
+        "time_upper": 57.31214651225424,
+        "confirmed_at": 57.52760570966873,
+        "group_id": 3,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 57.52760570966873,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 2,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 57.63533530837597,
+        "time_upper": 58.335577699973065,
+        "confirmed_at": 58.551036897387554,
+        "group_id": 3,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 58.551036897387554,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 1,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 59.62833288446,
+        "time_upper": 60.05925127928898,
+        "confirmed_at": 60.27471047670347,
+        "group_id": 3,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 60.27471047670347,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 60.921088068946936,
+        "time_upper": 61.62133046054403,
+        "confirmed_at": 61.83678965795852,
+        "group_id": 3,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 61.83678965795852,
+        "recovered_before_initialization": false
+      }
+    ]
+  },
+  {
+    "type": "group_closed",
+    "group_id": 4,
+    "phase": "unload",
+    "at": 77.72690546727713,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pending",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 4,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "unload",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "incremental_yolo_box_centers",
+        "reason": "four_slot_tracks_stable",
+        "eligible_slot_count": 3,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 69.59332076488015,
+        "initial_centers_xy": [
+          [
+            397.5700988769531,
+            245.5970001220703
+          ],
+          [
+            524.9478607177734,
+            310.9879150390625
+          ],
+          [
+            454.09613037109375,
+            222.72113037109375
+          ],
+          [
+            549.6431093649945,
+            270.2363066359504
+          ]
+        ],
+        "provisional_started_at": 65.93051440883383,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0,
+        "numbering_reference_centers_xy": [
+          [
+            397.5700988769531,
+            245.5970001220703
+          ],
+          [
+            524.9478607177734,
+            310.9879150390625
+          ],
+          [
+            454.09613037109375,
+            222.72113037109375
+          ],
+          [
+            549.6431093649945,
+            270.2363066359504
+          ]
+        ]
+      },
+      "slots": [
+        {
+          "group_id": 4,
+          "slot_id": 1,
+          "center_xy": [
+            378.65,
+            199.16
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 77.24212227309452,
+          "last_seen_at": 77.51144626986265,
+          "confirmed_state_since": 72.71747912739025,
+          "confirmed_state_first_confirmed_at": 72.93293832480474,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 4,
+          "slot_id": 2,
+          "center_xy": [
+            473.37,
+            254.57
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 77.6730406679235,
+          "last_seen_at": 77.6730406679235,
+          "confirmed_state_since": 72.82520872609749,
+          "confirmed_state_first_confirmed_at": 73.04066792351198,
+          "confidence": 0.9488814473152161,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 4,
+          "slot_id": 3,
+          "center_xy": [
+            455.7,
+            194.46
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 77.24212227309452,
+          "last_seen_at": 77.34985187180177,
+          "confirmed_state_since": 74.38728790735254,
+          "confirmed_state_first_confirmed_at": 74.60274710476703,
+          "confidence": 0.9326861500740051,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 4,
+          "slot_id": 4,
+          "center_xy": [
+            539.98,
+            243.96
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 77.6730406679235,
+          "last_seen_at": 77.6730406679235,
+          "confirmed_state_since": 68.73148397522219,
+          "confirmed_state_first_confirmed_at": 68.94694317263668,
+          "confidence": 0.906994104385376,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pending",
+      "confirmed_event_sequence": [
+        1,
+        2,
+        3
+      ],
+      "current_target_count": 0,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": []
+    },
+    "events": [
+      {
+        "slot_id": 1,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 72.34042553191489,
+        "time_upper": 72.71747912739025,
+        "confirmed_at": 72.93293832480474,
+        "group_id": 4,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 72.93293832480474,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 2,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 70.40129275518449,
+        "time_upper": 72.82520872609749,
+        "confirmed_at": 73.04066792351198,
+        "group_id": 4,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 73.04066792351198,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 73.63318071640182,
+        "time_upper": 74.38728790735254,
+        "confirmed_at": 74.60274710476703,
+        "group_id": 4,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 74.60274710476703,
+        "recovered_before_initialization": false
+      }
+    ]
+  },
+  {
+    "type": "group_closed",
+    "group_id": 5,
+    "phase": "unload",
+    "at": 91.24697010503635,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pending",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 5,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "unload",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "incremental_yolo_box_centers",
+        "reason": "four_slot_tracks_stable",
+        "eligible_slot_count": 4,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 82.52087260974952,
+        "initial_centers_xy": [
+          [
+            390.219482421875,
+            238.24728393554688
+          ],
+          [
+            518.1938323974609,
+            303.75225830078125
+          ],
+          [
+            453.7805480957031,
+            218.81198120117188
+          ],
+          [
+            546.4276123046875,
+            265.14898681640625
+          ]
+        ],
+        "provisional_started_at": 78.53487745758146,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0,
+        "numbering_reference_centers_xy": [
+          [
+            390.219482421875,
+            238.24728393554688
+          ],
+          [
+            518.1938323974609,
+            303.75225830078125
+          ],
+          [
+            453.7805480957031,
+            218.81198120117188
+          ],
+          [
+            546.4276123046875,
+            265.14898681640625
+          ]
+        ]
+      },
+      "slots": [
+        {
+          "group_id": 5,
+          "slot_id": 1,
+          "center_xy": [
+            411.19,
+            205.45
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 91.03151090762186,
+          "last_seen_at": 91.03151090762186,
+          "confirmed_state_since": 86.23754376514947,
+          "confirmed_state_first_confirmed_at": 86.45300296256396,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 5,
+          "slot_id": 2,
+          "center_xy": [
+            460.13,
+            248.38
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 91.19310530568274,
+          "last_seen_at": 91.19310530568274,
+          "confirmed_state_since": 90.33126851602478,
+          "confirmed_state_first_confirmed_at": 90.54672771343927,
+          "confidence": 0.92172771692276,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 5,
+          "slot_id": 3,
+          "center_xy": [
+            459.3,
+            194.73
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 90.92378130891461,
+          "last_seen_at": 90.92378130891461,
+          "confirmed_state_since": 87.96121734446538,
+          "confirmed_state_first_confirmed_at": 88.17667654187987,
+          "confidence": 0.907926082611084,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 5,
+          "slot_id": 4,
+          "center_xy": [
+            531.66,
+            241.23
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "empty",
+          "last_confirmed_at": 91.19310530568274,
+          "last_seen_at": 91.19310530568274,
+          "confirmed_state_since": 81.60517102073794,
+          "confirmed_state_first_confirmed_at": 81.82063021815243,
+          "confidence": 0.8422978520393372,
+          "reason": "rotation_or_transition",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pending",
+      "confirmed_event_sequence": [
+        1,
+        3,
+        2
+      ],
+      "current_target_count": 0,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": []
+    },
+    "events": [
+      {
+        "slot_id": 1,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 85.86049016967411,
+        "time_upper": 86.23754376514947,
+        "confirmed_at": 86.45300296256396,
+        "group_id": 5,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 86.45300296256396,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 87.31483975222191,
+        "time_upper": 87.96121734446538,
+        "confirmed_at": 88.17667654187987,
+        "group_id": 5,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 88.17667654187987,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 2,
+        "from": "filled",
+        "to": "empty",
+        "action": "unload",
+        "time_lower": 83.70589819552922,
+        "time_upper": 90.33126851602478,
+        "confirmed_at": 90.54672771343927,
+        "group_id": 5,
+        "phase": "unload",
+        "expected_action": true,
+        "reported_at": 90.54672771343927,
+        "recovered_before_initialization": false
+      }
+    ]
+  },
+  {
+    "type": "group_closed",
+    "group_id": 1,
+    "phase": "load",
+    "at": 108.16051710207378,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pending",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 1,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "load",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "incremental_yolo_box_centers",
+        "reason": "four_slot_tracks_stable",
+        "eligible_slot_count": 4,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 98.62644761648262,
+        "initial_centers_xy": [
+          [
+            409.24713134765625,
+            251.16476440429688
+          ],
+          [
+            520.5140380859375,
+            309.52996826171875
+          ],
+          [
+            457.6131896972656,
+            225.54684448242188
+          ],
+          [
+            547.75390625,
+            271.3623046875
+          ]
+        ],
+        "provisional_started_at": 91.73175329921895,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0,
+        "numbering_reference_centers_xy": [
+          [
+            409.24713134765625,
+            251.16476440429688
+          ],
+          [
+            520.5140380859375,
+            309.52996826171875
+          ],
+          [
+            457.6131896972656,
+            225.54684448242188
+          ],
+          [
+            547.75390625,
+            271.3623046875
+          ]
+        ]
+      },
+      "slots": [
+        {
+          "group_id": 1,
+          "slot_id": 1,
+          "center_xy": [
+            419.33,
+            256.53
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 106.49070832211149,
+          "last_seen_at": 106.81389711823323,
+          "confirmed_state_since": 103.3665499596014,
+          "confirmed_state_first_confirmed_at": 103.58200915701589,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 1,
+          "slot_id": 2,
+          "center_xy": [
+            472.77,
+            255.12
+          ],
+          "state": "unknown",
+          "observation": "filled",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 107.56800430918395,
+          "last_seen_at": 108.16051710207378,
+          "confirmed_state_since": 101.42741718287098,
+          "confirmed_state_first_confirmed_at": 101.64287638028547,
+          "confidence": 0.9304007887840271,
+          "reason": "confirming",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 1,
+          "slot_id": 3,
+          "center_xy": [
+            458.45,
+            195.59
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 107.89119310530567,
+          "last_seen_at": 107.89119310530567,
+          "confirmed_state_since": 104.98249394021006,
+          "confirmed_state_first_confirmed_at": 105.19795313762455,
+          "confidence": 0.9350115656852722,
+          "reason": "outside_roi",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 1,
+          "slot_id": 4,
+          "center_xy": [
+            538.43,
+            244.01
+          ],
+          "state": "unknown",
+          "observation": "filled",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 104.38998114732021,
+          "last_seen_at": 108.16051710207378,
+          "confirmed_state_since": 104.06679235119849,
+          "confirmed_state_first_confirmed_at": 104.28225154861298,
+          "confidence": 0.8542773723602295,
+          "reason": "confirming",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pending",
+      "confirmed_event_sequence": [
+        2,
+        1,
+        4,
+        3
+      ],
+      "current_target_count": 0,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": []
+    },
+    "events": [
+      {
+        "slot_id": 2,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 98.73417721518986,
+        "time_upper": 101.42741718287098,
+        "confirmed_at": 101.64287638028547,
+        "reason": "detected_after_hand_contact",
+        "inferred": false,
+        "group_id": 1,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 101.64287638028547,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 1,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 102.07379477511445,
+        "time_upper": 103.3665499596014,
+        "confirmed_at": 103.58200915701589,
+        "reason": "detected_after_hand_contact",
+        "inferred": false,
+        "group_id": 1,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 103.58200915701589,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 4,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 98.78804201454349,
+        "time_upper": 104.06679235119849,
+        "confirmed_at": 104.28225154861298,
+        "reason": "detected_after_hand_contact",
+        "inferred": false,
+        "group_id": 1,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 104.28225154861298,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 103.74360355507675,
+        "time_upper": 104.98249394021006,
+        "confirmed_at": 105.19795313762455,
+        "group_id": 1,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 105.19795313762455,
+        "recovered_before_initialization": false
+      }
+    ]
+  },
+  {
+    "type": "group_closed",
+    "group_id": 2,
+    "phase": "load",
+    "at": 110.04578507945057,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pending",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 2,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "provisional",
+      "phase": "load",
+      "identity_status": "waiting_initialization",
+      "initialization": {
+        "status": "collecting",
+        "method": "incremental_yolo_box_centers",
+        "reason": "collecting_slot_tracks",
+        "eligible_slot_count": 1,
+        "stable_frames": 0,
+        "required_slot_count": 4,
+        "initialized_at": null,
+        "initial_centers_xy": null,
+        "provisional_started_at": 109.18394828979261,
+        "geometry_seen_slot_ids": [
+          3
+        ],
+        "buffered_event_count": 0
+      },
+      "slots": [
+        {
+          "group_id": 2,
+          "slot_id": 1,
+          "center_xy": [
+            540.71,
+            294.91
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "unknown",
+          "last_confirmed_at": null,
+          "last_seen_at": 109.45327228656072,
+          "confirmed_state_since": null,
+          "confirmed_state_first_confirmed_at": null,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": null,
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 2,
+          "slot_id": 2,
+          "center_xy": [
+            531.03,
+            345.23
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "unknown",
+          "last_confirmed_at": null,
+          "last_seen_at": 109.45327228656072,
+          "confirmed_state_since": null,
+          "confirmed_state_first_confirmed_at": null,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": null,
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 2,
+          "slot_id": 3,
+          "center_xy": [
+            450.84,
+            193.89
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "unknown",
+          "last_confirmed_at": null,
+          "last_seen_at": 109.83032588203608,
+          "confirmed_state_since": null,
+          "confirmed_state_first_confirmed_at": null,
+          "confidence": 0.9334995150566101,
+          "reason": "outside_roi",
+          "confirmation_source": null,
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 2,
+          "slot_id": 4,
+          "center_xy": null,
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "unknown",
+          "last_confirmed_at": null,
+          "last_seen_at": null,
+          "confirmed_state_since": null,
+          "confirmed_state_first_confirmed_at": null,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": null,
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pending",
+      "confirmed_event_sequence": [],
+      "current_target_count": 0,
+      "last_verified_target_count": 0,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": false,
+      "unassigned_slot_detections": [],
+      "provisional_events": []
+    },
+    "events": []
+  },
+  {
+    "type": "group_closed",
+    "group_id": 3,
+    "phase": "load",
+    "at": 125.77430649070831,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pending",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 3,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "provisional",
+      "phase": "load",
+      "identity_status": "waiting_initialization",
+      "initialization": {
+        "status": "collecting",
+        "method": "incremental_yolo_box_centers",
+        "reason": "collecting_slot_tracks",
+        "eligible_slot_count": 2,
+        "stable_frames": 0,
+        "required_slot_count": 4,
+        "initialized_at": null,
+        "initial_centers_xy": null,
+        "provisional_started_at": 110.20737947751144,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3
+        ],
+        "buffered_event_count": 1
+      },
+      "slots": [
+        {
+          "group_id": 3,
+          "slot_id": 1,
+          "center_xy": [
+            417.94,
+            254.44
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 123.13493132238082,
+          "last_seen_at": 124.37382170751413,
+          "confirmed_state_since": 120.87260974952868,
+          "confirmed_state_first_confirmed_at": 121.08806894694317,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 3,
+          "slot_id": 2,
+          "center_xy": [
+            530.02,
+            243.19
+          ],
+          "state": "unknown",
+          "observation": "filled",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 123.61971451656342,
+          "last_seen_at": 125.77430649070831,
+          "confirmed_state_since": 123.35039051979531,
+          "confirmed_state_first_confirmed_at": 123.5658497172098,
+          "confidence": 0.8744531273841858,
+          "reason": "confirming",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 3,
+          "slot_id": 3,
+          "center_xy": [
+            456.51,
+            195.36
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "unknown",
+          "last_confirmed_at": null,
+          "last_seen_at": 125.45111769458659,
+          "confirmed_state_since": null,
+          "confirmed_state_first_confirmed_at": null,
+          "confidence": 0.9220006465911865,
+          "reason": "outside_roi",
+          "confirmation_source": null,
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 3,
+          "slot_id": 4,
+          "center_xy": null,
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "unknown",
+          "last_confirmed_at": null,
+          "last_seen_at": null,
+          "confirmed_state_since": null,
+          "confirmed_state_first_confirmed_at": null,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": null,
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pending",
+      "confirmed_event_sequence": [],
+      "current_target_count": 0,
+      "last_verified_target_count": 2,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": false,
+      "unassigned_slot_detections": [],
+      "provisional_events": [
+        {
+          "slot_id": 1,
+          "from": "empty",
+          "to": "filled",
+          "action": "load",
+          "time_lower": 119.95690816051709,
+          "time_upper": 120.87260974952868,
+          "confirmed_at": 121.08806894694317,
+          "reason": "detected_after_hand_contact",
+          "inferred": false,
+          "group_id": 3,
+          "phase": "load",
+          "expected_action": true,
+          "reported_at": 121.08806894694317,
+          "recovered_before_initialization": false
+        }
+      ]
+    },
+    "events": []
+  },
+  {
+    "type": "group_closed",
+    "group_id": 4,
+    "phase": "load",
+    "at": 139.2405063291139,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pass",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 4,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "load",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "incremental_yolo_box_centers",
+        "reason": "four_slot_tracks_stable",
+        "eligible_slot_count": 4,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 129.27551844869376,
+        "initial_centers_xy": [
+          [
+            409.021728515625,
+            248.71029663085938
+          ],
+          [
+            518.5758056640625,
+            311.545654296875
+          ],
+          [
+            457.0400390625,
+            226.14718627929688
+          ],
+          [
+            544.9192047119141,
+            269.6190872192383
+          ]
+        ],
+        "provisional_started_at": 126.79773767842714,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0,
+        "numbering_reference_centers_xy": [
+          [
+            409.021728515625,
+            248.71029663085938
+          ],
+          [
+            518.5758056640625,
+            311.545654296875
+          ],
+          [
+            457.0400390625,
+            226.14718627929688
+          ],
+          [
+            544.9192047119141,
+            269.6190872192383
+          ]
+        ]
+      },
+      "slots": [
+        {
+          "group_id": 4,
+          "slot_id": 1,
+          "center_xy": [
+            419.19,
+            256.35
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 137.84002154591974,
+          "last_seen_at": 137.84002154591974,
+          "confirmed_state_since": 134.28494478858065,
+          "confirmed_state_first_confirmed_at": 134.50040398599515,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 4,
+          "slot_id": 2,
+          "center_xy": [
+            469.98,
+            253.09
+          ],
+          "state": "unknown",
+          "observation": "filled",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 138.64799353622408,
+          "last_seen_at": 139.2405063291139,
+          "confirmed_state_since": 132.4535416105575,
+          "confirmed_state_first_confirmed_at": 132.66900080797197,
+          "confidence": 0.9483140707015991,
+          "reason": "confirming",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 4,
+          "slot_id": 3,
+          "center_xy": [
+            458.33,
+            195.61
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 138.9711823323458,
+          "last_seen_at": 138.9711823323458,
+          "confirmed_state_since": 135.52383517371396,
+          "confirmed_state_first_confirmed_at": 135.73929437112847,
+          "confidence": 0.9357127547264099,
+          "reason": "outside_roi",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 4,
+          "slot_id": 4,
+          "center_xy": [
+            532.38,
+            242.47
+          ],
+          "state": "unknown",
+          "observation": "filled",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 136.8165903582009,
+          "last_seen_at": 139.2405063291139,
+          "confirmed_state_since": 130.5682736331807,
+          "confirmed_state_first_confirmed_at": 130.7837328305952,
+          "confidence": 0.7894659638404846,
+          "reason": "confirming",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pass",
+      "confirmed_event_sequence": [
+        4,
+        2,
+        1,
+        3
+      ],
+      "current_target_count": 0,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": []
+    },
+    "events": [
+      {
+        "slot_id": 4,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 129.65257204416912,
+        "time_upper": 130.5682736331807,
+        "confirmed_at": 130.7837328305952,
+        "group_id": 4,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 130.7837328305952,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 2,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 131.4839752221923,
+        "time_upper": 132.4535416105575,
+        "confirmed_at": 132.66900080797197,
+        "reason": "detected_after_hand_contact",
+        "inferred": false,
+        "group_id": 4,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 132.66900080797197,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 1,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 133.4769727982763,
+        "time_upper": 134.28494478858065,
+        "confirmed_at": 134.50040398599515,
+        "group_id": 4,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 134.50040398599515,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 135.03905197953137,
+        "time_upper": 135.52383517371396,
+        "confirmed_at": 135.73929437112847,
+        "group_id": 4,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 135.73929437112847,
+        "recovered_before_initialization": false
+      }
+    ]
+  },
+  {
+    "type": "group_closed",
+    "group_id": 5,
+    "phase": "load",
+    "at": 152.81443576622675,
+    "close_reason": "observed_roi_exit",
+    "operation_result": "pass",
+    "crossed_slot_ids": [
+      3
+    ],
+    "required_crossings": 1,
+    "snapshot": {
+      "group_id": 5,
+      "group_assignment": "roi_exit_sequence",
+      "slot_numbering_status": "final",
+      "phase": "load",
+      "identity_status": "tracking",
+      "initialization": {
+        "status": "ready",
+        "method": "incremental_yolo_box_centers",
+        "reason": "four_slot_tracks_stable",
+        "eligible_slot_count": 3,
+        "stable_frames": 7,
+        "required_slot_count": 4,
+        "initialized_at": 142.84944788580663,
+        "initial_centers_xy": [
+          [
+            410.389892578125,
+            247.59298706054688
+          ],
+          [
+            521.7432861328125,
+            309.00567626953125
+          ],
+          [
+            453.55511474609375,
+            223.34918212890625
+          ],
+          [
+            544.0067291259766,
+            264.56329345703125
+          ]
+        ],
+        "provisional_started_at": 139.940748720711,
+        "geometry_seen_slot_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "buffered_event_count": 0,
+        "numbering_reference_centers_xy": [
+          [
+            410.389892578125,
+            247.59298706054688
+          ],
+          [
+            521.7432861328125,
+            309.00567626953125
+          ],
+          [
+            453.55511474609375,
+            223.34918212890625
+          ],
+          [
+            544.0067291259766,
+            264.56329345703125
+          ]
+        ]
+      },
+      "slots": [
+        {
+          "group_id": 5,
+          "slot_id": 1,
+          "center_xy": [
+            419.85,
+            253.05
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 151.52168058173982,
+          "last_seen_at": 151.52168058173982,
+          "confirmed_state_since": 147.96660382440075,
+          "confirmed_state_first_confirmed_at": 148.18206302181522,
+          "confidence": null,
+          "reason": "not_detected",
+          "confirmation_source": "yolo",
+          "position_is_prediction": true,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 5,
+          "slot_id": 2,
+          "center_xy": [
+            474.67,
+            259.79
+          ],
+          "state": "unknown",
+          "observation": "filled",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 152.27578777269053,
+          "last_seen_at": 152.81443576622675,
+          "confirmed_state_since": 145.86587664960948,
+          "confirmed_state_first_confirmed_at": 146.08133584702395,
+          "confidence": 0.9525936245918274,
+          "reason": "confirming",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 5,
+          "slot_id": 3,
+          "center_xy": [
+            455.67,
+            195.35
+          ],
+          "state": "unknown",
+          "observation": "unknown",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 152.59897656881228,
+          "last_seen_at": 152.59897656881228,
+          "confirmed_state_since": 149.63641260436304,
+          "confirmed_state_first_confirmed_at": 149.85187180177752,
+          "confidence": 0.9290582537651062,
+          "reason": "outside_roi",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        },
+        {
+          "group_id": 5,
+          "slot_id": 4,
+          "center_xy": [
+            539.85,
+            244.38
+          ],
+          "state": "filled",
+          "observation": "filled",
+          "last_confirmed_state": "filled",
+          "last_confirmed_at": 152.81443576622675,
+          "last_seen_at": 152.81443576622675,
+          "confirmed_state_since": 143.98060867223268,
+          "confirmed_state_first_confirmed_at": 144.19606786964718,
+          "confidence": 0.7596246004104614,
+          "reason": "confirmed",
+          "confirmation_source": "yolo",
+          "position_is_prediction": false,
+          "load_contact_pending": false,
+          "load_contact_count": 0,
+          "load_contact_since": null,
+          "load_contact_last_seen": null,
+          "load_contact_released_at": null
+        }
+      ],
+      "order_result": "pass",
+      "confirmed_event_sequence": [
+        4,
+        2,
+        1,
+        3
+      ],
+      "current_target_count": 1,
+      "last_verified_target_count": 4,
+      "all_four_currently_confirmed": false,
+      "all_four_target_previously_verified": true,
+      "unassigned_slot_detections": []
+    },
+    "events": [
+      {
+        "slot_id": 4,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 143.11877188257472,
+        "time_upper": 143.98060867223268,
+        "confirmed_at": 144.19606786964718,
+        "reason": "detected_after_hand_contact",
+        "inferred": false,
+        "group_id": 5,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 144.19606786964718,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 2,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 145.00403985995152,
+        "time_upper": 145.86587664960948,
+        "confirmed_at": 146.08133584702395,
+        "reason": "detected_after_hand_contact",
+        "inferred": false,
+        "group_id": 5,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 146.08133584702395,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 1,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 146.51225424185293,
+        "time_upper": 147.96660382440075,
+        "confirmed_at": 148.18206302181522,
+        "reason": "detected_after_hand_contact",
+        "inferred": false,
+        "group_id": 5,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 148.18206302181522,
+        "recovered_before_initialization": false
+      },
+      {
+        "slot_id": 3,
+        "from": "empty",
+        "to": "filled",
+        "action": "load",
+        "time_lower": 148.66684621599782,
+        "time_upper": 149.63641260436304,
+        "confirmed_at": 149.85187180177752,
+        "group_id": 5,
+        "phase": "load",
+        "expected_action": true,
+        "reported_at": 149.85187180177752,
+        "recovered_before_initialization": false
+      }
+    ]
+  }
+]

@@ -229,6 +229,31 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(result['slots'][0]['center_xy'],[230.,200.])
         self.assertEqual(result['slots'][0]['state'],'filled')
 
+    def test_unseen_old_s4_follows_three_old_slots_and_stays_out_of_next_group(self):
+        s=self.make(exit_min_slots=1,partial_exit_slots=1)
+        s.tracker=SlotGroupTracker(group_id=2,confirm_seconds=.1,minimum_frames=2,
+                                   initialization_seconds=.1,initialization_frames=2)
+        s.tracker.start_incremental_entry(40)
+        s.state='entering'
+        s._hands=[]
+        s.departing_points=POINTS.copy()
+        s.departing_seen=np.full(4,1.,dtype=float)
+        s.departing_predicted=np.array([False,False,False,True])
+        s.departing_gate=40
+        moved=POINTS+[20,10]
+
+        admitted=s._exclude_departing(boxes(moved,visible=(0,1,2)),1.1)
+        self.assertEqual(admitted,[])
+        np.testing.assert_allclose(s.departing_points[3],moved[3])
+        self.assertAlmostEqual(s.departing_seen[3],1.1)
+        self.assertTrue(s.departing_predicted[3])
+
+        # S4恢复检测时仍关联到旧G1并从新组入口候选中排除。
+        admitted=s._exclude_departing(boxes(moved),1.2)
+        self.assertEqual(admitted,[])
+        self.assertFalse(s.departing_predicted[3])
+        self.assertEqual(s.tracker._entry_points,[])
+
     def test_missing_old_tail_cannot_take_an_established_incoming_track(self):
         """旧点漏检后，新点仍应归属新组，临时号和正式号阶段都不能被旧点吞掉。"""
         roi=np.array([[80,80],[410,80],[410,310],[80,310]],dtype=np.float32)
@@ -275,16 +300,18 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(result['group_status'],'active')
         self.assertEqual(result['crossed_slot_ids'],[])
 
-    def test_no_entry_with_three_or_more_than_four_candidates(self):
+    def test_three_valid_entry_slots_are_inferred_but_excess_candidates_are_rejected(self):
         s=self.make()
         self.baseline(s)
         self.exit(s)
-        for _ in range(10): result=self.step(s,boxes(visible=(0,1,2)))
-        self.assertEqual(result['group_id'],1)
         extra={"class_name":"wafer_slot_empty","confidence":.9,"xyxy":[230,240,250,260]}
         for _ in range(10): result=self.step(s,boxes()+[extra])
         self.assertEqual(result['group_id'],1)
         self.assertEqual(result['group_status'],'waiting_next')
+        for _ in range(10): result=self.step(s,boxes(visible=(0,1,2)))
+        self.assertEqual(result['group_id'],2)
+        self.assertEqual(result['group_status'],'active')
+        self.assertEqual(result['initialization']['inferred_slot_ids'],[4])
 
     def test_moving_entry_does_not_initialize_until_stopped(self):
         s=self.make()
@@ -456,8 +483,12 @@ class GroupSequenceTests(unittest.TestCase):
                     first_full=now
                     self.assertEqual(result['group_status'],'entering')
                     self.assertEqual(sum(x['center_xy'] is not None for x in result['slots']),1)
-                if all_full is None and all(x['last_confirmed_state']=='filled' for x in result['slots']):
+                if all_full is None and sum(x['last_confirmed_state']=='filled' for x in result['slots']) >= 3:
                     all_full=now
+                    # 只有缺失位置正式映射为S4时才保留推算标记；
+                    # 三点暂时对应其他缺失槽时应等待真实检测，不伪造S4。
+                    self.assertTrue(all(x['slot_id']==4 for x in result['slots']
+                                        if x['geometry_inferred']))
                 self.assertNotEqual(result['group_status'],'identity_uncertain')
         self.assertIsNotNone(first_full)
         self.assertLess(first_full,42)
@@ -481,8 +512,10 @@ class GroupSequenceTests(unittest.TestCase):
                 if first_full is None and any(x['state']=='filled' for x in result['slots']):
                     first_full=now
                     self.assertEqual(result['group_status'],'entering')
-                if all_full is None and all(x['last_confirmed_state']=='filled' for x in result['slots']):
+                if all_full is None and sum(x['last_confirmed_state']=='filled' for x in result['slots']) >= 3:
                     all_full=now
+                    self.assertTrue(all(x['slot_id']==4 for x in result['slots']
+                                        if x['geometry_inferred']))
                 self.assertNotEqual(result['group_status'],'identity_uncertain')
         self.assertIsNotNone(first_full)
         self.assertLess(first_full,55)

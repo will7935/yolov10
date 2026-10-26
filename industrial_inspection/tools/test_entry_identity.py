@@ -27,7 +27,7 @@ def rotated(degrees):
 
 class EntryIdentityTests(unittest.TestCase):
     def tracker(self):
-        tracker = SlotGroupTracker(group_id=2, confirm_seconds=.1, minimum_frames=2,
+        tracker = SlotGroupTracker(group_id=2, phase='load', confirm_seconds=.1, minimum_frames=2,
             initialization_seconds=.3, initialization_frames=2, slot2_below_slot3=True)
         tracker.start_incremental_entry(40)
         return tracker
@@ -220,7 +220,7 @@ class EntryIdentityTests(unittest.TestCase):
         result = sequence.update(objects, .1)
         self.assertTrue(all(s['center_xy'] is None for s in result['slots']))
 
-    def test_partial_group_can_exit_without_inventing_formal_slot_numbers(self):
+    def test_partial_unestablished_group_cannot_trigger_another_switch(self):
         tracker = self.tracker()
         roi = np.array([[80, 80], [210, 80], [210, 310], [80, 310]], dtype=np.float32)
         sequence = RoiGroupSequence(tracker, roi, exit_min_slots=1, partial_exit_slots=1)
@@ -229,10 +229,10 @@ class EntryIdentityTests(unittest.TestCase):
         shifted = PHYSICAL.copy()
         shifted[0] = [75, 100]
         result = sequence.update(boxes(shifted, visible=(0, 1, 2)), .1)
-        self.assertEqual(result['group_id'], 3)
-        self.assertEqual(len(sequence.closed_groups), 1)
-        self.assertEqual(sequence.closed_groups[0]['snapshot']['slot_numbering_status'], 'provisional')
-        self.assertEqual(sequence.closed_groups[0]['operation_result'], 'pending')
+        self.assertEqual(result['group_id'], 2)
+        self.assertEqual(len(sequence.closed_groups), 0)
+        self.assertEqual(result['slot_numbering_status'], 'provisional')
+        self.assertEqual(result['group_status'], 'entering')
 
     def test_recorded_loading_transitions_exclude_all_four_reported_old_tails(self):
         fixture = Path(__file__).with_name('fixtures')/'loading_tail_transitions.json'

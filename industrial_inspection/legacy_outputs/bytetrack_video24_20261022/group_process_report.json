@@ -1,0 +1,258 @@
+{
+  "unload": {
+    "phase": "unload",
+    "slot_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "matrix": [
+      [
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        0
+      ],
+      [
+        1,
+        1,
+        1,
+        0
+      ]
+    ],
+    "groups": [
+      {
+        "group_id": 1,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "completed": true,
+        "sequence": [
+          4,
+          2,
+          1,
+          3
+        ],
+        "order_result": "pending"
+      },
+      {
+        "group_id": 2,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "completed": true,
+        "sequence": [
+          4,
+          2,
+          1,
+          3
+        ],
+        "order_result": "pass"
+      },
+      {
+        "group_id": 3,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "completed": true,
+        "sequence": [
+          4,
+          2,
+          1,
+          3
+        ],
+        "order_result": "pass"
+      },
+      {
+        "group_id": 4,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          0
+        ],
+        "completed": false,
+        "sequence": [
+          1,
+          2,
+          3
+        ],
+        "order_result": "pending"
+      },
+      {
+        "group_id": 5,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          0
+        ],
+        "completed": false,
+        "sequence": [
+          1,
+          3,
+          2
+        ],
+        "order_result": "pending"
+      }
+    ],
+    "end_status": "hatch_closed"
+  },
+  "load": {
+    "phase": "load",
+    "slot_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "matrix": [
+      [
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        1
+      ]
+    ],
+    "groups": [
+      {
+        "group_id": 1,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "completed": true,
+        "sequence": [
+          2,
+          1,
+          4,
+          3
+        ],
+        "order_result": "pending"
+      },
+      {
+        "group_id": 2,
+        "observed": true,
+        "slot_completed": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "completed": false,
+        "sequence": [],
+        "order_result": "pending"
+      },
+      {
+        "group_id": 3,
+        "observed": true,
+        "slot_completed": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "completed": false,
+        "sequence": [],
+        "order_result": "pending"
+      },
+      {
+        "group_id": 4,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "completed": true,
+        "sequence": [
+          4,
+          2,
+          1,
+          3
+        ],
+        "order_result": "pass"
+      },
+      {
+        "group_id": 5,
+        "observed": true,
+        "slot_completed": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "completed": true,
+        "sequence": [
+          4,
+          2,
+          1,
+          3
+        ],
+        "order_result": "pass"
+      }
+    ],
+    "end_status": "hatch_closed"
+  }
+}

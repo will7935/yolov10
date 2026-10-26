@@ -33,10 +33,10 @@ def contact(t):
 
 
 class LoadingEvidenceTests(unittest.TestCase):
-    def test_unknown_baseline_and_initial_filled_do_not_invent_a_load(self):
+    def test_unknown_baseline_without_contact_does_not_invent_a_load(self):
         t=tracker()
         for now in (0.,.1,.2):
-            t.update(boxes(visible=(0,1,2))+[HAND],now)
+            t.update(boxes(visible=(0,1,2)),now)
         for now in (.3,.4):
             t.update(boxes(filled=(3,)),now)
         self.assertEqual(t.events,[])
@@ -189,13 +189,13 @@ class LoadingPipelineTests(unittest.TestCase):
         self.assertEqual(report["order_result"],"pass")
         self.assertEqual(logs.count("游星片1：上料完成"),1)
 
-    def test_hidden_s4_is_not_completed_from_hand_contact_at_end(self):
+    def test_hidden_s4_is_completed_by_empty_to_unknown_after_hand_contact(self):
         result,logs=self.run_case(visual_fill=False)
-        self.assertEqual(len(result["events"]),3)
+        self.assertEqual(len(result["events"]),4)
+        self.assertEqual(result["events"][-1]["reason"],"hand_contact_inferred_load")
         report=result["group_process_report"]["groups"][0]
-        self.assertEqual(report["slot_completed"],[1,1,1,0])
-        self.assertNotIn("1*",logs[-1])
-        self.assertNotIn("游星片1：上料完成",logs)
+        self.assertEqual(report["slot_completed"],[1,1,1,1])
+        self.assertIn("游星片1：上料完成",logs)
 
     def test_g5_exit_still_checks_rotation_visible_fill(self):
         result,_=self.run_case(visual_fill=True,group_id=5)
@@ -204,7 +204,7 @@ class LoadingPipelineTests(unittest.TestCase):
         self.assertEqual(result["final_group_snapshot"]["group_status"],"sequence_complete")
 
     def test_early_stop_does_not_infer_an_incomplete_recording(self):
-        result,_=self.run_case(visual_fill=False,max_frames=17)
+        result,_=self.run_case(visual_fill=False,max_frames=16)
         self.assertEqual(len(result["events"]),3)
         self.assertEqual(result["group_process_report"]["matrix"][0],[1,1,1,0])
 

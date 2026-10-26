@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 import tempfile
@@ -48,6 +49,35 @@ class PipelineTest(unittest.TestCase):
         self.local_redetection.start()
         self.addCleanup(self.local_redetection.stop)
 
+    def test_unmapped_bytetrack_state_is_saved_in_detection_csv(self):
+        frames = [boxes(visible=(0,), filled=(0,))]*8
+        with tempfile.TemporaryDirectory(prefix='wafer_unmapped_tracks_') as directory:
+            root = Path(directory)
+            source = root/'source.mp4'
+            writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*'mp4v'), 10., (640,480))
+            self.assertTrue(writer.isOpened())
+            for _ in frames:
+                writer.write(np.zeros((480,640,3), dtype=np.uint8))
+            writer.release()
+            args = argparse.Namespace(source=source, weights=root/'model.pt', output_dir=root/'results',
+                conf=.35, imgsz=640, device='cpu', stride=1, show=False, max_frames=0, nms_iou=.7)
+            with (patch.object(predict.base, 'load_detection_model',
+                               return_value=(SyntheticModel(frames), 'synthetic')),
+                  patch.object(predict, 'CONFIRM_SECONDS', .2),
+                  patch.object(predict, 'MIN_CONFIRM_FRAMES', 2)):
+                predict.run_prediction(args, roi_polygon={'polygon': ROI/[640,480],
+                    'size': (640,480), 'start_frame': 0})
+            with (args.output_dir/'slot_tracks.csv').open(encoding='utf-8-sig', newline='') as handle:
+                records = list(csv.DictReader(handle))
+            self.assertEqual(len(records), len(frames))
+            self.assertEqual(len({row['track_id'] for row in records}), 1)
+            self.assertEqual(records[-1]['slot_state'], 'filled')
+            self.assertEqual(records[-1]['slot_id'], '')
+            self.assertEqual(records[-1]['mapping_reason'], 'waiting_group_geometry')
+            states = [json.loads(line) for line in
+                (args.output_dir/'slot_tracks.jsonl').read_text(encoding='utf-8').splitlines()]
+            self.assertEqual(states[-1]['detections'][0]['slot_state'], 'filled')
+
     def test_single_exit_saves_and_displays_full_state_from_one_incoming_point(self):
         roi=np.array([[80,80],[410,80],[410,310],[80,310]],dtype=float)
         old=POINTS.copy()
@@ -70,6 +100,7 @@ class PipelineTest(unittest.TestCase):
             context={'polygon':roi/np.array([640,480]),'size':(640,480),'start_frame':0}
             ui=[]
             with (patch.object(predict.base,'load_detection_model',return_value=(SyntheticModel(frames),'synthetic')),
+                  patch.object(predict.SlotByteTracker, 'reset', side_effect=AssertionError('G切换不得重置ByteTrack')),
                   patch.object(predict,'CURRENT_GROUP_ID',1),patch.object(predict,'PROCESS_PHASE','unload'),
                   patch.object(predict,'AUTO_GROUP_SWITCH',True),patch.object(predict,'EXIT_MIN_SLOTS',1),
                   patch.object(predict,'PARTIAL_EXIT_MIN_SLOTS',1),patch.object(predict,'CONFIRM_SECONDS',.1),
@@ -79,7 +110,8 @@ class PipelineTest(unittest.TestCase):
                     and r['slots'][0]['state']=='filled']
             self.assertTrue(filled)
             self.assertEqual(filled[0]['slot_numbering_status'],'provisional')
-            self.assertIn('临时点1:已填充',filled[0]['result'])
+            self.assertIn('BT',filled[0]['result'])
+            self.assertNotIn('临时点',filled[0]['result'])
             states=[json.loads(line) for line in (args.output_dir/'slot_states.jsonl').read_text(encoding='utf-8').splitlines()]
             self.assertTrue(any(r['group_id']==2 and r['group_status']=='entering'
                                 and r['slots'][0]['state']=='filled' for r in states))
@@ -88,6 +120,11 @@ class PipelineTest(unittest.TestCase):
             self.assertTrue(events[0]['recovered_before_initialization'])
             self.assertEqual(summary['events'],events)
             self.assertEqual(summary['closed_groups'][0]['events'],[])
+            tracks = [json.loads(line) for line in
+                (args.output_dir/'slot_tracks.jsonl').read_text(encoding='utf-8').splitlines()]
+            self.assertTrue(any(row['group_id'] == 2 and any(
+                item.get('group_id') == 1 and item.get('mapping_reason') == 'previous_group_track'
+                for item in row['detections']) for row in tracks))
 
     def test_early_unloads_reach_saved_events_summary_and_ui(self):
         hand={"class_name":"hand","confidence":.9,"xyxy":[85,85,115,115]}

@@ -7,13 +7,15 @@
 
 - 默认确认舱门把手打开后才启动原来的下料→上料流程；确认关门后结束本轮检测，冻结二十槽统计。
 - 每组正式槽号分别确认四个满槽后输出“游星片N：已放满（4/4）”；关门时输出“已放满（20/20）”或“未放满（N/20）”。
-- 用ROI内YOLO检测框的中心自动初始化四槽。当前相机按左上S1、顺时针1→3→4→2的二维环序编号，
+- 用ROI内YOLO检测框的中心初始化槽位。下料时若仅检测到三个几何关系有效的槽，且几何关系表明缺失位置是S4，可按约90°环形布局推算S4中心；若缺失的是其他槽则继续等待真实框。当前相机按左上S1、顺时针1→3→4→2的二维环序编号，
   并用S2通常位于S3下方辅助核验；不把四槽全局按y排序。正式编号后不再重排。
 - 起始组号可配置为 1..5；当前单点换组模式下，旧组任一真实中心越出ROI就立即递增组号，开始跟踪新点。
-  新点按出现顺序显示临时点号T1..T4并记录空满；收齐四条轨迹且停稳后映射一次正式槽号S1..S4，状态历史随点继承。
+  新点仅显示ByteTrack轨迹ID并记录空满；收齐三条或四条可靠轨迹且几何稳定后，一次性映射到正式槽号S1..S4，状态历史随轨迹继承。ByteTrack ID不是槽号，不能单独作为S1..S4使用。
   第四槽延迟出现时，可使用此前至少三槽已确认的停稳几何作为身份参考，不要求四槽同时无遮挡。
 - 单点换组后的新组按真实中心逐点匹配（当前40像素），不把一两个点的移动外推到其他槽。
   四条轨迹均已建立后，至少三个可靠点支持有界相似变换时，才允许跟随暂时遮挡槽的参考位置。
+  旧组退出时若S4来自三点几何推算，会用仍可见的三条真实槽估算同一载体运动，并保留为旧组预测轨迹，
+  直到该槽重新被真实框接管或旧组离开ROI缓冲带，避免转动中的G3-S4被当作G4槽位。
   首组及多点模式在小幅连续移动/旋转时，至少三个可靠匹配槽共同支持相似变换，才更新未检出槽的预计位置。
   当前检测中心与编号参考位置分开保存；只有一两个槽可见时仅显示各自的检测中心，
   不改变整组关联模板，避免把框中心抖动外推为整组运动或造成槽间距不断缩小。
@@ -28,7 +30,11 @@
 - 组号来自已知起始组号与换组次数，不是凭单张图片识别物理游星片。
 - 默认自动运行 `下料 G1→G5 → 上料 G1→G5`。下料G5实际退出ROI后立即进入上料G1，
   上料G5退出后显示“工序结束”。未确认完成的下料槽仍记录为未完成，不会阻塞下一物理组的跟踪。
-- 手接触只记录为遮挡和待核验信息，不能证明上料或下料；操作事件需要真实的empty→filled视觉证据。
+- 空满状态优先使用YOLO连续确认。仅S4的手接触用于补足状态变化；接触达到门限并离开后，若YOLO仍持续为unknown，
+  且接触前有已确认状态，则按原状态反转：`empty→filled`、`filled→empty`；推断事件标记
+  `confirmation_source=hand_contact`。下料时若接触前一直没有确认状态，则在有效手接触达到门限后，先以`filled`
+  作为初始基线，离手后仍为unknown时推断为`empty`。如果YOLO直接确认新状态，
+  保留YOLO结果；若确认的仍是接触前状态，则取消接触推断。接触后先等待短暂恢复检测，仍为unknown才补状态。
   满槽核验单独统计可靠确认的filled占用状态，首次看见已经放满也可以计入；不会凭接触、遮挡或转位次数补足数量。
 
 ## 舱门控制与二十槽核验
@@ -67,7 +73,7 @@ HATCH_MAX_GAP_SECONDS = .25
 ## 换组判断
 
 ```text
-首组四槽初始化 → 操作中 → 任一真实中心越界 → 新组逐点记录 → 四槽身份与停稳几何核验 → 正式编号
+首组至少三槽初始化（下料可推算缺失中心） → 操作中 → 任一真实中心越界 → 新组逐点记录 → 几何与停稳核验 → 正式编号
                             ↓
                  遮挡/匹配证据不足：组身份待确认，保持组号
 ```
@@ -105,18 +111,19 @@ EXIT_MIN_MOTION_RATIO和MOTION_PAUSE_RATIO仅供恢复多点换组规则时使�
 
 ## 首次运行
 
-1. 打开新脚本，确认 SOURCE_VIDEO、MODEL_WEIGHTS。默认沿用原脚本，也可直接改为自己的 Path(r"...")。
+1. 打开脚本，确认 SOURCE_VIDEO、MODEL_WEIGHTS。旧分组入口当前默认使用 exp3.3；ByteTrack跟踪`wafer_slot_empty`和`wafer_slot_filled`槽位框，两类检测共用同一跟踪器，轨迹稳定后再按槽位几何映射为S1–S4。普通检测入口的权重配置保持不变。
 2. 默认 CURRENT_GROUP_ID=1、PROCESS_PHASE="unload"、AUTO_LOAD_AFTER_UNLOAD=True，自动完成下料到上料的切换。
    视频中途开始时填当前真实组号和起始工序；只有纯上料片段才需要手动设PROCESS_PHASE="load"。
 3. 运行脚本，默认打开现有 UI7V。“槽位 ROI”可选“读取配置”或“手动划分”，然后点击“开始检测”。
    默认读取第一次验证通过的ROI；选择其他JSON即可复用已有标定。手动模式可选保存路径，开始时弹出圈选窗口。
 4. 不再打开四槽标定窗口，也不读取旧的 `<视频名>_four_slots.json`。
    槽中心直接取检测框 `(x1+x2)/2, (y1+y2)/2`。
-5. ROI内去重后首次恰好四个槽时，建立候选轨迹，并开始逐槽确认空满。
+5. ROI内去重后首次检测到三个槽时，下料阶段仅在四槽近似正方形/圆周关系表明缺失位置为S4时推算其中心；若缺失其他槽或几何不成立，则继续等待真实槽框。上料仍等待四个真实槽中心。
    首组每槽都曾无遮挡地匹配，至少三个可靠可见槽支持稳定几何达到0.3秒及2帧后，启用正式编号。
    此时即使一槽被手遮挡，也不再要求四槽同时无遮挡。身份确认时按参考姿态正式映射，之后不重排。
-6. 初始只有三个槽时，尚未建立轨迹的槽位坐标为空，左上角显示工序未完成，等待四槽齐全。
-   初始多于四槽时也等待，避免擅自取高分四框。ROI外缓冲带中的点只用于后续追踪，不参与初始化。
+6. 缺失位置确认是S4时，才为S4更新预测中心并显示虚线跟踪框；S1–S3及其他缺失槽不做几何外推，也不显示预测框。下料S4手接触达到门限并离手后，
+   若YOLO仍未给出可确认空/满状态，可按手接触规则记录推断事件；事件`confirmation_source`为`hand_contact`。
+   初始多于四槽时仍等待，避免擅自取高分四框。ROI外缓冲带中的点只用于后续追踪，不参与初始化。
 
 固定ROI保存在`industrial_inspection/configs/slot_roi.json`，使用第一次验证通过的区域，
 640×480参考坐标约为`(279,157)、(628,241)、(633,387)、(300,321)`，同宽高比按分辨率缩放。
@@ -134,12 +141,12 @@ python industrial_inspection/tools/predict_slot_groups.py --roi-file "I:/youyan/
 python industrial_inspection/tools/predict_slot_groups.py --roi-file "I:/youyan/test_dataset/custom_roi.json" --reselect-roi
 ```
 
-ROI应排除上方槽位并在操作时包含同一游星片的四槽。
+ROI应排除上方槽位，并覆盖同一游星片可见的至少三个槽和推算出的S4接触中心。
 恰好检测到四个框本身不能证明四槽同组。ROI需在操作时只包含一组；过宽且同时包含其他静止槽会影响初始化。
 新旧组短暂同时出现时，单点模式继续排除旧组尾部，同时跟踪新点；多余候选不用于凑足四槽。
 对已有新组轨迹，门限内且更靠近新点的框保留给新组，避免旧点漏检后误接新点并持续排除。
-新组即使只有一个点也保存临时状态，正式槽号需要累计收齐四槽，不要求同帧出现。
-临时T号仅表示出现顺序，正式S号可能不同；读取逐帧结果时应结合slot_numbering_status。
+新组即使只有一个点也保存临时状态；下料阶段三条有效槽轨迹仅在缺失位置为S4时可推算中心并进入稳定确认，上料阶段仍需收齐四个真实中心。
+初始化阶段的画面和状态栏使用ByteTrack ID标识检测框，不再显示临时T号；内部仍保留槽位索引用于状态缓存和几何恢复。正式编号完成后同时显示ByteTrack ID与S1-S4映射。
 默认只保留最近5秒内有原状态和新状态证据的事件，不会因为是下料工序就假定初始四槽全满。
 
 检查首次输出的槽号与实际顺时针关系。当前SLOT2_BELOW_SLOT3=True适用于本相机的左上S1、
@@ -162,14 +169,14 @@ EXIT_BOUNDARY_MARGIN_PX = 4
 ROI_TRACKING_MARGIN_PX = 40
 EXIT_MIN_MOTION_RATIO = 0.5
 MOTION_PAUSE_RATIO = 0.18
-NEXT_GROUP_STABLE_SECONDS = 0.3 # 新组正式编号前的几何停稳时长；T号状态确认不暂停
+NEXT_GROUP_STABLE_SECONDS = 0.3 # 新组正式编号前的几何停稳时长；ByteTrack状态确认不暂停
 NEXT_GROUP_STABILITY_RATIO = 0.12
 NEXT_GROUP_MATCH_DISTANCE_PX = 40 # 单点模式逐帧匹配距离，单位像素
 NEXT_GROUP_ENTRY_FRACTION = 0.6 # 已知退出方向下，沿入口到出口前60%允许首批轨迹出生
 SLOT2_BELOW_SLOT3 = True     # 本相机二维环序编号及上下关系辅助核验
 EXIT_DIRECTION = (-1,-1)      # camera_B首次转位已核实向左上；不确定时填None自动判断
 
-LOAD_HAND_CONTACT_ENABLED = True       # 仅上料时把手接触作为辅助证据
+LOAD_HAND_CONTACT_ENABLED = True       # 仅S4允许按手接触补足unknown空满变化
 LOAD_HAND_CONTACT_SECONDS = 0.15        # 连续接触时长
 LOAD_HAND_CONTACT_MIN_FRAMES = 2        # 最少接触帧数
 
@@ -191,9 +198,12 @@ MAX_FRAMES = 0                # 处理整段，包含后续上料；设为正数
 ROTATION_INTERVALS = []       # 可填[(源视频开始秒数,结束秒数)]，暂停状态确认但继续跟踪
 ```
 
-上料仅采用 YOLO 的 `empty → filled` 连续确认。手接触可能是取片、放片或整理，
-只用于遮挡和待核验记录，不能代替空满证据，也不用接触时刻推断操作顺序。
-手接触后仍确认为空、一直漏检、自然结束或手动停止，都不会补成已上料。
+空满状态以 YOLO 连续确认结果为主。仅 S4 的手接触达到门限并离开后，如果 YOLO 仍持续为unknown，
+且接触前已有 confirmed 状态，则按基线反转：`empty → filled`、`filled → empty`，不受当前工序方向限制；
+下料时若接触前一直为unknown，则在有效手接触达到时长和帧数门限后，先假定基线为`filled`，离手后仍为unknown
+就推断为`empty`；上料时没有此前状态则不猜测。对接触后仍漏检的槽位等待短暂恢复期，
+再依据unknown状态补事件；若YOLO恢复并确认新状态，仍由YOLO作为确认来源；若确认的还是接触前状态，
+则取消这次接触推断。S1–S3不记录手接触状态证据；接触身份失效、位于ROI外或检测到其他明确状态时，不做手接触推断。
 
 自动回到同一组上料时，正式槽号建立后，可复用该组此前下料真实确认过的空槽
 作为历史基线，不复用旧坐标。前提是转位顺序、同组槽号对应关系可靠；此前
@@ -204,7 +214,7 @@ ROTATION_INTERVALS = []       # 可填[(源视频开始秒数,结束秒数)]，�
 `IDENTITY_LOST_SECONDS`（默认1.2秒），不要求先检测到手。旋转后检测到填充，
 须通过原槽的逐点位置关联及正常连续确认，生成empty→filled事件并归属旧组，
 不会把该框用作新组初始化。超过核验时间仍无满槽证据就保留未确认。
-S4如果从未被定位，仍需先建立其中心及身份；单靠手框不能凭空生成S4。
+S4未被YOLO检测时，须由其余三个槽的有效几何关系推算中心并建立身份；单靠手框不能凭空生成S4。
 本相机已完成合成序列、真实检测框回放和现有权重的3487帧整段视频验证。
 
 首组模板的距离门限小于最小槽间距的一半；逐点模式使用固定像素门限，配合匈牙利一对一匹配和歧义拒绝。
@@ -222,7 +232,7 @@ S4如果从未被定位，仍需先建立其中心及身份；单靠手框不能
 视频中 `G2-S4 filled` 表示组2、槽4、已确认填充。绿色点为filled，橙色点为empty，
 灰色空心圈为unknown。未匹配到框时的点是保留或预测位置，不是当前看见该槽的证据。
 已匹配到框但状态确认中、冲突或遮挡时，点来自检测框中心，状态仍为unknown。
-新组四槽未收齐时显示临时点号（例如G2-T1 filled）；收齐后显示正式槽号（例如G2-S2 filled）。
+新组槽位尚未完成几何确认时只显示ByteTrack ID（例如BT41 filled），不输出临时T槽号；完成一次性映射后才显示正式槽号（例如G2-S2 filled）。
 左上角只显示当前组是否完成工序（例如`G5 Unload: completed`），不再列出四槽状态或顺序调试信息。
 四个不同槽均记录过当前工序的操作，且最后确认均达到目标状态时显示completed；否则显示not completed。
 完成提示与顺序是否合格分开：顺序判定仍保存在日志和JSON结果中。
@@ -231,14 +241,16 @@ S4如果从未被定位，仍需先建立其中心及身份；单靠手框不能
 - `state`：当前帧经过确认后的状态；漏检、确认中、遮挡或冲突时为unknown。
 - `observation`：当前帧候选空满观测；不等于已确认状态。
 - `last_confirmed_state`：历史最近确认状态，不能作为当前仍然可见或状态未变化的证明。
-- `position_is_prediction`：当前没有关联到检测框，显示的是保留或预测位置。
-  已关联整图框但空满冲突/遮挡时，该值为false，填充状态仍可为unknown。
-  局部补检可确认空满，但显示位置仍保留整图跟踪位置，此时该值为true。
+- `position_is_prediction`：仅在S4由三个真实槽位的几何关系成功外推且当前没有真实整图检测时为true；其他未检测槽不显示虚拟跟踪框。
+  已关联整图框但空满冲突/遮挡时，该值为false，填充状态仍可为unknown。局部补检可确认空满，但不会更新几何位置。
 - `center_xy`：尚未建立轨迹时为null；临时轨迹已有实际检测中心时输出该中心，CSV采用相同规则。
-- `slot_numbering_status`：provisional为临时T号，final为正式S号；映射时状态、事件、槽号一起转换。
+- `slot_numbering_status`：provisional时`slot_id`和`formal_slot_id`为空，槽位状态只通过ByteTrack ID显示；`internal_slot_index`仅供缓存诊断，不是槽号。final时建立正式S1-S4映射。
+- `formal_slot_id`：只有`slot_numbering_status=final`时才有值；临时轨迹记录使用`byte_track_id`，避免把内部缓存索引误当作槽号。
+- `group_transform`：2×3仿射/相似变换，把S1–S4映射建立时的稳定图像坐标变换到当前图像坐标；它不是相机标定后的物理世界坐标。
+- `transform_valid_this_frame`、`transform_fit_error`、`transform_support_slot_ids`、`transform_support_byte_track_ids`：本帧是否获得有效拟合、误差，以及支持拟合的正式槽号和ByteTrack ID。少于三个可靠检测时保留最近一次矩阵，但该帧有效标志为false。
 - `initialization`：自动初始化进度、候选槽数、连续帧数、成功时刻和首次四槽中心。
   未初始化时identity_status为waiting_initialization，不会因为等待时间长就锁定丢失。
-  `provisional_started_at`为候选轨迹开始时间，`geometry_seen_slot_ids`为曾可靠看见的槽号，
+  `provisional_started_at`为候选轨迹开始时间；正式编号前用`geometry_seen_track_ids`记录曾可靠看见的ByteTrack轨迹，编号后才填`geometry_seen_slot_ids`，
   `buffered_event_count`为身份确认时准备发布的缓存事件数（确认后保留该次初始化统计）。
 - `pending_initialization`：等待下一组时，下一组候选轨迹的初始化进度；其余时间为null。
 - `group_status`：initializing、entering（单点模式逐点进入）、active、exiting、waiting_next、stabilizing_next、identity_uncertain或sequence_complete。
@@ -279,13 +291,15 @@ S4如果从未被定位，仍需先建立其中心及身份；单靠手框不能
 每次创建 `<视频名>_slots_<时间>` 独立目录：
 
 - `annotated.mp4`：中心点、组号槽号、状态面板，无原视频音轨。
+- `slot_tracks.jsonl`：每帧的槽位检测框、ByteTrack ID、关联槽位状态、最近确认状态及观测原因；映射中保留内部槽位索引，并在正式编号后附带S1-S4。未映射检测框的槽位状态记为unknown；低置信度框只参与ByteTrack关联。
 - `slot_states.jsonl`：每帧一条，完整四槽状态、关联失败候选、顺序结果及当帧事件。
-- `slot_states.csv`：每帧四行，含phase工序、组号、槽号、当前状态、历史确认状态、坐标和原因。
+- `slot_states.csv`：每帧四行，含phase工序、组号、槽号、ByteTrack ID、当前状态、历史确认状态、坐标和原因。
 - `slot_events.jsonl`：确认的取放事件及时间区间，供人工复核顺序。
 - `group_events.jsonl`：退出候选、退出取消、旧组关闭、新组接管、phase_changed工序切换及退出后核验更新事件。
 - `group_summaries.json`：所有已确认退出组的独立结果，含各自槽位状态、操作事件和operation_result。
 - `group_process_report.txt` / `group_process_report.json`：处理结束时按工序分别保存五组四槽完成矩阵和逐组操作顺序。
 - `summary.json`：本次参数、结束原因、最终组状态、已关闭组的结果及所有取放事件。
+  `slot_tracking`记录ByteTrack阈值、轨迹数量和每条轨迹的持续时间。标注视频在槽位框旁显示BT轨迹ID；正式映射完成后同时显示其S1–S4槽号。低分框不进入槽位状态机，ROI exit gate仍负责组切换。
   未退出的当前组在final_group_snapshot中，不会当作已完成组保存到closed_groups。
   `group_process_reports.unload`和`group_process_reports.load`分别保存上下料汇总，含matrix、逐组sequence和order_result。
   `group_process_report`兼容保留起始工序汇总；`phase`为起始工序，`current_phase`为结束时所在工序。
@@ -408,7 +422,7 @@ G1、G2因身份仍为provisional不计入正式满槽数。验证输出为
 本流程直接用ROI真实越界切组，因此ROI变化会同时改变组身份，不能仅视为显示范围调整。
 新ROI使G1退出从40.883秒延后到42.338秒；G2直到退出仍为临时编号，正式下料记录为空，
 也无法向上料G2提供完整的下料空槽基线，导致上料记录缺少S4。G3的四次下料记录仍完整，
-上料第四槽遮挡会使正式编号延迟，不应把临时T号当作固定S号解读。
+上料第四槽遮挡会使正式编号延迟；初始化阶段应按ByteTrack ID查看检测框与状态，正式编号建立后再查看S1-S4。
 
 保留当前代码、模型、置信度及最少确认帧数2，仅换回原ROI重跑至关门，共3129帧：
 五组下料和五组上料均记录四次操作，报告序列均为2→1→3→4，最终占用核验20/20。
@@ -417,3 +431,78 @@ G1、G2因身份仍为provisional不计入正式满槽数。验证输出为
 备份为同目录`camera_B_20260924_021033_slot_roi_before_restore_20261019_190043.json`。
 对照输出：`I:/youyan/test_dataset/camera_B_20260924_021033_slots_roi_compare_20261019_185811`，
 其中`roi_regression_validation.json`记录前后ROI、切组时间和逐组结果；正常入口加载的ROI已核对一致。
+
+## ByteTrack 载体框试验（2026-10-22）
+
+旧版 `predict_slot_groups.py` 使用 exp4.2，以0.10阈值保留低分 `slot_group` 框供 ByteTrack 二阶段关联，
+0.35及以上的检测仍进入原槽位状态机。24日视频4在舱门关闭时结束，共处理3189/6157帧（171.72秒），
+旧流程已记录下料G1–G5及上料G1–G5。ByteTrack输出19个轨迹ID；处理帧中有2306帧至少检测到两个高置信度组框。
+
+54秒附近，旧exit gate已在52.303秒关闭G2并开始G3；但ByteTrack的ID14从16.16秒持续到66.42秒，
+而第二个重叠组框在54.35秒又获得ID24。标注图和逐帧轨迹见
+`industrial_inspection/legacy_outputs/bytetrack_video24_20261022/`。这些结果表明，当前模型的 `slot_group` 框
+还不能代表稳定、唯一的游星片身份；ByteTrack ID暂作复核信息，不参与旧流程的槽位归属或exit gate换组。
+因此本试验没有证明ByteTrack解决了54秒附近的旧组残留归属问题。
+
+## 槽位 ByteTrack 接入（2026-10-22）
+
+当前旧工程入口改为只跟踪槽位检测框，不跟踪`slot_group`。`wafer_slot_empty`与
+`wafer_slot_filled`输入ByteTrack前会归一成同一跟踪类别，因此空满状态切换时仍尽量沿用同一物理槽位轨迹；
+原检测类别和置信度保留，低分检测仅参与ByteTrack关联，不用于工艺状态确认。
+
+ByteTrack ID本身没有顺时针意义。首组/新组完成稳定几何编号时，代码将轨迹ID按槽位中心映射到正式S1–S4；
+同一组内已映射的ID作为物理槽身份主键，ByteTrack生成新ID后才尝试在几何门限内恢复映射。
+2026-10-23起，组号或工序切换保持ByteTrack连续运行；组归属独立保存，已关闭组的ID不会直接进入下一组。
+映射和轨迹记录在`slot_tracks.jsonl`、`slot_tracks.csv`、`slot_states.csv`及标注视频中。
+
+遮挡后若ByteTrack能恢复原ID，会优先维持原槽身份；若ID改变，则只在几何门限内尝试重新关联。ByteTrack自身发生ID切换时，映射可能跟着错，因此标注视频会同时显示BT ID和S号，需由操作人员检查遮挡处的映射连续性。
+本次仅做代码和无视频单元测试，不运行视频推理。
+
+## 轨迹状态与组编号分离（2026-10-23）
+
+入口仍是 `industrial_inspection/tools/predict_slot_groups.py`，沿用 exp3.3 和现有 ROI。
+`slot_track_state.py` 按视频内持续的 BT ID 独立累计 YOLO 空/满状态和视觉变化历史。
+尚未建立组或 S 号的框也可显示 `filled/empty S:pending`，不能把“槽号待定”统一当作空满 unknown。
+空满仍须满足 `CONFIRM_SECONDS` 和 `MIN_CONFIRM_FRAMES`；手遮挡、空满冲突、ROI 外和暂停检测不确认视觉状态。
+低置信度框仍只供 ByteTrack 关联，不累计工艺状态。
+
+候选被正式接收时恢复该 BT 轨迹先前的基线及视觉事件，并保留原始发生时间。
+正式 S 号建立后再发布缓存工艺事件；同一事件只回填一次。
+只对 S4 应用现有手接触补判；下料三点推算仍只允许补 S4，不推算缺失的 S1/S2/S3。
+
+换组时不重置 ByteTrack。旧组身份优先按 ID 隔离，不能仅凭新框靠近旧中心就排除新框。
+旧 ID 变化时，需共同可见的旧轨迹提供一致运动及严格位置约束，才恢复旧组归属；
+预测 S4 的真实框恢复也需要旧组共同运动支持。
+轨迹从 ROI 真正离开一段时间后重新从入口进入，可开始新一轮访问，避免同一载体上料时被永久列为旧组。
+
+当前组正式编号后，任意一个已关联真实槽位越过出口仍立即关闭该组。
+新组在 `entering` 阶段只记录候选轨迹和状态，未完成正式几何身份的临时点越界不会继续推进组号。
+若一直缺少非 S4 的真实槽位，保持身份待确认；不会用临时点越界猜测下一组。
+
+对持续真实支持的四框组合，比较凸四边形、槽间距离和对角线中点关系。
+只有几何上有明确优势的组合才用于纠正早期错误临时槽；保留未被替换轨迹的状态和事件。
+不按置信度取前四框；多个布局仍有歧义时继续等待。此项是图像几何关系，不要求四点精确共圆。
+
+输出新增 `slot_tracks.csv`，每个处理帧的所有检测框（包括未映射和低分框）均有明细，
+包含 BT ID、组/槽号、状态、`mapping_status`、`mapping_reason` 和 `state_reason`。
+无 BT ID 的单帧检测只记录原始观测，不伪造持续轨迹。
+`mapping_reason` 用于区分 `previous_group_track`、`new_track_outside_entry_region`、
+`outside_supported_group_geometry`、`waiting_group_geometry`、`waiting_slot_numbering`、
+`ambiguous_group_geometry`、`invalid_group_geometry`、`association_ambiguous_or_too_far`、
+`below_state_confidence_threshold` 等原因。
+原有 `slot_states.csv` 仍是组内四槽的逐帧状态表，完成矩阵仍以正式归属后的事件为准。
+
+本次以合成检测序列检查轨迹状态、入组、事件回填和导出，不重跑用户的真实视频；实际视频效果由操作人员复核。
+使用现有 youyan311 环境执行相关回归共197项，196项通过；唯一失败为此前已存在的
+`test_recorded_single_exit_captures_second_group_full_states_before_four_slots` 顺序断言：
+期望S2→S1，实际事件为S1→S2。本次保留该断言，不将其计为通过。
+
+2026-10-24补充两项入口处理：
+
+1. 换组瞬间，若一个未映射的BT轨迹在旧组关闭前已经持续出现、已有稳定空/满状态且位于出口侧，
+   会记录为 `pre_exit_unmapped_tail` 并继续归属于旧组；它不会因为没有S号就被下一组接收。
+   切组后才首次出现的新ID不使用这条规则。
+2. 下料时若S4正在使用几何预测位置，出现唯一且几何有效的真实S4框会在当前帧替换预测中心、
+   清除 `position_is_prediction` 和 `geometry_inferred`，并绑定该真实BT ID。空/满状态仍按正常确认帧数、
+   确认时间和手遮挡规则处理；多个候选有歧义时继续使用预测位置等待消歧。无BT ID但框与唯一真实S4重合时，
+   也会按真实框显示和记录，后续ByteTrack激活后再绑定ID。

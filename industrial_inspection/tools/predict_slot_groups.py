@@ -20,20 +20,23 @@ import torch
 from industrial_inspection.tools import predict_video as base
 from industrial_inspection.tools.detection_display import draw_detection_points
 from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, SlotGroupTracker
+from industrial_inspection.tools.slot_track_display import slot_track_label, slot_track_record
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
 from industrial_inspection.tools.slot_roi import draw_roi, pixel_polygon
+from industrial_inspection.tools.slot_byte_tracker import SlotByteTracker
 from industrial_inspection.tools.hatch_loading_inspection import (
     HatchHandleMonitor, HatchLoadingInspection, format_fullness_report)
 
 
 # =============================================================================
 # 在这里改配置，直接在 PyCharm 运行，无需终端；原 predict_video.py 不受影响。
-# 视频、模型和 ROI 默认沿用原脚本，也可以改为自己的 Path(r"...")。
+# 视频和 ROI 沿用旧配置；本入口使用 exp3.3 槽位模型。
 # =============================================================================
 SOURCE_VIDEO = base.SOURCE_VIDEO
-MODEL_WEIGHTS = base.MODEL_WEIGHTS
+MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp3.3\weights\best.pt")
 OUTPUT_ROOT = base.OUTPUT_ROOT
 CONFIDENCE = base.CONFIDENCE
+AUDIT_CONFIDENCE = getattr(base, "AUDIT_CONFIDENCE", .001)  # CSV审计下限，不改变显示/状态门槛
 IMAGE_SIZE = base.IMAGE_SIZE
 DEVICE = base.DEVICE
 UI_ENABLED = True             # True：沿用 UI7V；False：OpenCV 预览/批处理
@@ -70,12 +73,12 @@ EXIT_MIN_SLOTS = 1            # 任意一个已编号槽实际越出ROI即触发
 PARTIAL_EXIT_MIN_SLOTS = 1    # 单点换组模式下同样只需要一个越界槽
 EXIT_MIN_MOTION_RATIO = .5    # 多点换组规则的组中心位移比例；单点换组时不参与触发
 MOTION_PAUSE_RATIO = .18      # 多点换组规则的共同外移门限；单点换组时不参与触发
-NEXT_GROUP_STABLE_SECONDS = .3 # 收齐四条近期轨迹且几何停稳后启用S号；此前T号照常记录空满
-NEXT_GROUP_STABILITY_RATIO = .12 # 停稳期间各槽偏离起始位置不得超过最小槽间距×此比例
+NEXT_GROUP_STABLE_SECONDS = .2 # 收齐可靠轨迹且几何停稳后一次性建立S号映射；此前仅按ByteTrack ID记录
+NEXT_GROUP_STABILITY_RATIO = .2 # 停稳期间各槽偏离起始位置不得超过最小槽间距×此比例
 NEXT_GROUP_MATCH_DISTANCE_PX = 40 # 新点/旧组残留点逐帧匹配的最大距离（像素）
 NEXT_GROUP_ENTRY_FRACTION = .6 # 沿EXIT_DIRECTION从入口到出口的前60%允许建立新轨迹
 SLOT2_BELOW_SLOT3 = True      # 左上S1、顺时针1→3→4→2，y辅助核验S2通常在S3下方；编号后不重排
-EXIT_DIRECTION = (-1, -1)     # 本视频已核实旧组从右下ROI向左上退出；None可恢复自动方向判断
+EXIT_DIRECTION = (0, -1)     # 本视频已核实旧组从右下ROI向左上退出；None可恢复自动方向判断
 
 # 每轮五组按顺序计数；自动模式运行五组下料再五组上料。
 START_FRAME = None            # None：从第0帧开始；数字：指定当前组开始的源帧号
@@ -90,8 +93,8 @@ MIN_CONFIRM_FRAMES = 2
 IDENTITY_LOST_SECONDS = 1.2   # 连续无匹配超时，锁定为unknown，避免下一组继承旧编号
 CONFLICT_CONF_MARGIN = .15    # 同位置空/满分数差小于该值时，输出unknown
 HAND_OVERLAP_RATIO = .2       # 手遮挡槽框达到此比例，或覆盖中心时，暂停该槽状态确认
-LOAD_HAND_CONTACT_ENABLED = True       # 上料时记录手接触供复核，不据此判断空满或操作顺序
-LOAD_HAND_CONTACT_SECONDS = .15        # 手在同一槽位的最短连续接触时间
+LOAD_HAND_CONTACT_ENABLED = True       # 仅S4的手接触可补足本工序的unknown空满变化
+LOAD_HAND_CONTACT_SECONDS = .1        # 手在同一槽位的最短连续接触时间
 LOAD_HAND_CONTACT_MIN_FRAMES = 2       # 接触至少需要的连续检测帧数
 ROI_TRACKING_MARGIN_PX = 40   # ROI外只跟踪当前已编号槽；区域外框不确认空满、不初始化
 LOCAL_REDETECT_ENABLED = True # 已编号槽被整图漏检时，用同一模型局部补检
@@ -99,8 +102,11 @@ LOCAL_REDETECT_CROP_SIZE = (180, 140) # 原图裁剪宽、高（像素），保�
 LOCAL_REDETECT_IMAGE_SIZE = 320 # 局部图送入YOLO时的尺寸；置信度沿用整图配置
 ROTATION_INTERVALS = []       # 可选源视频秒数[(开始,结束),...]；期间跟踪位置、暂停空满确认
 DRAW_SLOT_ROI = base.DRAW_SLOT_ROI
-SHOW_SLOT_TEXT = True         # 在点旁标注G1-S2 empty/filled/unknown
+SHOW_SLOT_TEXT = True         # 正式编号后在点旁标注S1-S4；初始化阶段在ByteTrack框上标状态
 POINT_RADIUS = base.POINT_RADIUS
+BYTE_TRACK_SLOTS_ENABLED = True     # 用ByteTrack跟踪空槽/满槽框，并映射到正式S号
+BYTE_TRACK_LOW_CONFIDENCE = .10     # 低分框只参与ByteTrack二阶段关联，不进入工艺状态机
+BYTE_TRACK_BUFFER_SECONDS = 3.0
 # =============================================================================
 STATE_TEXT = {"empty": "空槽","filled": "已填充","unknown": "未知"}
 GROUP_TEXT = {"initializing": "等待四槽初始化","active": "操作中","exiting": "正在退出",
@@ -111,7 +117,8 @@ GROUP_TEXT = {"initializing": "等待四槽初始化","active": "操作中","exi
 
 def build_args(argv=None):
     defaults = ["--source",str(SOURCE_VIDEO),"--weights",str(MODEL_WEIGHTS),
-        "--conf",str(CONFIDENCE),"--imgsz",str(IMAGE_SIZE),"--device",str(DEVICE),
+        "--conf",str(CONFIDENCE),"--audit-conf",str(AUDIT_CONFIDENCE),
+        "--imgsz",str(IMAGE_SIZE),"--device",str(DEVICE),
         "--ui" if UI_ENABLED else "--no-ui", "--show" if SHOW_PREVIEW else "--no-show",
         "--max-frames",str(MAX_FRAMES),"--stride",str(FRAME_STRIDE),
         "--roi-file",str(SLOT_ROI_FILE or base.DEFAULT_SLOT_ROI_FILE),
@@ -124,8 +131,10 @@ def build_args(argv=None):
         raise ValueError("本脚本专用于四槽跟踪；普通检测请运行 predict_video.py")
     if not args.source.is_file() or not args.weights.is_file():
         raise FileNotFoundError("请检查本脚本配置的视频和权重路径")
-    if not 0 < args.conf < 1 or args.stride < 1 or args.max_frames < 0 or args.imgsz < 32:
-        raise ValueError("置信度、stride、max_frames 或 imgsz 配置错误")
+    audit_conf = getattr(args, "audit_conf", AUDIT_CONFIDENCE)
+    if (not 0 < args.conf < 1 or not 0 < audit_conf <= args.conf
+            or args.stride < 1 or args.max_frames < 0 or args.imgsz < 32):
+        raise ValueError("置信度、audit-conf、stride、max_frames 或 imgsz 配置错误")
     if START_FRAME is not None and START_FRAME < 0 or END_FRAME is not None and END_FRAME < 1:
         raise ValueError("起止帧号必须为有效非负帧号，结束帧大于0")
     for start,end in ROTATION_INTERVALS:
@@ -313,8 +322,6 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None):
                 (40,220,80) if complete else (0,165,255),1,cv2.LINE_AA)
     for slot in snapshot["slots"]:
         color = colors[slot["state"]]
-        prefix = "T" if snapshot.get("slot_numbering_status") == "provisional" else "S"
-        label = f"G{slot['group_id']}-{prefix}{slot['slot_id']} {slot['state']}"
         if slot["center_xy"] is None:
             continue
         x,y = slot["center_xy"]
@@ -326,7 +333,10 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None):
         else:
             cv2.circle(frame,point,POINT_RADIUS+1,(0,0,0),-1,cv2.LINE_AA)
             cv2.circle(frame,point,POINT_RADIUS,color,-1,cv2.LINE_AA)
-        if show_text:
+        # Provisional points are identified by their ByteTrack boxes. Showing
+        # the internal temporary array index here would look like a stable ID.
+        if show_text and snapshot.get("slot_numbering_status") == "final":
+            label = f"G{slot['group_id']}-S{slot['slot_id']} {slot['state']}"
             (tw,th),_ = cv2.getTextSize(label,cv2.FONT_HERSHEY_SIMPLEX,.38,1)
             left = max(0,min(w-tw-3,point[0]+7))
             top = max(th+3,min(h-3,point[1]-7))
@@ -340,8 +350,46 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None):
         cv2.putText(frame,label,(8,h-12),cv2.FONT_HERSHEY_SIMPLEX,.43,(160,210,255),1,cv2.LINE_AA)
     elif snapshot["identity_status"] == "waiting_initialization":
         init = snapshot["initialization"]
-        label = f"Identity pending: seen {len(init['geometry_seen_slot_ids'])}/4 | observed actions: {init['buffered_event_count']}"
+        label = f"Identity pending: seen {len(init.get('geometry_seen_track_ids', []))}/4 | observed actions: {init['buffered_event_count']}"
         cv2.putText(frame,label,(8,h-12),cv2.FONT_HERSHEY_SIMPLEX,.43,(0,210,255),1,cv2.LINE_AA)
+    return frame
+
+
+def draw_slot_tracks(frame, detections, snapshot, roi_contour):
+    """Draw slot tracks only when their detector center is inside the ROI."""
+    for item in detections:
+        box = item["xyxy"]
+        center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+        if cv2.pointPolygonTest(roi_contour, center, False) < 0:
+            continue
+        x1, y1, x2, y2 = (int(round(value)) for value in item["xyxy"])
+        track_id = item.get("track_id")
+        color = (255, 170, 0) if track_id is not None else (150, 150, 150)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label = slot_track_label(item, snapshot)
+        cv2.putText(frame, label, (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX,
+                    .4, color, 1, cv2.LINE_AA)
+    return frame
+
+
+def draw_predicted_slot_boxes(frame, slots, roi_contour, *, color=(0, 220, 255), label_prefix="S"):
+    """Show geometry-backed virtual slot tracks as dashed boxes inside the ROI."""
+    for slot in slots:
+        box = slot.get("tracking_box_xyxy")
+        center = slot.get("center_xy")
+        if box is None or center is None or cv2.pointPolygonTest(roi_contour, tuple(center), False) < 0:
+            continue
+        x1, y1, x2, y2 = (int(round(value)) for value in box)
+        for x in range(x1, x2, 12):
+            cv2.line(frame, (x, y1), (min(x+6, x2), y1), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (x, y2), (min(x+6, x2), y2), color, 1, cv2.LINE_AA)
+        for y in range(y1, y2, 12):
+            cv2.line(frame, (x1, y), (x1, min(y+6, y2)), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (x2, y), (x2, min(y+6, y2)), color, 1, cv2.LINE_AA)
+        slot_label = f"{label_prefix}{slot['slot_id']}" if label_prefix else "slot"
+        label = f"G{slot['group_id']}-{slot_label} PRED"
+        cv2.putText(frame, label, (x1, max(14, y1-4)), cv2.FONT_HERSHEY_SIMPLEX,
+                    .38, color, 1, cv2.LINE_AA)
     return frame
 
 
@@ -374,6 +422,11 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         model,architecture = base.load_detection_model(args.weights)
     finally:
         torch.load = original_load
+    names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
+    slot_classes = [int(class_id) for class_id, name in names.items() if name in SLOT_STATES]
+    audit_confidence = float(getattr(args, "audit_conf", AUDIT_CONFIDENCE))
+    if not 0 < audit_confidence <= args.conf:
+        raise ValueError("检测框审计置信度必须满足 0 < audit-conf <= conf")
     sequence = make_sequence(polygon,context["size"])
     tracker = sequence.tracker
     inspection = HatchLoadingInspection(HatchHandleMonitor(HATCH_OPEN_POLYGON, HATCH_CLOSED_POLYGON,
@@ -392,7 +445,16 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
     started = time.perf_counter()
     summary = {"source": str(args.source.resolve()),"weights": str(args.weights.resolve()),
         "output_dir": str(output.resolve()),"output_video": str((output/"annotated.mp4").resolve()),
-        "architecture": architecture,"conf": args.conf,"imgsz": args.imgsz,"stride": args.stride,
+        "architecture": architecture,"conf": args.conf,"audit_conf": audit_confidence,
+        "imgsz": args.imgsz,"stride": args.stride,
+        "detection_confidence_csv": "detection_confidences.csv",
+        "slot_tracking": {"enabled": False, "backend": None,
+            "class_names": sorted(SLOT_STATES), "identity_mapping": "ByteTrack ID -> one-time geometry-assigned S1-S4",
+            "low_confidence": BYTE_TRACK_LOW_CONFIDENCE,
+            "high_confidence": args.conf, "buffer_seconds": BYTE_TRACK_BUFFER_SECONDS,
+            "role": "slot_identity_association_and_mapping",
+            "continuous_across_groups": True, "state_before_slot_mapping": True,
+            "per_detection_csv": "slot_tracks.csv"},
         "group_id": CURRENT_GROUP_ID,"group_count": 5,"phase": PROCESS_PHASE,"clockwise_order": CLOCKWISE_ORDER,
         "auto_load_after_unload": sequence.auto_load_after_unload,
         "hatch_control_config": {"enabled": HATCH_CONTROL_ENABLED,
@@ -408,6 +470,10 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         "group_assignment": "roi_exit_sequence" if AUTO_GROUP_SWITCH else "configured",
         "group_switch_config": {"exit_confirm_seconds": EXIT_CONFIRM_SECONDS,
             "single_exit_immediate_entry": EXIT_MIN_SLOTS == 1,
+            "provisional_tracks_can_trigger_exit": False,
+            "old_group_exclusion": "persistent_id_then_coherent_s4_recovery",
+            "retired_track_handoff": "unique_geometry_supported_candidate_when_current_group_has_two_or_three_fresh_slots",
+            "entry_geometry_selection": "unique_supported_quadrilateral_not_top_confidence",
             "boundary_margin_px": EXIT_BOUNDARY_MARGIN_PX,"exit_min_slots": EXIT_MIN_SLOTS,
             "partial_exit_min_slots": PARTIAL_EXIT_MIN_SLOTS,"min_motion_ratio": EXIT_MIN_MOTION_RATIO,
             "motion_pause_ratio": MOTION_PAUSE_RATIO,"entry_seconds": NEXT_GROUP_STABLE_SECONDS,
@@ -432,7 +498,10 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         "confirm_seconds": CONFIRM_SECONDS,"min_confirm_frames": MIN_CONFIRM_FRAMES,
         "load_hand_contact_config": {"enabled": LOAD_HAND_CONTACT_ENABLED,
             "contact_seconds": LOAD_HAND_CONTACT_SECONDS,
-            "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,"infer_from_contact": False},
+            "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES, "target_slot_ids": [4],
+            "fallback_transitions": {"unload": ["unknown->empty", "filled->unknown"],
+                                      "load": ["unknown->filled", "empty->unknown"]},
+            "yolo_state_has_priority": True,"infer_after_unknown_grace": True},
         "match_distance_ratio": MATCH_DISTANCE_RATIO,"identity_lost_seconds": IDENTITY_LOST_SECONDS,
         "local_redetection_config": {"enabled": LOCAL_REDETECT_ENABLED,
             "crop_size_wh": list(LOCAL_REDETECT_CROP_SIZE),"imgsz": LOCAL_REDETECT_IMAGE_SIZE,
@@ -446,12 +515,40 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         if not math.isfinite(fps) or fps <= 0:
             raise RuntimeError("视频帧率无效")
         summary.update(source_fps=fps,output_fps=fps/args.stride)
+        byte_tracker = None
+        if BYTE_TRACK_SLOTS_ENABLED and slot_classes:
+            low_conf = min(BYTE_TRACK_LOW_CONFIDENCE, args.conf * .5)
+            byte_tracker = SlotByteTracker(fps / args.stride, high_thresh=args.conf,
+                low_thresh=low_conf, buffer_seconds=BYTE_TRACK_BUFFER_SECONDS)
+            summary["slot_tracking"].update(enabled=True, low_confidence=low_conf,
+                high_confidence=args.conf, backend="ultralytics.ByteTrack", class_ids=slot_classes)
+        elif BYTE_TRACK_SLOTS_ENABLED:
+            summary["slot_tracking"]["reason"] = "model_has_no_wafer_slot_empty_or_filled_class"
+        track_summary = {}
+        track_counts = {"slot_boxes": 0, "tracked_slot_boxes": 0,
+                        "untracked_slot_boxes": 0, "multi_high_conf_frames": 0}
         cap.set(cv2.CAP_PROP_POS_FRAMES,index)
         with ExitStack() as stack:
             records = stack.enter_context((output/"slot_states.jsonl").open("w",encoding="utf-8"))
             events = stack.enter_context((output/"slot_events.jsonl").open("w",encoding="utf-8"))
             group_events = stack.enter_context((output/"group_events.jsonl").open("w",encoding="utf-8"))
             inspection_events = stack.enter_context((output/"inspection_events.jsonl").open("w",encoding="utf-8"))
+            detection_csv = stack.enter_context(
+                (output/"detection_confidences.csv").open("w", encoding="utf-8-sig", newline=""))
+            detection_fields = ["source_frame", "time_seconds", "detection_index", "class_id", "class_name",
+                                "confidence", "x1", "y1", "x2", "y2", "track_id",
+                                "meets_display_confidence", "displayed", "display_reason", "display_style",
+                                "detection_source"]
+            detection_rows = csv.DictWriter(detection_csv, fieldnames=detection_fields, extrasaction="ignore")
+            detection_rows.writeheader()
+            slot_track_records = stack.enter_context((output/"slot_tracks.jsonl").open("w",encoding="utf-8"))
+            track_csv = stack.enter_context((output/'slot_tracks.csv').open('w', encoding='utf-8-sig', newline=''))
+            track_fields = ['source_frame', 'time_seconds', 'track_id', 'group_id', 'phase',
+                            'slot_id', 'formal_slot_id', 'mapping_status', 'mapping_reason',
+                            'slot_state', 'observation', 'last_confirmed_state', 'state_reason',
+                            'confirmation_source', 'class_name', 'confidence', 'xyxy']
+            track_rows = csv.DictWriter(track_csv, fieldnames=track_fields, extrasaction='ignore')
+            track_rows.writeheader()
             def publish_inspection_events(items):
                 for item in items:
                     inspection_events.write(json.dumps(item,ensure_ascii=False)+"\n")
@@ -463,9 +560,12 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                     elif item['type'] == 'loading_fullness_final':
                         log(f"上料检测结束：{item['result']}（{item['confirmed_filled_count']}/20）")
             csv_file = stack.enter_context((output/"slot_states.csv").open("w",encoding="utf-8-sig",newline=""))
-            fields = ["source_frame","time_seconds","group_id","slot_id","phase","state","observation",
+            fields = ["source_frame","time_seconds","group_id","slot_id","formal_slot_id","internal_slot_index",
+                      "byte_track_id","phase","state","observation",
                       "last_confirmed_state","confidence","center_x","center_y","reason","order_result","group_status",
-                      "slot_numbering_status"]
+                      "slot_numbering_status","group_transform","group_transform_definition",
+                      "transform_valid_this_frame","transform_fit_error","transform_support_slot_ids",
+                      "transform_support_byte_track_ids"]
             rows = csv.DictWriter(csv_file,fieldnames=fields)
             rows.writeheader()
             while True:
@@ -488,17 +588,48 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                     writer = cv2.VideoWriter(str(output/"annotated.mp4"),cv2.VideoWriter_fourcc(*"mp4v"),fps/args.stride,(w,h))
                     if not writer.isOpened():
                         raise RuntimeError("无法创建输出MP4")
-                result = model.predict(frame,imgsz=args.imgsz,conf=args.conf,device=args.device,
+                # 推理使用独立的审计下限；业务状态和画面仍按 --conf 过滤。
+                result = model.predict(frame,imgsz=args.imgsz,conf=audit_confidence,device=args.device,
                     iou=args.nms_iou,agnostic_nms=False,verbose=False,save=False)[0]
                 boxes = result.boxes.cpu()
-                raw = [{"class_id": int(c),"class_name": model.names[int(c)],"confidence": float(score),"xyxy": xy}
+                all_raw = [{"class_id": int(c),"class_name": names[int(c)],"confidence": float(score),"xyxy": xy}
                     for c,score,xy in zip(boxes.cls.tolist(),boxes.conf.tolist(),boxes.xyxy.tolist())]
+                tracked_raw = byte_tracker.update(all_raw) if byte_tracker else all_raw
+                raw = [obj for obj in tracked_raw if obj["confidence"] >= args.conf]
+                tracking_confidence = (summary["slot_tracking"]["low_confidence"]
+                                       if byte_tracker else args.conf)
+                slot_track_detections = [item for item in tracked_raw
+                                         if item["class_name"] in SLOT_STATES
+                                         and item["confidence"] >= tracking_confidence]
+                high_conf_slots = [item for item in slot_track_detections if item["confidence"] >= args.conf]
+                track_counts["slot_boxes"] += len(slot_track_detections)
+                track_counts["tracked_slot_boxes"] += sum(item.get("track_id") is not None
+                                                             for item in slot_track_detections)
+                track_counts["untracked_slot_boxes"] += sum(item.get("track_id") is None
+                                                               for item in slot_track_detections)
+                track_counts["multi_high_conf_frames"] += len(high_conf_slots) >= 2
+                # Keep retired detections out of local re-detection and hand
+                # contact inspection, but pass them to the sequence as
+                # candidates. During a new-group entry the sequence may
+                # explicitly hand off one such ID when it is the only way to
+                # complete the current group's three/four-slot geometry.
+                sequence_raw = [item for item in raw
+                                if not (item.get("class_name") in SLOT_STATES
+                                        and sequence.is_retired_track(item.get("track_id")))]
+                retired_raw = [item for item in raw
+                               if item.get("class_name") in SLOT_STATES
+                               and sequence.is_retired_track(item.get("track_id"))]
                 timestamp = source_frame/fps
                 enabled = not any(start <= timestamp < end for start,end in ROTATION_INTERVALS)
                 if inspection is not None:
-                    publish_inspection_events(inspection.observe_handle(raw,timestamp,(w,h)))
+                    publish_inspection_events(inspection.observe_handle(sequence_raw,timestamp,(w,h)))
                 if inspection is None or inspection.active:
-                    objects,local_attempts = recover_missing_slots(model,frame,raw,sequence,args) if enabled else (raw,[])
+                    objects,local_attempts = (recover_missing_slots(model,frame,sequence_raw,sequence,args)
+                                              if enabled else (sequence_raw,[]))
+                    # The group sequence applies its own conservative handoff
+                    # gate. Retired boxes remain available for that gate but
+                    # never enter the local crop detector.
+                    objects.extend(retired_raw)
                     snapshot = sequence.update(objects,timestamp,observations_enabled=enabled)
                     inspection_processed += 1
                 else:
@@ -509,6 +640,97 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                     else:
                         snapshot = {**sequence.snapshot(),"new_events":[],"new_group_events":[]}
                 tracker = sequence.tracker
+                # ByteTrack runs continuously for the whole video. G/S is a
+                # separate business mapping; switching G must not renumber BT.
+                track_states = snapshot.setdefault('track_states', [])
+                known_state_ids = {item.get('byte_track_id') for item in track_states}
+                for item in slot_track_detections:
+                    track_id = item.get('track_id')
+                    if (track_id is not None and sequence.is_retired_track(track_id)
+                            and track_id not in known_state_ids):
+                        previous = sequence.track_store.describe(track_id)
+                        if previous is not None:
+                            track_states.append({**previous,
+                                'state': 'unknown', 'observation': 'unknown',
+                                'reason': 'previous_group_track',
+                                'mapping_reason': 'previous_group_track'})
+                            known_state_ids.add(track_id)
+                known_records = {item['byte_track_id'] for item in track_states}
+                for item in slot_track_detections:
+                    if item['confidence'] < args.conf and item.get('track_id') not in known_records:
+                        previous = sequence.track_store.describe(item.get('track_id'))
+                        if previous is not None:
+                            snapshot.setdefault('track_states', []).append({**previous,
+                                'state': 'unknown', 'observation': 'unknown',
+                                'reason': 'below_state_confidence_threshold',
+                                'mapping_reason': 'below_state_confidence_threshold'})
+                            known_records.add(item['track_id'])
+                for detection_index, item in enumerate(tracked_raw):
+                    is_slot = item["class_name"] in SLOT_STATES
+                    if item["confidence"] < args.conf:
+                        displayed, display_reason = False, "below_confidence_threshold"
+                    elif not is_slot:
+                        displayed, display_reason = True, "drawn_detection_point"
+                    elif sequence.is_retired_track(item.get("track_id")):
+                        displayed, display_reason = False, "previous_group_track"
+                    else:
+                        box = item["xyxy"]
+                        center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+                        displayed = cv2.pointPolygonTest(sequence.contour, center, False) >= 0
+                        display_reason = "drawn_slot_box" if displayed else "outside_slot_roi"
+                    audit_row = base.detection_confidence_row(
+                        source_frame=source_frame, time_seconds=round(timestamp, 6),
+                        index=detection_index, detection=item,
+                        confidence_threshold=args.conf, displayed=displayed,
+                        display_reason=display_reason,
+                        display_style="slot_box" if is_slot else "detection_point")
+                    audit_row.update(track_id=item.get("track_id"),
+                                     detection_source=item.get("detection_source", "full_frame"))
+                    detection_rows.writerow(audit_row)
+                detection_records = [slot_track_record(item, snapshot) for item in slot_track_detections]
+                # Track statistics represent business-group membership, not
+                # merely which group's frame happened to contain a raw box.
+                # Old-group tails remain in slot_tracks.jsonl for diagnostics,
+                # but unassigned/previous_group_track detections must not
+                # create a second G entry for the same ByteTrack ID.
+                for item, detection_record in zip(slot_track_detections, detection_records):
+                    track_id = item.get("track_id")
+                    assigned_group = detection_record.get("group_id")
+                    mapping_status = detection_record.get("mapping_status")
+                    if (track_id is None or assigned_group is None
+                            or mapping_status not in ("provisional", "final")):
+                        continue
+                    assigned_phase = detection_record.get("phase") or tracker.phase
+                    metric_key = (assigned_group, assigned_phase, track_id)
+                    metric = track_summary.setdefault(metric_key, {"group_id": assigned_group,
+                        "phase": assigned_phase, "byte_track_id": track_id, "detections": 0,
+                        "first_time_seconds": source_frame / fps,
+                        "last_time_seconds": None, "high_confidence_detections": 0,
+                        "low_confidence_detections": 0})
+                    metric["detections"] += 1
+                    metric["last_time_seconds"] = source_frame / fps
+                    confidence_key = ("high_confidence_detections" if item["confidence"] >= args.conf
+                                      else "low_confidence_detections")
+                    metric[confidence_key] += 1
+                for detection_record in detection_records:
+                    track_rows.writerow({**detection_record, 'source_frame': source_frame,
+                        'time_seconds': round(timestamp, 6),
+                        'phase': detection_record.get('phase') or tracker.phase,
+                        'xyxy': json.dumps(detection_record.get('xyxy'))})
+                slot_track_records.write(json.dumps({"source_frame": source_frame,
+                    "time_seconds": timestamp,"group_id": tracker.group_id,"phase": tracker.phase,
+                    "slot_numbering_status": snapshot.get("slot_numbering_status"),
+                    "group_transform": snapshot.get("group_transform"),
+                    "group_transform_definition": snapshot.get("group_transform_definition"),
+                    "transform_valid_this_frame": snapshot.get("transform_valid_this_frame"),
+                    "transform_fit_error": snapshot.get("transform_fit_error"),
+                    "transform_support_slot_ids": snapshot.get("transform_support_slot_ids", []),
+                    "transform_support_byte_track_ids": snapshot.get("transform_support_byte_track_ids", []),
+                    "detections": detection_records,
+                    "mapping": [{key: slot.get(key) for key in (
+                        "group_id", "slot_id", "formal_slot_id", "byte_track_id", "state", "observation",
+                        "last_confirmed_state", "confidence", "reason", "confirmation_source")}
+                        for slot in snapshot.get("slots", [])]},ensure_ascii=False)+"\n")
                 if inspection is not None:
                     publish_inspection_events(inspection.update_fullness(sequence,timestamp))
                 record = {"source_frame": source_frame,"time_seconds": timestamp,**snapshot,
@@ -525,19 +747,50 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                     log_group_completion(snapshot)
                 for slot in snapshot["slots"]:
                     center = slot["center_xy"] or (None,None)
-                    rows.writerow({"source_frame": source_frame,"time_seconds": round(timestamp,6),
-                        **{key: slot[key] for key in ("group_id","slot_id","state","observation","last_confirmed_state","confidence","reason")},
-                        "phase": tracker.phase,"center_x": center[0],"center_y": center[1],"order_result": snapshot["order_result"],
-                        "group_status": snapshot["group_status"],"slot_numbering_status": snapshot["slot_numbering_status"]})
+                    row = {key: slot.get(key) for key in (
+                        "group_id","slot_id","formal_slot_id","internal_slot_index","byte_track_id","state",
+                        "observation","last_confirmed_state","confidence","reason")}
+                    row.update({"source_frame": source_frame,"time_seconds": round(timestamp,6),
+                        "phase": tracker.phase,"center_x": center[0],"center_y": center[1],
+                        "order_result": snapshot["order_result"],"group_status": snapshot["group_status"],
+                        "slot_numbering_status": snapshot["slot_numbering_status"],
+                        "group_transform": json.dumps(snapshot.get("group_transform"), ensure_ascii=False),
+                        "group_transform_definition": snapshot.get("group_transform_definition"),
+                        "transform_valid_this_frame": snapshot.get("transform_valid_this_frame"),
+                        "transform_fit_error": snapshot.get("transform_fit_error"),
+                        "transform_support_slot_ids": json.dumps(
+                            snapshot.get("transform_support_slot_ids", []), ensure_ascii=False),
+                        "transform_support_byte_track_ids": json.dumps(
+                            snapshot.get("transform_support_byte_track_ids", []), ensure_ascii=False)})
+                    rows.writerow(row)
                 others = [o for o in raw if o["class_name"] not in SLOT_STATES]
                 plotted = draw_detection_points(frame,others,radius=POINT_RADIUS)
+                if slot_track_detections:
+                    # Retired IDs remain in the raw track log for diagnosis,
+                    # but must not visually occupy a slot in the current group.
+                    display_slots = [item for item in high_conf_slots
+                                     if not sequence.is_retired_track(item.get('track_id'))]
+                    draw_slot_tracks(plotted, display_slots, snapshot, sequence.contour)
+                draw_predicted_slot_boxes(plotted,
+                    [slot for slot in snapshot.get("slots", []) if slot.get("position_is_prediction")],
+                    sequence.contour,
+                    label_prefix="S" if snapshot.get("slot_numbering_status") == "final" else None)
+                draw_predicted_slot_boxes(plotted, snapshot.get("departing_slot_predictions", []),
+                                          sequence.contour, color=(255, 190, 80))
                 if DRAW_SLOT_ROI:
                     draw_roi(plotted,polygon)
                 overlay_status(plotted,snapshot,SHOW_SLOT_TEXT,inspection.snapshot() if inspection is not None else None)
                 writer.write(plotted)
                 processed += 1
-                slot_label = "临时点" if snapshot["slot_numbering_status"] == "provisional" else "槽"
-                text = "；".join(f"组{s['group_id']}-{slot_label}{s['slot_id']}:{STATE_TEXT[s['state']]}" for s in snapshot["slots"])
+                if snapshot["slot_numbering_status"] == "provisional":
+                    text = "；".join(
+                        f"组{s['group_id']}-BT{s['byte_track_id'] if s['byte_track_id'] is not None else '待关联'}:"
+                        f"{STATE_TEXT[s['state'] if s['state'] != 'unknown' else s['last_confirmed_state']]}"
+                        f"{'*' if s['state'] == 'unknown' and s['last_confirmed_state'] != 'unknown' else ''}"
+                        for s in snapshot["slots"])
+                else:
+                    text = "；".join(f"组{s['group_id']}-S{s['slot_id']}:{STATE_TEXT[s['state']]}"
+                                    for s in snapshot["slots"])
                 status_text = f"组{tracker.group_id} {tracker.phase} · {timestamp:.2f}s · {GROUP_TEXT[snapshot['group_status']]} · 顺序{snapshot['order_result']}"
                 if inspection is not None:
                     if inspection.started_at is None:
@@ -555,6 +808,7 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                         "pending_phase": snapshot["pending_phase"],
                         "pending_initialization": snapshot["pending_initialization"],
                         "slot_numbering_status": snapshot["slot_numbering_status"],
+                        "track_states": snapshot.get('track_states', []),
                         "inspection": inspection.snapshot() if inspection is not None else None})
                 if inspection is not None and inspection.closed_at is not None:
                     status = "hatch_closed"
@@ -596,6 +850,11 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                        inspection_processed_frames=inspection_processed,
                        final_group_snapshot=sequence.snapshot(),events=sequence.all_events,
                        closed_groups=sequence.closed_groups)
+        if "track_counts" in locals():
+            summary["slot_tracking"].update(track_counts=track_counts,
+                track_count=len(track_summary),
+                tracks={f"{phase}:G{group_id}:BT{track_id}": values
+                        for (group_id, phase, track_id), values in sorted(track_summary.items())})
         summary["group_process_report"] = build_process_report(summary)
         phases = [summary["phase"]]
         if sequence.auto_load_after_unload and summary["phase"] == "unload":

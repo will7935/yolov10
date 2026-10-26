@@ -9,6 +9,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, box_iou
+from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
 
 
 class RoiGroupSequence:
@@ -70,6 +71,10 @@ class RoiGroupSequence:
         self.pending_tracker = None
         self.departing_points = None
         self.departing_seen = None
+        self.departing_predicted = None
+        self.departing_group_id = None
+        self.departing_numbered = False
+        self.departing_box_sizes = None
         self.departing_gate = None
         self.closed_at, self.departed_points, self.departed_velocity = None, None, None
         self.last_time = None
@@ -82,9 +87,21 @@ class RoiGroupSequence:
         self._deferred_new_events = []
         self._observations_enabled = True
         self._restored_load_groups = set()
+        self.track_store = SlotTrackStateStore(tracker, self.contour)
+        tracker.track_store = self.track_store
+        self.departing_track_ids = []
+        self.departing_phase = None
+        self._track_rejections = {}
 
     def _distance(self, point):
         return cv2.pointPolygonTest(self.contour,tuple(float(v) for v in point),True)
+
+    def is_retired_track(self, track_id):
+        """Return whether a ByteTrack ID belongs to a closed previous group."""
+        if track_id is None:
+            return False
+        owner = self.track_store.owner(int(track_id))
+        return owner in self.track_store.closed
 
     def _entry_progress(self, point):
         """沿已核实转位方向计算ROI内进度：入口为0，出口为1。"""
@@ -126,16 +143,26 @@ class RoiGroupSequence:
             center = np.array([(a[0]+a[2])/2, (a[1]+a[3])/2])
             established = (points is not None and len(points) and
                 np.min(np.linalg.norm(np.asarray(points)-center, axis=1)) <= self.entry_match_distance_px)
+            track_id = obj.get('track_id')
+            owner = self.track_store.owner(track_id)
+            identity = (tracker.phase, tracker.group_id)
+            if owner is not None and owner != identity:
+                self._reject_track(obj, 'previous_group_track')
+                continue
+            known_current = owner == identity
             distance = self._distance(center)
             if distance < 0:
-                if established and distance >= -self.buffer_px:
-                    result.append(obj)  # 临时T轨迹也必须看见真实越界，才能继续切组。
+                if (established or known_current) and distance >= -self.buffer_px:
+                    result.append(obj)
+                else:
+                    self._reject_track(obj, 'outside_roi')
                 continue
             progress = self._entry_progress(center)
             late_visible = established_group and self._distance(center) >= self.margin
             if established or progress is None or progress <= self.entry_birth_fraction or late_visible:
                 result.append(obj)
             else:
+                self._reject_track(obj, 'new_track_outside_entry_region')
                 self._entry_rejected.append({**obj, "center": center.tolist(),
                     "reason": "new_track_outside_entry_region", "entry_progress": progress})
         return result
@@ -143,10 +170,44 @@ class RoiGroupSequence:
     def _new_tracker(self, group_id, *, entry=False, phase=None):
         result = deepcopy(self.tracker)
         result.reset_group(group_id,phase=phase)
+        result.track_store = self.track_store
         if entry:
             result.initialization_seconds = self.entry_seconds
             result.initialization_stability_ratio = self.entry_stability_ratio
         return result
+
+    def _reject_track(self, obj, reason):
+        if obj.get('track_id') is not None:
+            self._track_rejections[int(obj['track_id'])] = reason
+
+    def _sync_track_bindings(self, result):
+        tracker = self.tracker
+        identity = (tracker.phase, tracker.group_id)
+        slots = result.get('slots', [])
+        for slot in slots:
+            self.track_store.bind(slot.get('byte_track_id'), identity,
+                                  slot.get('formal_slot_id'))
+        for obj in tracker.geometry_rejected:
+            self._reject_track(obj, obj['reason'])
+
+    def _track_metadata(self, objects, result):
+        records = self.track_store.visible_records(objects)
+        known = {record['byte_track_id'] for record in records}
+        for track_id, reason in self.track_store.rejected.items():
+            if track_id not in known:
+                records.append(dict(byte_track_id=track_id, state='unknown', observation='unknown',
+                    last_confirmed_state='unknown', reason=reason, group_id=None,
+                    formal_slot_id=None, slot_id=None, phase=None))
+        mapped = {s.get('byte_track_id'): s for s in result.get('slots', [])
+                  if s.get('byte_track_id') is not None}
+        for record in records:
+            track_id = record['byte_track_id']
+            slot = mapped.get(track_id)
+            reason = self._track_rejections.get(track_id) or self.track_store.rejected.get(track_id)
+            if reason is None and slot is None:
+                reason = 'waiting_group_geometry' if self.tracker.points is None else 'association_ambiguous_or_too_far'
+            record['mapping_reason'] = reason or ('mapped' if slot.get('formal_slot_id') else 'waiting_slot_numbering')
+        return records
 
     def _restore_load_baseline(self, result, now):
         """正式编号后复用同组下料时真实检测的空槽，绝不复用旧坐标。"""
@@ -210,7 +271,8 @@ class RoiGroupSequence:
             center = np.array([(a[0]+a[2])/2,(a[1]+a[3])/2])
             distance = self._distance(center)
             if distance >= 0 or (reference is not None and distance >= -self.buffer_px
-                    and np.min(np.linalg.norm(reference-center,axis=1)) <= gate):
+                    and ((obj.get('track_id') is not None and obj.get('track_id') in self.tracker.byte_track_ids)
+                         or np.min(np.linalg.norm(reference-center,axis=1)) <= gate)):
                 result.append(obj)
         return result
 
@@ -349,6 +411,7 @@ class RoiGroupSequence:
                   "required_crossings": self._required_crossings,"snapshot": snap,
                   "events": deepcopy(self.tracker.events)}
         self.closed_groups.append(deepcopy(record))
+        self.track_store.closed.add((self.tracker.phase, self.tracker.group_id))
         self._group_events.append(record)
         # 组号立即切换，但旧组保留一个丢失时限供旋转后的填充框核验。
         # 旧框仍由原有退出点关联排除，不会参与下一组的编号。
@@ -359,6 +422,10 @@ class RoiGroupSequence:
             self.departing_points = self.tracker.points.copy()
             self.departing_seen = np.full(4, now)
             self.departing_gate = self.entry_match_distance_px
+            self.departing_track_ids = list(self.tracker.byte_track_ids)
+            self.departing_predicted = np.asarray([not slot.geometry_observed or slot.geometry_inferred
+                                                  for slot in self.tracker.slots], dtype=bool)
+            self.departing_group_id, self.departing_phase = self.tracker.group_id, self.tracker.phase
         self.closed_at = now
         self.departed_points = np.asarray(self.tracker._entry_points if self.tracker.points is None
                                           else self.tracker.reference_points).copy()
@@ -437,17 +504,32 @@ class RoiGroupSequence:
 
     def _exclude_departing(self, objects, now):
         """旧组退出后继续沿用旧身份匹配，残留点不能成为下一组的初始槽。"""
+        identity = (self.tracker.phase, self.tracker.group_id)
+        known_old = []
+        remaining = []
+        for obj in objects:
+            owner = self.track_store.owner(obj.get('track_id'))
+            if obj['class_name'] in SLOT_STATES and owner in self.track_store.closed and owner != identity:
+                known_old.append(obj)
+                self._reject_track(obj, 'previous_group_track')
+            else:
+                remaining.append(obj)
         if self.departing_points is None:
-            return objects
+            return remaining
         live = np.flatnonzero(now-self.departing_seen <= self.tracker.lost_seconds)
         if not len(live):
             self._verify_departing_load({}, objects, now)
             self._finish_departing_load(now)
             self.departing_points = None
-            return objects
+            self.departing_predicted = None
+            self.departing_group_id = None
+            self.departing_numbered = False
+            self.departing_box_sizes = None
+            return remaining
         # 只跟随每个旧点自己的真实中心，不用退出时变形较大的整组模板外推。
         candidates = self.tracker._candidates([o for o in objects if o.get("detection_source") != "local_crop"])
         old_points = self.departing_points[live].copy()
+        prior_points = self.departing_points.copy()
         current_points = (self.tracker._entry_points if self.tracker._entry_points is not None
                           else self.tracker.reference_points)
 
@@ -459,12 +541,26 @@ class RoiGroupSequence:
             return (distance <= self.entry_match_distance_px
                     and distance < np.min(np.linalg.norm(old_points-center, axis=1)))
 
-        candidates = [c for c in candidates if not belongs_to_current(c["center"])]
+        known_old_ids = {obj.get('track_id') for obj in known_old}
+        candidates = [c for c in candidates if c.get('track_id') in known_old_ids
+                      or not belongs_to_current(c["center"])]
         old_boxes, old_matches = [], {}
         if candidates:
             gate = self.departing_gate
             distances = np.linalg.norm(old_points[:, None]
                 -np.asarray([c["center"] for c in candidates])[None, :], axis=2)
+            # Persistent IDs take precedence over proximity. A clearly new ID
+            # must not feed an old-tail track just because it passes nearby.
+            for row, index in enumerate(live):
+                old_id = self.departing_track_ids[index] if index < len(self.departing_track_ids) else None
+                for col, candidate in enumerate(candidates):
+                    track_id = candidate.get('track_id')
+                    if track_id is not None and old_id is not None:
+                        distances[row, col] = 0. if track_id == old_id else 1e6
+                    elif track_id is not None:
+                        # ID-less predicted S4 can recover only with coherent
+                        # old-group motion, not from a single nearby new box.
+                        distances[row, col] = 1e6
             cost = np.concatenate((np.where(distances <= gate, distances, 1e6),
                 np.full((len(live), len(live)), gate+1)), axis=1)
             rows, cols = linear_sum_assignment(cost)
@@ -475,34 +571,144 @@ class RoiGroupSequence:
                     old_boxes.append(candidates[col])
                     if live[row] < 4:
                         old_matches[int(live[row])] = candidates[col]
+                    if self.departing_predicted is not None and live[row] < len(self.departing_predicted):
+                        self.departing_predicted[live[row]] = False
+        # Recover changed old IDs only when common real old tracks support the
+        # same motion. This is a bounded association check, not a new prediction
+        # box for S1-S3 and not a nearest-point claim on an incoming carrier.
+        support = [i for i, obj in old_matches.items()
+                   if not obj['conflict'] and not self.tracker._occluded(obj, self._hands)]
+        if len(support) >= 2 and self.departing_group_id is not None:
+            deltas = np.asarray([np.asarray(old_matches[i]['center'])-prior_points[i] for i in support])
+            shift = deltas.mean(axis=0)
+            if np.max(np.linalg.norm(deltas-shift, axis=1)) <= self.departing_gate*.25:
+                used_ids = {c.get('track_id') for c in old_boxes}
+                for i in live:
+                    if i in old_matches:
+                        continue
+                    expected = prior_points[i]+shift
+                    options = [c for c in candidates if c.get('track_id') is not None
+                        and c['track_id'] not in used_ids
+                        and self.track_store.owner(c['track_id']) is None
+                        and not belongs_to_current(c['center'])
+                        and np.linalg.norm(np.asarray(c['center'])-expected) <= self.departing_gate*.35
+                        and (len(support) >= 3 or self._entry_progress(c['center']) is None
+                             or self._entry_progress(c['center']) > self.entry_birth_fraction)]
+                    if len(options) != 1:
+                        continue
+                    recovered = options[0]
+                    other_old = [np.linalg.norm(np.asarray(recovered['center'])-(prior_points[j]+shift))
+                                 for j in live if j != i]
+                    if other_old and min(other_old) <= np.linalg.norm(np.asarray(recovered['center'])-expected)+self.departing_gate*.1:
+                        continue
+                    old_boxes.append(recovered)
+                    old_matches[int(i)] = recovered
+                    used_ids.add(recovered['track_id'])
+                    self.departing_points[i], self.departing_seen[i] = recovered['center'], now
+                    if i < len(self.departing_track_ids):
+                        self.departing_track_ids[i] = recovered['track_id']
+                    self.track_store.bind(recovered['track_id'],
+                        (self.departing_phase, self.departing_group_id), int(i)+1 if i < 4 else None)
+        # 对退出组中当前未直接检测到的槽位，用三条可靠旧槽轨迹估算同一载体
+        # 的仿射运动。这样未检测到的S4也会随旧组转动，继续作为旧组的排除轨迹，
+        # 而不是在旧组状态切换后冻结在退出时的位置。
+        predicted = self.departing_predicted
+        if predicted is not None and len(predicted) >= 4:
+            reliable = {i: obj for i, obj in old_matches.items()
+                        if not obj["conflict"] and not self.tracker._occluded(obj, self._hands)}
+            predicted_indices = [i for i in range(4) if predicted[i] and i not in reliable]
+            support = sorted(reliable)
+            if len(support) >= 3 and predicted_indices:
+                source = prior_points[support].astype(np.float32)
+                target = np.asarray([reliable[i]["center"] for i in support], dtype=np.float32)
+                design = np.column_stack((source, np.ones(len(source))))
+                if np.linalg.matrix_rank(design) == 3:
+                    affine = np.linalg.lstsq(design, target, rcond=None)[0].T
+                    singular = np.linalg.svd(affine[:, :2], compute_uv=False)
+                    residual = np.linalg.norm(source @ affine[:, :2].T + affine[:, 2] - target, axis=1)
+                    if (np.linalg.det(affine[:, :2]) > 0 and singular.min() >= .8
+                            and singular.max() <= 1.2 and np.max(residual) <= self.departing_gate * .4):
+                        transformed = prior_points @ affine[:, :2].T + affine[:, 2]
+                        for i in predicted_indices:
+                            # 只延续ROI出口缓冲带内的旧组预测；离开该带后不保留
+                            # 远处虚拟点，避免它长期遮蔽后续载体。
+                            if self._distance(transformed[i]) >= -self.buffer_px:
+                                self.departing_points[i] = transformed[i]
+                                self.departing_seen[i] = now
+                                # Three real old tracks can recover a previously
+                                # unseen old S4 ID. A lone nearby box cannot.
+                                available = [c for c in candidates if c not in old_boxes
+                                    and self.track_store.owner(c.get('track_id')) is None
+                                    and np.linalg.norm(np.asarray(c['center'])-transformed[i]) <= self.departing_gate*.35]
+                                if i == 3 and len(available) == 1:
+                                    recovered = available[0]
+                                    old_boxes.append(recovered)
+                                    old_matches[i] = recovered
+                                    self.departing_points[i] = recovered['center']
+                                    self.departing_predicted[i] = False
+                                    if i < len(self.departing_track_ids):
+                                        self.departing_track_ids[i] = recovered.get('track_id')
+                                    self.track_store.bind(recovered.get('track_id'),
+                                        (self.departing_phase, self.departing_group_id), i+1)
         self._verify_departing_load(old_matches, objects, now)
         result = []
         for obj in objects:
             if obj["class_name"] in SLOT_STATES:
+                if obj.get('track_id') in known_old_ids:
+                    continue
                 a = obj["xyxy"]
                 center = np.array([(a[0]+a[2])/2, (a[1]+a[3])/2])
                 if belongs_to_current(center):
                     result.append(obj)
                     continue
-                if any(np.linalg.norm(np.asarray(old["center"])-center) <= 2
-                        or box_iou(old["xyxy"], a) > .85 for old in old_boxes):
+                if any((obj.get('track_id') is None or obj.get('track_id') == old.get('track_id'))
+                       and (np.linalg.norm(np.asarray(old["center"])-center) <= 2
+                            or box_iou(old["xyxy"], a) > .85) for old in old_boxes):
+                    self._reject_track(obj, 'previous_group_track')
                     continue
-                if np.min(np.linalg.norm(self.departing_points[live]-center, axis=1)) <= self.departing_gate*.5:
+                if (obj.get('track_id') is None and
+                        np.min(np.linalg.norm(self.departing_points[live]-center, axis=1)) <= self.departing_gate*.5):
                     continue
             result.append(obj)
         return result
 
     def _start_immediate_next(self, now, objects):
+        previous_tracker = self.tracker
+        self.departing_group_id = previous_tracker.group_id
+        self.departing_phase = previous_tracker.phase
+        self.departing_numbered = previous_tracker.points is not None
+        known_sizes = [slot.box_size_wh for slot in previous_tracker.slots if slot.box_size_wh is not None]
+        typical_size = None if not known_sizes else tuple(float(value) for value in np.median(known_sizes, axis=0))
+        self.departing_box_sizes = [slot.box_size_wh or typical_size for slot in previous_tracker.slots]
         self.departing_points = np.asarray(self.tracker._entry_points if self.tracker.points is None
                                           else self.tracker.points).copy()
-        # 匹配失败不等于新组：切组帧中出口侧的所有整图中心都保留为旧组尾部。
-        # 额外中心仅隔离，不伪造槽号或参与旧组空满核验。
+        self.departing_track_ids = list(previous_tracker.byte_track_ids if previous_tracker.points is not None
+                                         else previous_tracker._entry_track_ids)
+        if previous_tracker.points is not None:
+            self.departing_predicted = np.asarray([
+                not slot.geometry_observed or slot.geometry_inferred
+                for slot in previous_tracker.slots], dtype=bool)
+        else:
+            # 临时轨迹仍需内部保留以排除旧组尾点，但不会输出成正式S槽预测框。
+            self.departing_predicted = np.ones(min(4, len(self.departing_points)), dtype=bool)
+        if len(self.departing_predicted) < len(self.departing_points):
+            self.departing_predicted = np.pad(self.departing_predicted,
+                (0, len(self.departing_points)-len(self.departing_predicted)), constant_values=False)
+        if len(self.departing_box_sizes) < len(self.departing_points):
+            self.departing_box_sizes.extend([typical_size] * (len(self.departing_points)-len(self.departing_box_sizes)))
+        # 已知旧组ID继续作为尾部排除；有新ID的出口侧框仍需重新判断归属，
+        # 不能一律扣到旧组。无ID输入保留原几何兼容路径。
         for obj in self.tracker._candidates([o for o in objects if o.get("detection_source") != "local_crop"]):
             center = np.asarray(obj["center"])
             progress = self._entry_progress(center)
             if (self._distance(center) >= 0 and progress is not None and progress > self.entry_birth_fraction
+                    and (obj.get('track_id') is None or self.track_store.owner(obj.get('track_id'))
+                         == (previous_tracker.phase, previous_tracker.group_id))
                     and np.min(np.linalg.norm(self.departing_points-center, axis=1)) > 2):
                 self.departing_points = np.vstack((self.departing_points, center))
+                self.departing_track_ids.append(obj.get('track_id'))
+                self.departing_predicted = np.append(self.departing_predicted, False)
+                self.departing_box_sizes.append(typical_size)
         self.departing_seen = np.full(len(self.departing_points), now)
         # 进入时用明确的像素门限，避免旧组退出时透视压缩把新点匹配距离缩得过小。
         gate = self.entry_match_distance_px
@@ -519,7 +725,6 @@ class RoiGroupSequence:
             "phase": self.tracker.phase, "at": now, "reason": "single_slot_roi_exit"})
 
     def _update_immediate_entry(self, objects, now, enabled):
-        original = objects
         objects = self._entry_objects(objects, now)
         self._entry_count = len(self.tracker._candidates(objects))
         result = self.tracker.update(objects, now, observations_enabled=enabled, roi_contour=self.contour)
@@ -530,27 +735,10 @@ class RoiGroupSequence:
             result = self._restore_load_baseline(result, now)
             self._arm(now)
         else:
-            # 个别槽始终遮挡时不能虚构正式槽号，也不能因此错过下一物理组。
-            for i, seen in enumerate(self.tracker._entry_seen_at):
-                if seen != now:
-                    continue
-                point = self.tracker._entry_points[i]
-                distance = self._distance(point)
-                if distance >= self.margin:
-                    self.inside_seen[i] = (now, point.copy())
-                elif distance <= -self.margin and i in self.inside_seen:
-                    at, previous = self.inside_seen[i]
-                    if now-at <= self.tracker.lost_seconds:
-                        self.crossed[i] = {"at": now, "delta": point-previous}
-            if self.crossed:
-                self._required_crossings = 1
-                self._group_events.append({"type": "group_exiting", "group_id": self.tracker.group_id,
-                    "phase": self.tracker.phase, "at": now, "slot_numbering_status": "provisional",
-                    "moving_slot_ids": [i+1 for i in sorted(self.crossed)]})
-                self._close(now)
-                if self.state != "sequence_complete":
-                    self._start_immediate_next(now, original)
-                    return self._update_immediate_entry(original, now, enabled)
+            # A single physical turn closes at most one established group.
+            # Unnumbered/residual entry points cannot advance G again.
+            self.inside_seen.clear()
+            self.crossed.clear()
         return result
 
     def _update_entry(self, objects, now, enabled):
@@ -577,8 +765,13 @@ class RoiGroupSequence:
         self._group_events = []
         self._deferred_new_events = []
         self._entry_rejected = []
+        self._track_rejections = {}
         self._observations_enabled = observations_enabled
         self._hands = [o for o in objects if o["class_name"] == "hand"]
+        self.track_store.observe(objects, now, observations_enabled,
+            reentry_allowed=lambda center: self._distance(center) >= self.margin and (
+                self._entry_progress(center) is None
+                or self._entry_progress(center) <= self.entry_birth_fraction))
         result = None
         if self.state == "entering":
             result = self._update_immediate_entry(objects, now, observations_enabled)
@@ -606,16 +799,20 @@ class RoiGroupSequence:
                     result["new_events"] = closing_events + result["new_events"]
         if result is None:
             result = {**self.tracker.snapshot(),"new_events": []}
+        self._sync_track_bindings(result)
         result["new_events"] = list(result.get("new_events", [])) + deepcopy(self._deferred_new_events)
         self.all_events.extend(deepcopy(result["new_events"]))
         if self.state in ("waiting_next","stabilizing_next","sequence_complete"):
             # 旧组已关闭；等待阶段不重复输出旧组的当前空/满状态。
             for slot in result["slots"]:
                 slot.update(state="unknown",observation="unknown",reason=self.state,
-                            position_is_prediction=slot["center_xy"] is not None)
+                            position_is_prediction=(slot["slot_id"] == 4
+                                and slot["center_xy"] is not None
+                                and slot.get("tracking_box_xyxy") is not None))
             result["current_target_count"] = 0
             result["all_four_currently_confirmed"] = False
-        return {**result,**self.metadata(),"new_group_events": deepcopy(self._group_events)}
+        return {**result,**self.metadata(),"track_states": self._track_metadata(objects, result),
+                "new_group_events": deepcopy(self._group_events)}
 
     def finish(self):
         """结束退出核验；没有空到满的视觉证据就始终保留未完成。"""
@@ -629,6 +826,19 @@ class RoiGroupSequence:
                 "new_group_events": deepcopy(self._group_events)}
 
     def metadata(self):
+        departing_slot_predictions = []
+        if (self.departing_points is not None and self.departing_predicted is not None
+                and self.departing_box_sizes is not None):
+            for index, (point, predicted) in enumerate(zip(self.departing_points, self.departing_predicted)):
+                if (not predicted or index != 3 or not self.departing_numbered
+                        or index >= 4 or self.departing_box_sizes[index] is None):
+                    continue
+                width, height = self.departing_box_sizes[index]
+                departing_slot_predictions.append({"group_id": self.departing_group_id,
+                    "slot_id": index+1, "center_xy": [round(float(v), 2) for v in point],
+                    "tracking_box_xyxy": [round(float(point[0]-width/2), 2),
+                        round(float(point[1]-height/2), 2), round(float(point[0]+width/2), 2),
+                        round(float(point[1]+height/2), 2)]})
         return {"group_assignment": "roi_exit_sequence" if self.enabled else "configured",
                 "group_status": self.state,"pending_group_id": self.pending_tracker.group_id
                     if self.pending_tracker is not None else None,
@@ -640,7 +850,8 @@ class RoiGroupSequence:
                 "entry_candidate_count": self._entry_count,
                 "entry_rejected_slot_detections": deepcopy(self._entry_rejected),
                 "pending_initialization": deepcopy(self.pending_tracker.initialization)
-                    if self.pending_tracker is not None else None}
+                    if self.pending_tracker is not None else None,
+                "departing_slot_predictions": departing_slot_predictions}
 
     def snapshot(self):
         return {**self.tracker.snapshot(),**self.metadata()}

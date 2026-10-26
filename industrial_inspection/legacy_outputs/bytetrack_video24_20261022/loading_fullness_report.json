@@ -1,0 +1,93 @@
+{
+  "phase": "load",
+  "started": true,
+  "finalized": true,
+  "required_slot_count": 20,
+  "confirmed_filled_count": 12,
+  "all_filled": false,
+  "result": "未放满",
+  "groups": [
+    {
+      "group_id": 1,
+      "observed": true,
+      "slot_numbering_status": "final",
+      "filled_slot_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "empty_slot_ids": [],
+      "unknown_slot_ids": [],
+      "filled_count": 4,
+      "all_filled": true,
+      "result": "已放满"
+    },
+    {
+      "group_id": 2,
+      "observed": true,
+      "slot_numbering_status": "provisional",
+      "filled_slot_ids": [],
+      "empty_slot_ids": [],
+      "unknown_slot_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "filled_count": 0,
+      "all_filled": false,
+      "result": "未放满"
+    },
+    {
+      "group_id": 3,
+      "observed": true,
+      "slot_numbering_status": "provisional",
+      "filled_slot_ids": [],
+      "empty_slot_ids": [],
+      "unknown_slot_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "filled_count": 0,
+      "all_filled": false,
+      "result": "未放满"
+    },
+    {
+      "group_id": 4,
+      "observed": true,
+      "slot_numbering_status": "final",
+      "filled_slot_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "empty_slot_ids": [],
+      "unknown_slot_ids": [],
+      "filled_count": 4,
+      "all_filled": true,
+      "result": "已放满"
+    },
+    {
+      "group_id": 5,
+      "observed": true,
+      "slot_numbering_status": "final",
+      "filled_slot_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "empty_slot_ids": [],
+      "unknown_slot_ids": [],
+      "filled_count": 4,
+      "all_filled": true,
+      "result": "已放满"
+    }
+  ],
+  "started_at": 11.419337462967949,
+  "closed_at": 171.72098033934822
+}

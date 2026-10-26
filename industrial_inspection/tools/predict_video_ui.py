@@ -68,7 +68,7 @@ class VideoMainWindow(MainWindow):
         self.prepare_roi = prepare_roi
         self.thread = None
         self.close_when_finished = False
-        self.setWindowTitle("智能晶圆外延工艺检测系统 - 本地视频检测")
+        self.setWindowTitle("晶圆外延工艺智能检测系统 - 本地视频检测")
         self.image_label.setText("本地视频画面")
         self.start_btn.setText("▶️ 开始检测")
         self.stop_btn.setText("⏹️ 停止检测")

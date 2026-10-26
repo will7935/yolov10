@@ -197,7 +197,7 @@ class CycleSequenceTests(unittest.TestCase):
         for _ in range(5):
             self.feed(sequence, group_frames("unload"))
         before = deepcopy(sequence.closed_groups)
-        # T1在其他三个槽出现前已连续检测为满，正式编号后应补报上料。
+        # 第一条ByteTrack轨迹在其他三个槽出现前已连续检测为满，正式编号后应补报上料。
         results = self.feed(sequence, [boxes(visible=(0,), filled=(0,))] * 3
                             + [boxes(filled=range(4))] * 5)
         load_events = [e for e in sequence.all_events if e["phase"] == "load"]

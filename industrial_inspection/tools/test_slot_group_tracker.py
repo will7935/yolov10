@@ -11,14 +11,18 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 import numpy as np
 
 from industrial_inspection.tools.slot_group_tracker import SlotGroupTracker
+from industrial_inspection.tools.slot_byte_tracker import SlotByteTracker
 
 CENTERS = np.array([[100,100],[200,100],[100,200],[200,200]],dtype=float)
 
 
-def detection(index,state="empty",centers=CENTERS,score=.9):
+def detection(index,state="empty",centers=CENTERS,score=.9,track_id=None):
     x,y = centers[index-1]
-    return {"class_name": "wafer_slot_"+state,"class_id": 3 if state=="empty" else 4,
-            "confidence": score,"xyxy": [x-20,y-20,x+20,y+20]}
+    result = {"class_name": "wafer_slot_"+state,"class_id": 3 if state=="empty" else 4,
+              "confidence": score,"xyxy": [x-20,y-20,x+20,y+20]}
+    if track_id is not None:
+        result["track_id"] = track_id
+    return result
 
 
 def tracker(**kwargs):
@@ -26,6 +30,95 @@ def tracker(**kwargs):
 
 
 class TrackingTests(unittest.TestCase):
+    def test_bytetrack_keeps_empty_and_filled_as_one_slot_track(self):
+        byte_tracker=SlotByteTracker(30,high_thresh=.35,low_thresh=.1,buffer_seconds=1)
+        box=[10,10,50,50]
+        first=byte_tracker.update([{"class_name":"wafer_slot_empty","class_id":3,
+            "confidence":.9,"xyxy":box}])[0]
+        self.assertIsNotNone(first["track_id"])
+        byte_tracker.update([])  # Lost-frame aging must continue when no slot is visible.
+        second=byte_tracker.update([{"class_name":"wafer_slot_filled","class_id":4,
+            "confidence":.9,"xyxy":box}])[0]
+        self.assertEqual(second["track_id"],first["track_id"])
+
+    def test_bytetrack_id_keeps_slot_identity_when_center_is_closer_to_neighbor(self):
+        t=tracker()
+        t.byte_track_ids=[101,102,103,104]
+        shifted=CENTERS.copy()
+        shifted[0,0]=155  # The ID is the identity cue even after geometry drifts toward S2.
+        objects=[detection(i,centers=shifted,track_id=100+i) for i in range(1,5)]
+        candidates=t._candidates(objects)
+        matches=t._associate(candidates,t._spacing()*t.match_distance_ratio)
+        self.assertEqual(matches[0],0)
+        result=t.update(objects,0)
+        self.assertEqual([slot["byte_track_id"] for slot in result["slots"]],
+                         [101,102,103,104])
+
+    def test_group_transform_is_exported_from_byte_track_mapped_slots(self):
+        t=tracker()
+        t.byte_track_ids=[101,102,103,104]
+        shifted=CENTERS+np.array([12.,-7.])
+        objects=[detection(i,centers=shifted,track_id=100+i) for i in range(1,5)]
+
+        result=t.update(objects,0.)
+
+        self.assertTrue(result["transform_valid_this_frame"])
+        self.assertLess(result["transform_fit_error"],1e-3)
+        matrix=np.asarray(result["group_transform"])
+        self.assertEqual(matrix.shape,(2,3))
+        np.testing.assert_allclose(matrix[:,2],[12.,-7.],atol=1e-3)
+        self.assertEqual(result["transform_support_slot_ids"],[1,2,3,4])
+
+    def test_three_tracked_slots_keep_transform_valid_and_predict_only_s4(self):
+        t=tracker(phase="unload")
+        t.byte_track_ids=[101,102,103,104]
+        shifted=CENTERS+np.array([8.,-5.])
+        objects=[detection(i,"filled",centers=shifted,track_id=100+i) for i in (1,2,3)]
+
+        result=t.update(objects,0.)
+
+        self.assertTrue(result["transform_valid_this_frame"])
+        self.assertEqual(result["transform_support_slot_ids"],[1,2,3])
+        self.assertEqual(result["slots"][3]["center_xy"],[208.,195.])
+        self.assertTrue(result["slots"][3]["position_is_prediction"])
+        self.assertFalse(any(slot["position_is_prediction"] for slot in result["slots"][:3]))
+
+    def test_empty_to_filled_class_change_keeps_same_byte_track_mapping(self):
+        t=tracker()
+        t.byte_track_ids=[101,102,103,104]
+        for now,state in ((0,"empty"),(.1,"empty"),(.2,"filled"),(.3,"filled")):
+            result=t.update([detection(1,state,track_id=101)],now)
+        self.assertEqual(result["slots"][0]["byte_track_id"],101)
+        self.assertEqual(result["new_events"][0]["slot_id"],1)
+        self.assertEqual(result["new_events"][0]["byte_track_id"],101)
+        self.assertEqual(result["new_events"][0]["action"],"load")
+
+    def test_new_bytetrack_id_recovers_formal_slot_by_geometry_without_resetting_state(self):
+        t=tracker()
+        t.byte_track_ids=[101,102,103,104]
+        for now in (0.,.1):
+            t.update([detection(1,"empty",track_id=101)],now)
+        shifted=CENTERS.copy()
+        shifted[0,0]=112
+        result=t.update([detection(1,"empty",centers=shifted,track_id=201)],.2)
+        self.assertEqual(result["slots"][0]["byte_track_id"],201)
+        self.assertEqual(result["slots"][0]["last_confirmed_state"],"empty")
+        self.assertEqual(result["new_events"],[])
+
+        for now in (.3,.4):
+            result=t.update([detection(1,"filled",centers=shifted,track_id=201)],now)
+        self.assertEqual((result["new_events"][0]["slot_id"],
+                          result["new_events"][0]["byte_track_id"]),(1,201))
+
+    def test_initial_geometry_maps_bytetrack_ids_to_formal_slot_ids(self):
+        t=SlotGroupTracker(None,confirm_seconds=0,minimum_frames=1,
+                           initialization_seconds=.1,initialization_frames=2)
+        objects=[detection(i,track_id=200+i) for i in (4,2,1,3)]
+        t.update(objects,0)
+        result=t.update(objects,.1)
+        mapped={slot["slot_id"]:slot["byte_track_id"] for slot in result["slots"]}
+        self.assertEqual(mapped,{1:201,2:203,3:202,4:204})
+
     def test_baseline_does_not_create_events(self):
         t=tracker()
         objects=[detection(i,"filled") for i in range(1,5)]
@@ -160,7 +253,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(t.order_result(),'pending')
         self.assertTrue(t.snapshot()['all_four_target_previously_verified'])
 
-    def test_load_hand_contact_alone_never_fills_hidden_s4(self):
+    def test_empty_to_unknown_after_contact_infers_hidden_s4_load(self):
         t=tracker(phase='load',load_hand_contact_seconds=.15)
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
         full=[detection(i,'empty') for i in range(1,5)]
@@ -170,12 +263,11 @@ class TrackingTests(unittest.TestCase):
             result=t.update([detection(i,'empty') for i in (1,2,3)]+[hand],now)
         self.assertEqual(result['slots'][3]['state'],'unknown')
         self.assertTrue(result['slots'][3]['load_contact_pending'])
-        result=t.update([detection(i,'empty') for i in (1,2,3)],.5)
-        self.assertEqual(result['new_events'],[])
-        result=t.update([detection(i,'empty') for i in (1,2,3)],.7)
-        self.assertEqual(result['new_events'],[])
-        self.assertEqual(t.events,[])
-        self.assertEqual(t.snapshot()['slots'][3]['last_confirmed_state'],'empty')
+        for now in (.5,.7,1.0):
+            result=t.update([detection(i,'empty') for i in (1,2,3)],now)
+        self.assertEqual([(e['slot_id'],e['action'],e['reason']) for e in t.events],
+                         [(4,'load','hand_contact_inferred_load')])
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'filled')
 
     def test_load_hand_contact_prefers_later_filled_detection(self):
         t=tracker(phase='load',load_hand_contact_seconds=.15)
@@ -190,6 +282,177 @@ class TrackingTests(unittest.TestCase):
                          [(4,'detected_after_hand_contact',False)])
         self.assertEqual(result['slots'][3]['last_confirmed_state'],'filled')
 
+    def test_unknown_slot_contact_then_filled_infers_load(self):
+        t=tracker(phase='load')
+        hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
+        for now in (0.,.1,.2):
+            t.update([detection(i) for i in (1,2,3)]+[hand],now)
+        for now in (.3,.4):
+            result=t.update([detection(i) for i in (1,2,3)]+[detection(4,'filled')],now)
+        self.assertEqual(len(t.events),1)
+        event=t.events[0]
+        self.assertEqual((event['slot_id'],event['from'],event['to'],event['action']),
+                         (4,'unknown','filled','load'))
+        self.assertEqual(event['reason'],'unknown_state_after_hand_contact')
+        self.assertTrue(event['inferred'])
+        self.assertTrue(event['expected_action'])
+        self.assertEqual((event['time_lower'],event['time_upper']),(0.,.3))
+        self.assertEqual(event['hand_contact_frames'],3)
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'filled')
+
+    def test_unload_unknown_slot_assumes_filled_then_yolo_empty_confirms_unload(self):
+        t=tracker(phase='unload')
+        hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
+        for now in (0.,.1,.2):
+            t.update([detection(i) for i in (1,2,3)]+[hand],now)
+        for now in (.3,.4):
+            result=t.update([detection(i) for i in (1,2,3,4)],now)
+        self.assertEqual(len(t.events),1)
+        event=t.events[0]
+        self.assertEqual((event['slot_id'],event['from'],event['to'],event['action']),
+                         (4,'filled','empty','unload'))
+        self.assertEqual(event['reason'],'detected_after_hand_contact')
+        self.assertFalse(event['inferred'])
+        self.assertTrue(event['expected_action'])
+        self.assertEqual(result['slots'][3]['confirmation_source'],'yolo')
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'empty')
+
+    def test_filled_to_unknown_after_hand_contact_infers_unload(self):
+        t=tracker(phase='unload')
+        hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
+        for now in (0.,.1):
+            t.update([detection(4,'filled')],now)
+        for now in (.2,.3,.4):
+            t.update([detection(4,'filled'),hand],now)
+        for now in (.5,.7,1.0):
+            result=t.update([],now)
+        self.assertEqual([(e['slot_id'],e['from'],e['to'],e['action']) for e in t.events],
+                         [(4,'filled','empty','unload')])
+        self.assertEqual(result['slots'][3]['confirmation_source'],'hand_contact')
+        self.assertEqual(result['new_events'][0]['reason'],'hand_contact_inferred_unload')
+
+    def test_empty_to_unknown_after_hand_contact_infers_load(self):
+        t=tracker(phase='load')
+        hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
+        for now in (0.,.1):
+            t.update([detection(4,'empty')],now)
+        for now in (.2,.3,.4):
+            t.update([detection(4,'empty'),hand],now)
+        for now in (.5,.7,1.0):
+            result=t.update([],now)
+        self.assertEqual([(e['slot_id'],e['from'],e['to'],e['action']) for e in t.events],
+                         [(4,'empty','filled','load')])
+        self.assertEqual(result['slots'][3]['confirmation_source'],'hand_contact')
+        self.assertEqual(result['new_events'][0]['reason'],'hand_contact_inferred_load')
+
+    def test_hand_contact_unknown_to_unknown_toggles_last_confirmed_state_in_either_phase(self):
+        cases=(('unload','empty','filled','load'),('load','filled','empty','unload'))
+        for phase,prior,target,action in cases:
+            with self.subTest(phase=phase,prior=prior):
+                t=tracker(phase=phase)
+                hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
+                for now in (0.,.1):
+                    t.update([detection(4,prior)],now)
+                for now in (.2,.3,.4):
+                    result=t.update([detection(4,prior),hand],now)
+                self.assertEqual(result['slots'][3]['state'],'unknown')
+                for now in (.5,.7,1.0):
+                    result=t.update([detection(i,prior) for i in (1,2,3)],now)
+
+                event=result['new_events'][0]
+                self.assertEqual((event['from'],event['to'],event['action']),
+                                 (prior,target,action))
+                self.assertEqual(event['reason'],'hand_contact_unknown_state_toggle')
+                self.assertFalse(event['expected_action'])
+                self.assertEqual(result['slots'][3]['last_confirmed_state'],target)
+
+    def test_unload_hand_contact_assumes_unknown_slot_was_filled_then_unloads_it(self):
+        t=tracker(phase='unload',load_hand_contact_seconds=.15,load_hand_contact_min_frames=2)
+        hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
+        other_slots=[detection(i,'filled') for i in (1,2,3)]
+        for now in (0.,.1):
+            result=t.update(other_slots,now)
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'unknown')
+
+        for now in (.2,.3,.4):
+            result=t.update(other_slots+[hand],now)
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'filled')
+        self.assertEqual(result['slots'][3]['confirmation_source'],'unload_hand_contact_baseline')
+        self.assertTrue(result['slots'][3]['load_contact_pending'])
+
+        for now in (.5,.7,1.0):
+            result=t.update(other_slots,now)
+        event=result['new_events'][0]
+        self.assertEqual((event['from'],event['to'],event['action']),('filled','empty','unload'))
+        self.assertEqual(event['reason'],'hand_contact_inferred_unload')
+        self.assertTrue(event['expected_action'])
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'empty')
+        self.assertEqual(result['slots'][3]['confirmation_source'],'hand_contact')
+
+    def test_hand_contact_only_records_s4_even_when_hand_covers_multiple_slots(self):
+        t=tracker(phase='unload',load_hand_contact_seconds=.15,load_hand_contact_min_frames=2)
+        full=[detection(i,'filled') for i in range(1,5)]
+        for now in (0.,.1):
+            t.update(full,now)
+        wide_hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[75,75,225,225]}
+        for now in (.2,.3,.4):
+            result=t.update(full+[wide_hand],now)
+        self.assertFalse(any(slot['load_contact_pending'] for slot in result['slots'][:3]))
+        # A hand box covering multiple slot centers is ambiguous and must not
+        # start contact accumulation for S4 either.
+        self.assertFalse(result['slots'][3]['load_contact_pending'])
+
+        s4_hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
+        for now in (.5,.6,.7):
+            result=t.update(full+[s4_hand],now)
+        self.assertFalse(any(slot['load_contact_pending'] for slot in result['slots'][:3]))
+        self.assertTrue(result['slots'][3]['load_contact_pending'])
+
+        # Once unique S4 contact is pending, an expanded ambiguous box keeps
+        # the contact open but cannot create contact evidence for other slots.
+        result=t.update(full+[wide_hand],.8)
+        self.assertTrue(result['slots'][3]['load_contact_pending'])
+        self.assertIsNone(result['slots'][3]['load_contact_released_at'])
+
+    def test_incremental_entry_hand_contact_uses_formal_s4_mapping(self):
+        t=SlotGroupTracker(None,phase='unload',slot2_below_slot3=True)
+        t.start_incremental_entry(100)
+        angle=np.radians(60)
+        rotation=np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+        points=(CENTERS-[150,150])@rotation.T+[150,150]
+        t._entry_points=[point.copy() for point in points]
+        s4_index=t._entry_s4_index()
+        self.assertEqual(s4_index,1)  # The temporary arrival order is not the formal S1-S4 order.
+        point=points[s4_index]
+        hand={'class_name':'hand','class_id':0,'confidence':.9,
+              'xyxy':[point[0]-5,point[1]-5,point[0]+5,point[1]+5]}
+        self.assertTrue(t._hand_contact(s4_index,[hand]))
+        self.assertFalse(t._hand_contact(3,[hand]))
+        for now in (.2,.3,.4):
+            t._record_hand_contact(t.slots[s4_index],now,True,True,s4_index)
+        self.assertTrue(t.slots[s4_index].load_contact_pending)
+
+    def test_opposite_yolo_state_after_contact_cancels_hand_inference(self):
+        t=tracker(phase='load')
+        hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[85,85,115,115]}
+        for now in (0.,.1):
+            t.update([detection(1,'empty')],now)
+        for now in (.2,.3,.4):
+            t.update([detection(1,'empty'),hand],now)
+        result=t.update([detection(1,'empty')],.5)
+        t.update([detection(1,'empty')],.7)
+        self.assertEqual(result['slots'][0]['last_confirmed_state'],'empty')
+        self.assertEqual(t.events,[])
+
+    def test_unknown_state_without_contact_only_establishes_baseline(self):
+        t=tracker(phase='load')
+        for now in (0.,.1):
+            t.update([detection(i) for i in (1,2,3)],now)
+        for now in (.2,.3):
+            t.update([detection(i) for i in (1,2,3)]+[detection(4,'filled')],now)
+        self.assertEqual(t.slots[3].confirmed,'filled')
+        self.assertEqual(t.events,[])
+
     def test_short_load_hand_pass_does_not_fill_slot(self):
         t=tracker(phase='load',load_hand_contact_seconds=.15)
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
@@ -200,14 +463,19 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(result['slots'][3]['last_confirmed_state'],'empty')
         self.assertEqual(t.events,[])
 
-    def test_unload_ignores_hand_contact_inference(self):
+    def test_unload_s4_hand_contact_can_infer_unload_without_slot_detection(self):
         t=tracker(phase='unload')
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
         for now in (0.,.1):
             t.update([detection(i,'filled') for i in range(1,5)],now)
-        for now in (.2,.3,.4,.7):
-            t.update([detection(i,'filled') for i in (1,2,3)]+([hand] if now < .5 else []),now)
-        self.assertEqual(t.events,[])
+        for now in (.2,.3,.4,.7,.9,1.2):
+            result=t.update([detection(i,'filled') for i in (1,2,3)]+([hand] if now < .5 else []),now)
+        self.assertEqual(len(t.events),1)
+        event=t.events[0]
+        self.assertEqual((event['slot_id'],event['from'],event['to'],event['action']),(4,'filled','empty','unload'))
+        self.assertEqual(event['reason'],'hand_contact_inferred_unload')
+        self.assertTrue(event['inferred'])
+        self.assertEqual(result['slots'][3]['confirmation_source'],'hand_contact')
 
     def test_hidden_event_is_not_imputed_and_partial_sequence_not_failed(self):
         t=tracker(phase='load')
@@ -245,23 +513,47 @@ class AutomaticInitializationTests(unittest.TestCase):
         self.assertEqual([s['state'] for s in result['slots']],['unknown']*4)
         json.dumps(result,allow_nan=False)
 
-    def test_three_slots_wait_until_four_appear(self):
+    def test_three_slots_infer_missing_fourth_and_initialize_group(self):
         t=self.make_auto(group_id=4)
+        objects=[detection(i) for i in (1,2,3)]
         for now in (0,.1):
-            result=t.update([detection(i) for i in (1,2,3)],now)
-        self.assertIsNone(t.points)
+            result=t.update(objects,now)
+        self.assertIsNotNone(t.points)
         self.assertEqual(result['initialization']['eligible_slot_count'],3)
-        objects=[detection(i,'filled') for i in (4,2,1,3)]
-        t.update(objects,.2)
-        result=t.update(objects,.3)
         self.assertEqual(result['identity_status'],'tracking')
-        expected=CENTERS[[0,2,1,3]]  # 按x排序，x相同再按y排序。
+        expected=CENTERS[[0,2,1,3]]  # 左上、左下、右上、右下；右下由三点推算。
         np.testing.assert_allclose(t.points,expected)
+        self.assertEqual(result['initialization']['inferred_slot_ids'],[4])
+        self.assertEqual(result['initialization']['required_slot_count'],3)
+        self.assertTrue(result['slots'][3]['geometry_inferred'])
+        self.assertTrue(result['slots'][3]['position_is_prediction'])
+        self.assertIsNotNone(result['slots'][3]['tracking_box_xyxy'])
+        self.assertTrue(all(not slot['position_is_prediction'] and slot['tracking_box_xyxy'] is not None
+                            for slot in result['slots'][:3]))
         self.assertEqual(result['group_id'],4)
         self.assertEqual(t.events,[])
-        result=t.update(objects,.4)
-        self.assertEqual([s['state'] for s in result['slots']],['filled']*4)
+        result=t.update(objects,.2)
+        self.assertEqual([s['state'] for s in result['slots']],['empty','empty','empty','unknown'])
         self.assertEqual(t.events,[])
+
+    def test_unknown_inferred_s4_assumes_filled_then_yolo_empty_confirms_unload(self):
+        t=self.make_auto(phase='unload',load_hand_contact_seconds=.15,load_hand_contact_min_frames=2)
+        objects=[detection(i) for i in (1,2,3)]
+        for now in (0.,.1):
+            result=t.update(objects,now)
+        self.assertTrue(result['slots'][3]['geometry_inferred'])
+        hand={'class_name':'hand','confidence':.9,'xyxy':[185,185,215,215]}
+        for now in (.2,.3,.4):
+            t.update(objects+[hand],now)
+        after_contact=objects+[detection(4,'empty')]
+        t.update(after_contact,.5)
+        result=t.update(after_contact,.6)
+        self.assertEqual([(event['slot_id'],event['action']) for event in result['new_events']],[(4,'unload')])
+        self.assertEqual((result['new_events'][0]['from'],result['new_events'][0]['to']),('filled','empty'))
+        self.assertEqual(result['new_events'][0]['reason'],'detected_after_hand_contact')
+        self.assertFalse(result['new_events'][0]['inferred'])
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'empty')
+        self.assertEqual(result['slots'][3]['confirmation_source'],'yolo')
 
     def test_duration_and_frame_count_both_required(self):
         t=SlotGroupTracker(initialization_seconds=.2,initialization_frames=3)
@@ -281,6 +573,9 @@ class AutomaticInitializationTests(unittest.TestCase):
         self.assertIsNone(t.points)
         self.assertEqual(result['identity_status'],'waiting_initialization')
         self.assertEqual([s['state'] for s in result['slots']],['filled']*4)
+        self.assertTrue(all(s['formal_slot_id'] is None for s in result['slots']))
+        self.assertTrue(all(s['slot_id'] is None for s in result['slots']))
+        self.assertEqual([s['internal_slot_index'] for s in result['slots']],[1,2,3,4])
         empty_first=[detection(i,'empty' if i==1 else 'filled') for i in range(1,5)]
         for now in (.2,.3):
             result=t.update(empty_first,now)
@@ -460,8 +755,9 @@ class AutomaticInitializationTests(unittest.TestCase):
         objects=[detection(i) for i in range(1,5)]
         for now in (0,.1):
             result=t.update(objects,now,initialization_objects=objects[:3])
-        self.assertIsNone(t.points)
+        self.assertIsNotNone(t.points)
         self.assertEqual(result['initialization']['eligible_slot_count'],3)
+        self.assertEqual(result['initialization']['inferred_slot_ids'],[4])
 
     def test_discontinuous_geometry_restarts_initialization(self):
         t=self.make_auto()
@@ -502,7 +798,7 @@ class IncrementalEntryTests(unittest.TestCase):
         t.start_incremental_entry(40)
         return t
 
-    def test_two_visible_points_move_without_extrapolating_hidden_points(self):
+    def test_two_visible_points_move_without_extrapolating_any_hidden_points(self):
         t=self.make()
         for now in (0,.1):
             t.update([detection(i,'filled') for i in range(1,5)],now)
@@ -511,8 +807,71 @@ class IncrementalEntryTests(unittest.TestCase):
         result=t.update([detection(i,'filled',centers=moved) for i in (1,3)],.2)
         np.testing.assert_allclose(t.reference_points[:2],reference[:2]+[-30,0])
         np.testing.assert_allclose(t.reference_points[2:],reference[2:])
-        self.assertEqual([x['position_is_prediction'] for x in result['slots']],[False,False,True,True])
+        self.assertEqual([x['position_is_prediction'] for x in result['slots']],[False]*4)
+        self.assertEqual([x['tracking_box_xyxy'] is not None for x in result['slots']],
+                         [True,True,False,False])
         self.assertEqual(result['identity_status'],'tracking')
+
+    def test_three_visible_slots_predict_only_missing_s4(self):
+        t=self.make()
+        for now in (0,.1):
+            t.update([detection(i,'filled') for i in range(1,5)],now)
+        moved=CENTERS+[15,10]
+        result=t.update([detection(i,'filled',centers=moved) for i in (1,2,3)],.2)
+        self.assertEqual([slot['position_is_prediction'] for slot in result['slots']],
+                         [False,False,False,True])
+        self.assertEqual([slot['tracking_box_xyxy'] is not None for slot in result['slots']],
+                         [True,True,True,True])
+        np.testing.assert_allclose(t.reference_points[:3],moved[[0,2,1]])
+        np.testing.assert_allclose(t.reference_points[3],moved[3],atol=.05)
+
+    def test_missing_non_s4_slot_is_not_predicted(self):
+        t=self.make()
+        for now in (0,.1):
+            t.update([detection(i,'filled') for i in range(1,5)],now)
+        moved=CENTERS+[15,10]
+        # Formal S1 is missing; the observed formal slots are S2, S3 and S4.
+        result=t.update([detection(i,'filled',centers=moved) for i in (2,3,4)],.2)
+        self.assertEqual([slot['position_is_prediction'] for slot in result['slots']],
+                         [False,False,False,False])
+        self.assertEqual(result['slots'][0]['tracking_box_xyxy'],None)
+        np.testing.assert_allclose(t.reference_points[[1,2,3]],moved[[2,1,3]])
+
+    def test_three_detected_points_infer_fourth_for_unload_group_entry(self):
+        t=SlotGroupTracker(group_id=2,phase='unload',confirm_seconds=.1,minimum_frames=2,
+                           initialization_seconds=.1,initialization_frames=2)
+        t.start_incremental_entry(40)
+        objects=[detection(i) for i in (1,2,3)]
+        for now in (0.,.1):
+            result=t.update(objects,now)
+        self.assertEqual(result['identity_status'],'tracking')
+        self.assertIsNotNone(t.points)
+        self.assertEqual(result['initialization']['inferred_slot_ids'],[4])
+        self.assertTrue(result['slots'][3]['geometry_inferred'])
+        self.assertTrue(all(not slot['position_is_prediction'] and slot['tracking_box_xyxy'] is not None
+                            for slot in result['slots'][:3]))
+        np.testing.assert_allclose(t.points,CENTERS[[0,2,1,3]])
+
+    def test_incremental_entry_only_infers_missing_s4(self):
+        t=SlotGroupTracker(group_id=2,phase='unload',confirm_seconds=.1,minimum_frames=2,
+                           initialization_seconds=.1,initialization_frames=2)
+        t.start_incremental_entry(40)
+        # 缺失S1时，三点几何仍能推算出一个角点，但不能把该临时点当S4。
+        three=[detection(i) for i in (2,3,4)]
+        t.update(three,0.)
+        result=t.update(three,.1)
+        self.assertIsNone(t.points)
+        self.assertEqual(result['initialization']['reason'],'waiting_for_detected_non_s4_slot')
+        self.assertEqual(result['initialization']['required_slot_count'],4)
+        self.assertEqual(result['initialization']['inferred_slot_ids'],[])
+
+        # 等到真实缺失槽进入后，按四条真实轨迹完成编号。
+        all_four=[detection(i) for i in (1,2,3,4)]
+        t.update(all_four,.2)
+        result=t.update(all_four,.3)
+        self.assertEqual(result['identity_status'],'tracking')
+        self.assertEqual(result['initialization']['inferred_slot_ids'],[])
+        np.testing.assert_allclose(t.points,CENTERS[[0,2,1,3]])
 
     def test_state_change_with_shifted_box_uses_entry_pixel_gate(self):
         t=self.make()
