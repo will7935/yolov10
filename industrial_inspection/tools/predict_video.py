@@ -35,7 +35,7 @@ MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs
 OUTPUT_ROOT = Path(r"I:\youyan\test_dataset")
 # 例如改为：OUTPUT_ROOT = Path(r"I:\youyan\video_results")
 
-CONFIDENCE = 0.2        # 检测分数门槛；降低可减少部分漏检，也可能增加误报，不等于准确率
+CONFIDENCE = 0.7        # 检测分数门槛；降低可减少部分漏检，也可能增加误报，不等于准确率
 AUDIT_CONFIDENCE = 0.001 # 置信度审计下限；低于显示门槛的模型候选框也写入 CSV
 IMAGE_SIZE = 1280        # 推理输入尺寸；输出视频和记录坐标仍使用原图分辨率
 DEVICE = "0"          # "auto" 自动选择 GPU/CPU；"0" 使用 GPU 0；"cpu" 使用 CPU

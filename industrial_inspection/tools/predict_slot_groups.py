@@ -518,6 +518,7 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         byte_tracker = None
         if BYTE_TRACK_SLOTS_ENABLED and slot_classes:
             low_conf = min(BYTE_TRACK_LOW_CONFIDENCE, args.conf * .5)
+            # low_conf = BYTE_TRACK_LOW_CONFIDENCE
             byte_tracker = SlotByteTracker(fps / args.stride, high_thresh=args.conf,
                 low_thresh=low_conf, buffer_seconds=BYTE_TRACK_BUFFER_SECONDS)
             summary["slot_tracking"].update(enabled=True, low_confidence=low_conf,
@@ -536,7 +537,7 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
             detection_csv = stack.enter_context(
                 (output/"detection_confidences.csv").open("w", encoding="utf-8-sig", newline=""))
             detection_fields = ["source_frame", "time_seconds", "detection_index", "class_id", "class_name",
-                                "confidence", "x1", "y1", "x2", "y2", "track_id",
+                                "confidence", "x1", "y1", "x2", "y2", "track_id", "group_id", "phase", "slot_point",
                                 "meets_display_confidence", "displayed", "display_reason", "display_style",
                                 "detection_source"]
             detection_rows = csv.DictWriter(detection_csv, fieldnames=detection_fields, extrasaction="ignore")
@@ -667,6 +668,10 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                             known_records.add(item['track_id'])
                 for detection_index, item in enumerate(tracked_raw):
                     is_slot = item["class_name"] in SLOT_STATES
+                    slot_record = slot_track_record(item, snapshot) if is_slot else {}
+                    slot_id = slot_record.get("formal_slot_id") or slot_record.get("slot_id")
+                    slot_point = (f"S{slot_id}" if slot_id is not None else
+                                  "待编号" if slot_record.get("mapping_status") == "provisional" else "")
                     if item["confidence"] < args.conf:
                         displayed, display_reason = False, "below_confidence_threshold"
                     elif not is_slot:
@@ -685,6 +690,9 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
                         display_reason=display_reason,
                         display_style="slot_box" if is_slot else "detection_point")
                     audit_row.update(track_id=item.get("track_id"),
+                                     group_id=slot_record.get("group_id"),
+                                     phase=(slot_record.get("phase") or tracker.phase) if is_slot else "",
+                                     slot_point=slot_point,
                                      detection_source=item.get("detection_source", "full_frame"))
                     detection_rows.writerow(audit_row)
                 detection_records = [slot_track_record(item, snapshot) for item in slot_track_detections]
