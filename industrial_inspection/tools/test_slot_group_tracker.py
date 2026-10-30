@@ -564,6 +564,17 @@ class AutomaticInitializationTests(unittest.TestCase):
         t.update(objects,.2)
         self.assertIsNotNone(t.points)
 
+    def test_geometry_stability_seconds_can_exceed_track_support_seconds(self):
+        t=SlotGroupTracker(initialization_seconds=.1,geometry_initialization_seconds=.5,
+                           initialization_frames=2)
+        objects=[detection(i) for i in range(1,5)]
+        for now in (0.,.1,.2,.3,.4):
+            result=t.update(objects,now)
+            self.assertIsNone(t.points)
+        self.assertEqual(result['initialization']['geometry_stable_seconds'],.5)
+        t.update(objects,.5)
+        self.assertIsNotNone(t.points)
+
     def test_provisional_states_are_visible_before_identity_is_ready(self):
         t=SlotGroupTracker(initialization_seconds=.5,initialization_frames=3,
                            confirm_seconds=.1,minimum_frames=2)
@@ -852,26 +863,17 @@ class IncrementalEntryTests(unittest.TestCase):
                             for slot in result['slots'][:3]))
         np.testing.assert_allclose(t.points,CENTERS[[0,2,1,3]])
 
-    def test_incremental_entry_only_infers_missing_s4(self):
+    def test_incremental_entry_uses_rightmost_candidate_as_s4(self):
         t=SlotGroupTracker(group_id=2,phase='unload',confirm_seconds=.1,minimum_frames=2,
                            initialization_seconds=.1,initialization_frames=2)
         t.start_incremental_entry(40)
-        # 缺失S1时，三点几何仍能推算出一个角点，但不能把该临时点当S4。
+        # 三点构造三个平行四边形候选，选择最右侧候选作为预测S4。
         three=[detection(i) for i in (2,3,4)]
         t.update(three,0.)
         result=t.update(three,.1)
-        self.assertIsNone(t.points)
-        self.assertEqual(result['initialization']['reason'],'waiting_for_detected_non_s4_slot')
-        self.assertEqual(result['initialization']['required_slot_count'],4)
-        self.assertEqual(result['initialization']['inferred_slot_ids'],[])
-
-        # 等到真实缺失槽进入后，按四条真实轨迹完成编号。
-        all_four=[detection(i) for i in (1,2,3,4)]
-        t.update(all_four,.2)
-        result=t.update(all_four,.3)
         self.assertEqual(result['identity_status'],'tracking')
-        self.assertEqual(result['initialization']['inferred_slot_ids'],[])
-        np.testing.assert_allclose(t.points,CENTERS[[0,2,1,3]])
+        self.assertEqual(result['initialization']['inferred_slot_ids'],[4])
+        np.testing.assert_allclose(t.points,[[100,200],[200,100],[200,200],[300,100]])
 
     def test_state_change_with_shifted_box_uses_entry_pixel_gate(self):
         t=self.make()

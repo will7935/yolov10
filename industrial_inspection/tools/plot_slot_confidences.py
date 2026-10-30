@@ -91,6 +91,7 @@ def _read_rows(path: Path):
                 "class_name": (row.get("class_name") or "").strip(),
                 "displayed": _as_bool(row.get("displayed")),
                 "track_id": (row.get("track_id") or "").strip(),
+                "logical_track_id": (row.get("logical_track_id") or row.get("track_id") or "").strip(),
             })
     for values in records.values():
         values.sort(key=lambda item: (item["source_frame"], item["time_seconds"]))
@@ -230,8 +231,12 @@ def plot_confidences(input_csv: Path, output_image: Path, output_summary: Path, 
                             detection_state = (track_id, item["class_name"])
                             if detection_state == previous_detection:
                                 continue
+                            actual_label = f"BT{track_id or '-'}"
+                            logical_id = item.get("logical_track_id", "")
+                            if logical_id and logical_id != track_id:
+                                actual_label += f"/L{logical_id}"
                             ax.annotate(
-                                f"BT{track_id or '-'} {CLASS_LABELS.get(item['class_name'], item['class_name'] or '未知')} "
+                                f"{actual_label} {CLASS_LABELS.get(item['class_name'], item['class_name'] or '未知')} "
                                 f"{item['confidence']:.2f}",
                                 (item["time_seconds"], item["confidence"]),
                                 xytext=(3, 3), textcoords="offset points",

@@ -16,19 +16,32 @@ def slot_track_record(item, snapshot):
         record.update(slot_id=None, slot_state="unknown", last_confirmed_state="unknown",
                       formal_slot_id=None,
                       observation=SLOT_STATES.get(item.get("class_name"), "unknown"),
-                      state_reason="unmapped_track", confirmation_source=None, group_id=None)
+                      state_reason="unmapped_track", confirmation_source=None, group_id=None,
+                      logical_track_id=track_id, reidentified_from_track_id=None,
+                      reid_gap_seconds=None, reid_method=None)
         if independent is not None:
             record.update(slot_id=independent.get('slot_id'), formal_slot_id=independent.get('formal_slot_id'),
                           slot_state=independent['state'], last_confirmed_state=independent['last_confirmed_state'],
                           observation=independent['observation'], state_reason=independent['reason'],
                           confirmation_source=independent.get('confirmation_source'),
-                          group_id=independent.get('group_id'), phase=independent.get('phase'))
+                          group_id=independent.get('group_id'), phase=independent.get('phase'),
+                          logical_track_id=independent.get('logical_track_id', track_id),
+                          reidentified_from_track_id=independent.get('reidentified_from_track_id'),
+                          reid_gap_seconds=independent.get('reid_gap_seconds'),
+                          reid_method=independent.get('reid_method'))
     else:
         formal = (slot["slot_id"] if snapshot.get("slot_numbering_status") == "final" else None)
         record.update(slot_id=formal, formal_slot_id=formal, slot_state=slot["state"],
                       last_confirmed_state=slot["last_confirmed_state"],
                       observation=slot["observation"], state_reason=slot["reason"],
-                      confirmation_source=slot.get("confirmation_source"), group_id=slot["group_id"])
+                      confirmation_source=slot.get("confirmation_source"), group_id=slot["group_id"],
+                      logical_track_id=(independent.get('logical_track_id', track_id)
+                                        if independent is not None else track_id),
+                      reidentified_from_track_id=(independent.get('reidentified_from_track_id')
+                                                  if independent is not None else None),
+                      reid_gap_seconds=(independent.get('reid_gap_seconds')
+                                        if independent is not None else None),
+                      reid_method=(independent.get('reid_method') if independent is not None else None))
         if (formal is None and independent is not None
                 and slot.get('confirmation_source') != 'hand_contact'):
             # Waiting for a coherent quartet must not hide a track's otherwise
@@ -58,5 +71,10 @@ def slot_track_label(item, snapshot):
     else:
         slot_label = (f"G{record['group_id']} " if record['group_id'] is not None else '') + 'S:pending '
     detected = SLOT_STATES.get(item.get("class_name"), "unknown")
-    return (f"BT:{item.get('track_id') if item.get('track_id') is not None else '-'} "
+    actual_id = item.get('track_id') if item.get('track_id') is not None else '-'
+    logical_id = record.get('logical_track_id')
+    id_label = f"BT:{actual_id}"
+    if logical_id is not None and str(logical_id) != str(actual_id):
+        id_label += f"/L{logical_id}"
+    return (f"{id_label} "
             f"{slot_label}{state_label} det:{detected} {item['confidence']:.2f}")

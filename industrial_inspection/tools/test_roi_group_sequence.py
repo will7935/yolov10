@@ -229,7 +229,7 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(result['slots'][0]['center_xy'],[230.,200.])
         self.assertEqual(result['slots'][0]['state'],'filled')
 
-    def test_unseen_old_s4_follows_three_old_slots_and_stays_out_of_next_group(self):
+    def test_unseen_old_s4_does_not_consume_a_new_group_candidate(self):
         s=self.make(exit_min_slots=1,partial_exit_slots=1)
         s.tracker=SlotGroupTracker(group_id=2,confirm_seconds=.1,minimum_frames=2,
                                    initialization_seconds=.1,initialization_frames=2)
@@ -238,21 +238,47 @@ class GroupSequenceTests(unittest.TestCase):
         s._hands=[]
         s.departing_points=POINTS.copy()
         s.departing_seen=np.full(4,1.,dtype=float)
-        s.departing_predicted=np.array([False,False,False,True])
+        s.departing_untrackable_indices={3}
         s.departing_gate=40
         moved=POINTS+[20,10]
 
         admitted=s._exclude_departing(boxes(moved,visible=(0,1,2)),1.1)
         self.assertEqual(admitted,[])
-        np.testing.assert_allclose(s.departing_points[3],moved[3])
-        self.assertAlmostEqual(s.departing_seen[3],1.1)
-        self.assertTrue(s.departing_predicted[3])
+        np.testing.assert_allclose(s.departing_points[3],POINTS[3])
+        self.assertAlmostEqual(s.departing_seen[3],1.)
 
-        # S4恢复检测时仍关联到旧G1并从新组入口候选中排除。
+        # 新组S4候选不再被旧组推算点吞掉。
         admitted=s._exclude_departing(boxes(moved),1.2)
-        self.assertEqual(admitted,[])
-        self.assertFalse(s.departing_predicted[3])
-        self.assertEqual(s.tracker._entry_points,[])
+        self.assertEqual(len(admitted),1)
+        self.assertAlmostEqual((admitted[0]['xyxy'][0]+admitted[0]['xyxy'][2])/2,moved[3,0])
+        self.assertAlmostEqual((admitted[0]['xyxy'][1]+admitted[0]['xyxy'][3])/2,moved[3,1])
+        self.assertIsNone(s.track_store.owner(admitted[0].get('track_id')))
+
+    def test_new_id_near_inferred_old_s4_is_not_bound_to_closed_group(self):
+        s=self.make(exit_min_slots=1,partial_exit_slots=1)
+        s.tracker=SlotGroupTracker(group_id=2,confirm_seconds=.1,minimum_frames=2,
+                                   initialization_seconds=.1,initialization_frames=2)
+        s.tracker.start_incremental_entry(40)
+        s.state='entering'
+        s._hands=[]
+        s.departing_points=POINTS.copy()
+        s.departing_seen=np.full(4,1.,dtype=float)
+        s.departing_untrackable_indices={3}
+        s.departing_track_ids=[101,102,103,None]
+        s.departing_gate=40
+        moved=POINTS+[20,10]
+        objects=[]
+        for index in (0,1,2):
+            obj=boxes(moved,visible=(index,))[0]
+            obj['track_id']=101+index
+            objects.append(obj)
+        incoming=boxes(moved,visible=(3,))[0]
+        incoming['track_id']=204
+        objects.append(incoming)
+
+        admitted=s._exclude_departing(objects,1.1)
+        self.assertEqual([obj['track_id'] for obj in admitted],[204])
+        self.assertIsNone(s.track_store.owner(204))
 
     def test_missing_old_tail_cannot_take_an_established_incoming_track(self):
         """旧点漏检后，新点仍应归属新组，临时号和正式号阶段都不能被旧点吞掉。"""

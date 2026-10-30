@@ -11,12 +11,20 @@ from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, SlotStat
 class SlotTrackStateStore:
     """A track's visual history is independent of its group/slot assignment."""
 
-    def __init__(self, tracker, contour):
+    def __init__(self, tracker, contour, *, reidentification_enabled=False,
+                 reidentification_max_gap_seconds=15.0,
+                 reidentification_max_distance_px=40.0):
         self.rules = tracker
         self.contour = contour
         self.tracks = {}
         self.closed = set()
         self.rejected = {}
+        self.reidentification_enabled = bool(reidentification_enabled)
+        self.reidentification_max_gap_seconds = float(reidentification_max_gap_seconds)
+        self.reidentification_max_distance_px = float(reidentification_max_distance_px)
+        self.aliases = {}
+        self.reidentification_events = []
+        self._seen_this_frame = set()
 
     def __deepcopy__(self, memo):
         return self
@@ -45,7 +53,9 @@ class SlotTrackStateStore:
                 record = dict(state=SlotState(0), previous=SlotState(0), events=[],
                               imported=set(), owner=None, slot_id=None,
                               first_seen=float(now), last_seen=float(now),
-                              last_inside=float(now), reliable_since=None, reliable_count=0)
+                              last_inside=float(now), reliable_since=None, reliable_count=0,
+                              logical_track_id=track_id, reidentified_from_track_id=None,
+                              reid_gap_seconds=None, reid_method=None)
                 self.tracks[track_id] = record
             if now-record['last_seen'] > self.rules.lost_seconds and record['owner'] is None:
                 record['state'] = SlotState(0)
@@ -83,19 +93,77 @@ class SlotTrackStateStore:
                 record['state'].observe('unknown', now, None, 'not_detected',
                                         self.rules.confirm_seconds, self.rules.minimum_frames)
                 record['reliable_since'], record['reliable_count'] = None, 0
+        self._seen_this_frame = seen
 
     def owner(self, track_id):
         record = self.tracks.get(track_id)
         return None if record is None else record['owner']
 
-    def bind(self, track_id, identity, slot_id=None):
+    def bind(self, track_id, identity, slot_id=None, *, center=None, now=None):
         record = self.tracks.get(track_id)
         if record is None or record['owner'] not in (None, identity):
             return False
         record['owner'] = identity
         if slot_id is not None:
             record['slot_id'] = slot_id
+            self._try_reidentify(record, int(track_id), identity, int(slot_id), center, now)
         return True
+
+    def _try_reidentify(self, record, track_id, identity, slot_id, center, now):
+        """Attach a new ByteTrack ID to a prior logical ID using slot geometry."""
+        if (not self.reidentification_enabled or center is None or now is None
+                or record.get('reidentified_from_track_id') is not None):
+            return False
+        try:
+            center = [float(center[0]), float(center[1])]
+            now = float(now)
+        except (TypeError, ValueError, IndexError):
+            return False
+        candidates = []
+        for old_id, old in self.tracks.items():
+            if int(old_id) == track_id or int(old_id) in self._seen_this_frame:
+                continue
+            if old.get('owner') != identity or old.get('slot_id') != slot_id:
+                continue
+            old_center = old.get('center')
+            old_seen = old.get('last_seen')
+            if old_center is None or old_seen is None:
+                continue
+            gap = now - float(old_seen)
+            if gap <= 0.0 or gap > self.reidentification_max_gap_seconds:
+                continue
+            distance = ((center[0] - float(old_center[0])) ** 2
+                        + (center[1] - float(old_center[1])) ** 2) ** .5
+            if distance <= self.reidentification_max_distance_px:
+                candidates.append((distance, -float(old_seen), int(old_id), gap))
+        if not candidates:
+            return False
+        candidates.sort()
+        distance, _, old_id, gap = candidates[0]
+        # A second old record at almost the same location makes the identity
+        # ambiguous; leave the new ByteTrack ID untouched in that case.
+        if len(candidates) > 1 and candidates[1][0] - distance < 3.0:
+            return False
+        old = self.tracks[old_id]
+        logical_id = int(old.get('logical_track_id') or old_id)
+        record.update(logical_track_id=logical_id,
+                      reidentified_from_track_id=old_id,
+                      reid_gap_seconds=round(gap, 6),
+                      reid_method='stationary_slot_geometry')
+        self.aliases[track_id] = logical_id
+        event = {'track_id': track_id, 'logical_track_id': logical_id,
+                 'reidentified_from_track_id': old_id, 'group_id': identity[1],
+                 'phase': identity[0], 'slot_id': slot_id,
+                 'gap_seconds': round(gap, 6), 'distance_px': round(distance, 3),
+                 'method': 'stationary_slot_geometry', 'at': now}
+        self.reidentification_events.append(event)
+        return True
+
+    def logical_id(self, track_id):
+        if track_id is None:
+            return None
+        record = self.tracks.get(int(track_id))
+        return int(record.get('logical_track_id') or track_id) if record is not None else int(track_id)
 
     def release_candidate(self, track_id, identity):
         record = self.tracks.get(track_id)
@@ -112,13 +180,15 @@ class SlotTrackStateStore:
             return []
         imported.add(track_id)
         slot._restored_track_ids = imported
-        if slot.confirmed != 'unknown' or slot.candidate_count:
-            return []
-        prior = record['previous']
-        for key in ('confirmed', 'evidence_time', 'confirmed_since', 'confirmed_at',
-                    'candidate', 'candidate_since', 'candidate_count', 'last_seen',
-                    'confirmation_source'):
-            setattr(slot, key, deepcopy(getattr(prior, key)))
+        # A late-mapped slot may already have current-frame evidence.  That
+        # must not prevent importing older state-change events from the track;
+        # only restore the slot's visual state when it has no local evidence.
+        if slot.confirmed == 'unknown' and not slot.candidate_count:
+            prior = record['previous']
+            for key in ('confirmed', 'evidence_time', 'confirmed_since', 'confirmed_at',
+                        'candidate', 'candidate_since', 'candidate_count', 'last_seen',
+                        'confirmation_source'):
+                setattr(slot, key, deepcopy(getattr(prior, key)))
         events = []
         for index, event in enumerate(record['events']):
             if event['confirmed_at'] >= now or index in record['imported']:
@@ -135,7 +205,12 @@ class SlotTrackStateStore:
         if record is None:
             return None
         state, owner = record['state'], record['owner']
-        return dict(byte_track_id=track_id, state=state.state, observation=state.observation,
+        return dict(byte_track_id=track_id,
+                    logical_track_id=record.get('logical_track_id', track_id),
+                    reidentified_from_track_id=record.get('reidentified_from_track_id'),
+                    reid_gap_seconds=record.get('reid_gap_seconds'),
+                    reid_method=record.get('reid_method'),
+                    state=state.state, observation=state.observation,
                     last_confirmed_state=state.confirmed, reason=state.reason,
                     confirmation_source=state.confirmation_source,
                     group_id=None if owner is None else owner[1],

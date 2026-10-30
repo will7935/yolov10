@@ -16,15 +16,16 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # PyCharm configuration
 # ---------------------------------------------------------------------------
-# INPUT_CSV = None  # Example: Path(r"I:\youyan\run\detection_confidences.csv")
-INPUT_CSV =Path(r"I:\youyan\test_dataset\测试视频2\置信度0.7camera_B_20260923_143845_slots_20261027_162650_098934"
-                r"\detection_confidences.csv")
+INPUT_CSV = None  # Example: Path(r"I:\youyan\run\detection_confidences.csv")
+# INPUT_CSV =Path(r"I:\youyan\test_dataset\测试视频2\置信度0.7camera_B_20260923_143845_slots_20261027_162650_098934"
+#                 r"\detection_confidences.csv")
 SEARCH_ROOT = Path(r"I:\youyan\test_dataset")
-TRACK_IDS = [34]  # ByteTrack IDs to plot; example: [12, 18, 27]
+TRACK_IDS = [578]  # 逻辑/ByteTrack IDs to plot; logical mode also joins reidentified IDs
 OUTPUT_ROOT = None  # None -> slot_confidence_tracks beside INPUT_CSV
 SHOW_WINDOW = False
+USE_LOGICAL_TRACK_ID = True  # 合并长遮挡后通过槽位几何重连的ByteTrack轨迹
 
-DISPLAY_CONFIDENCE = .7
+DISPLAY_CONFIDENCE = .1
 BYTE_TRACK_LOW_CONFIDENCE = .10
 CONNECT_POINTS = True
 POINT_SIZE = 14
@@ -96,7 +97,9 @@ def _read_rows(path: Path, selected_ids: set[str]):
             raise ValueError("CSV缺少 track_id 列，请使用新版 predict_slot_groups.py 重新运行视频。")
         for row_number, row in enumerate(reader):
             track_id = _track_id(row.get("track_id"))
-            if track_id not in selected_ids:
+            logical_track_id = _track_id(row.get("logical_track_id")) or track_id
+            plot_id = logical_track_id if USE_LOGICAL_TRACK_ID else track_id
+            if plot_id not in selected_ids:
                 continue
             group_value = _as_float(row.get("group_id"), 0)
             group_id = int(group_value) if group_value is not None else 0
@@ -106,13 +109,14 @@ def _read_rows(path: Path, selected_ids: set[str]):
             confidence = _as_float(row.get("confidence"))
             if confidence is None:
                 continue
-            records[track_id].append({
+            records[plot_id].append({
                 "source_frame": int(source_frame),
                 "time_seconds": time_seconds,
                 "confidence": confidence,
                 "group_id": group_id,
                 "phase": phase,
                 "track_id": track_id,
+                "logical_track_id": logical_track_id,
                 "slot_point": (row.get("slot_point") or "").strip(),
                 "class_name": (row.get("class_name") or "").strip(),
                 "displayed": _as_bool(row.get("displayed")),
@@ -155,7 +159,11 @@ def _plot_track(track_id, values, input_csv: Path, output_root: Path, *, show: b
             if state == previous_detection:
                 continue
             class_label = CLASS_LABELS.get(item["class_name"], item["class_name"] or "未知")
-            ax.annotate(f"BT{track_id} {class_label} {item['confidence']:.2f}",
+            id_label = (f"L{track_id}" if USE_LOGICAL_TRACK_ID else f"BT{track_id}")
+            actual_id = item.get("track_id", track_id)
+            if actual_id and str(actual_id) != str(track_id):
+                id_label += f"/BT{actual_id}"
+            ax.annotate(f"{id_label} {class_label} {item['confidence']:.2f}",
                         (item["time_seconds"], item["confidence"]),
                         xytext=(3, 3), textcoords="offset points",
                         fontsize=7, color=color, alpha=.9, zorder=3)
@@ -170,11 +178,12 @@ def _plot_track(track_id, values, input_csv: Path, output_root: Path, *, show: b
     ax.set_ylabel("检测框置信度")
     group_label = ",".join(f"G{group_id}" for group_id in groups) or "未知组"
     phase_label = ",".join(phases)
-    ax.set_title(f"{group_label} - {phase_label} - BT{track_id} - {slot_label}\n{input_csv.name}")
+    id_label = f"L{track_id}" if USE_LOGICAL_TRACK_ID else f"BT{track_id}"
+    ax.set_title(f"{group_label} - {phase_label} - {id_label} - {slot_label}\n{input_csv.name}")
     ax.legend(fontsize=9, loc="best")
     fig.tight_layout()
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = output_root / f"BT{track_id}.png"
+    output_path = output_root / f"{'L' if USE_LOGICAL_TRACK_ID else 'BT'}{track_id}.png"
     fig.savefig(output_path, dpi=180)
     print(f"已保存：{output_path}")
     if show:
@@ -187,7 +196,7 @@ def parse_args(argv=None):
     parser.add_argument("--csv", type=Path, default=INPUT_CSV)
     parser.add_argument("--search-root", type=Path, default=SEARCH_ROOT)
     parser.add_argument("--track-id", nargs="+", default=[str(value) for value in TRACK_IDS],
-                        help="ByteTrack ID，例如 --track-id 12 18 27")
+                        help="逻辑/ByteTrack ID，例如 --track-id 34 18 27")
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
     parser.add_argument("--show", action=argparse.BooleanOptionalAction, default=SHOW_WINDOW)
     return parser.parse_args(argv)

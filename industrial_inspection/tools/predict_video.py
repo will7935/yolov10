@@ -28,14 +28,14 @@ from industrial_inspection.tools.detection_display import draw_detection_legend,
 # 用户配置：在这里修改，然后在 PyCharm / VS Code 中直接运行此文件。
 # Windows 路径请保留 r 前缀，避免反斜杠被解释为转义字符。
 # =============================================================================
-SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频1\camera_B_20260924_021033.avi")
+SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频2\camera_B_20260923_143845.avi")
 MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp4.2\weights\best.pt")
 
 # 每次在此目录内新建“视频名_时间”文件夹，可重复运行而不覆盖结果。
 OUTPUT_ROOT = Path(r"I:\youyan\test_dataset")
 # 例如改为：OUTPUT_ROOT = Path(r"I:\youyan\video_results")
 
-CONFIDENCE = 0.7        # 检测分数门槛；降低可减少部分漏检，也可能增加误报，不等于准确率
+CONFIDENCE = 0.1        # 检测分数门槛；降低可减少部分漏检，也可能增加误报，不等于准确率
 AUDIT_CONFIDENCE = 0.001 # 置信度审计下限；低于显示门槛的模型候选框也写入 CSV
 IMAGE_SIZE = 1280        # 推理输入尺寸；输出视频和记录坐标仍使用原图分辨率
 DEVICE = "0"          # "auto" 自动选择 GPU/CPU；"0" 使用 GPU 0；"cpu" 使用 CPU

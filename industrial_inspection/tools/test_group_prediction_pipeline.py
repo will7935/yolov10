@@ -49,6 +49,28 @@ class PipelineTest(unittest.TestCase):
         self.local_redetection.start()
         self.addCleanup(self.local_redetection.stop)
 
+    def test_untracked_slot_boxes_are_audit_only_until_bytetrack_assigns_id(self):
+        """A high-confidence gray slot box cannot create business state."""
+        rows = [
+            {"class_name": "wafer_slot_filled", "confidence": .92,
+             "tracking_confidence": .92, "track_id": None,
+             "xyxy": [100, 100, 140, 140]},
+            {"class_name": "wafer_slot_filled", "confidence": .91,
+             "tracking_confidence": .91, "track_id": 34,
+             "xyxy": [100, 100, 140, 140]},
+            {"class_name": "hand", "confidence": .88,
+             "tracking_confidence": .88, "track_id": None,
+             "xyxy": [200, 200, 220, 220]},
+        ]
+        business = predict.prepare_business_detections(rows, .35)
+        self.assertEqual([row["class_name"] for row in business],
+                         ["wafer_slot_filled", "hand"])
+        self.assertEqual(business[0]["track_id"], 34)
+        self.assertEqual(business[1]["track_id"], None)
+        # The audit/drawing input is untouched, including the gray row.
+        self.assertEqual(len(rows), 3)
+        self.assertIsNone(rows[0]["track_id"])
+
     def test_unmapped_bytetrack_state_is_saved_in_detection_csv(self):
         frames = [boxes(visible=(0,), filled=(0,))]*8
         with tempfile.TemporaryDirectory(prefix='wafer_unmapped_tracks_') as directory:
