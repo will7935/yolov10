@@ -414,6 +414,30 @@ class TrackingTests(unittest.TestCase):
         self.assertTrue(result['slots'][3]['load_contact_pending'])
         self.assertIsNone(result['slots'][3]['load_contact_released_at'])
 
+    def test_s2_dominant_hand_overlap_suppresses_s4_contact(self):
+        t=tracker(phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
+                  load_hand_contact_competing_margin=.10,
+                  load_hand_contact_competing_ratio=2.0)
+        full=[detection(i,'empty') for i in range(1,5)]
+        t.update(full,0.)
+        # S2 box overlap is 75%; S4 overlap is 12.5%.  The hand covers S2's
+        # center but does not cover S4's center, so it is an S2 operation.
+        s2_dominant_hand={'class_name':'hand','class_id':0,'confidence':.9,
+                          'xyxy':[180,90,220,185]}
+        self.assertFalse(t._hand_contact(3,[s2_dominant_hand]))
+        result=t.update(full+[s2_dominant_hand],.1)
+        self.assertFalse(result['slots'][3]['load_contact_pending'])
+
+    def test_s4_center_coverage_overrides_competing_overlap(self):
+        t=tracker(phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
+                  load_hand_contact_competing_margin=.10,
+                  load_hand_contact_competing_ratio=2.0)
+        full=[detection(i,'empty') for i in range(1,5)]
+        t.update(full,0.)
+        s4_center_hand={'class_name':'hand','class_id':0,'confidence':.9,
+                        'xyxy':[180,180,220,220]}
+        self.assertTrue(t._hand_contact(3,[s4_center_hand]))
+
     def test_incremental_entry_hand_contact_uses_formal_s4_mapping(self):
         t=SlotGroupTracker(None,phase='unload',slot2_below_slot3=True)
         t.start_incremental_entry(100)

@@ -183,6 +183,10 @@ class SlotGroupTracker:
                  initialization_stability_ratio=.12, initialization_history_seconds=5.,
                  load_hand_contact_enabled=True, load_hand_contact_seconds=.15,
                  load_hand_contact_min_frames=2, load_hand_contact_overlap_ratio=.05,
+                  load_hand_contact_competing_slot_enabled=True,
+                  load_hand_contact_competing_slot_id=2,
+                  load_hand_contact_competing_margin=.10,
+                  load_hand_contact_competing_ratio=2.0,
                  slot2_below_slot3=False,
                  allow_three_point_initialization=None):
         if group_count != 5 or not 1 <= group_id <= group_count:
@@ -201,7 +205,13 @@ class SlotGroupTracker:
             raise ValueError("初始化停稳比例须在0..0.5之间，观测缓存秒数须为正有限数")
         if (not np.isfinite(load_hand_contact_seconds) or load_hand_contact_seconds < 0
                 or load_hand_contact_min_frames < 1 or int(load_hand_contact_min_frames) != load_hand_contact_min_frames
-                or not 0 < load_hand_contact_overlap_ratio <= 1):
+                or not 0 < load_hand_contact_overlap_ratio <= 1
+                or int(load_hand_contact_competing_slot_id) != load_hand_contact_competing_slot_id
+                or not 1 <= int(load_hand_contact_competing_slot_id) <= 4
+                or not np.isfinite(load_hand_contact_competing_margin)
+                or not 0 <= load_hand_contact_competing_margin <= 1
+                or not np.isfinite(load_hand_contact_competing_ratio)
+                or load_hand_contact_competing_ratio < 1):
             raise ValueError("上料手接触确认参数无效")
         self.points = None if centers is None else validate_centers(centers).copy()
         # 编号参考位置与本帧检测中心分开。少数框的中心偏移不能改变整组关联模板。
@@ -241,6 +251,10 @@ class SlotGroupTracker:
         self.load_hand_contact_seconds = float(load_hand_contact_seconds)
         self.load_hand_contact_min_frames = int(load_hand_contact_min_frames)
         self.load_hand_contact_overlap_ratio = float(load_hand_contact_overlap_ratio)
+        self.load_hand_contact_competing_slot_enabled = bool(load_hand_contact_competing_slot_enabled)
+        self.load_hand_contact_competing_slot_id = int(load_hand_contact_competing_slot_id)
+        self.load_hand_contact_competing_margin = float(load_hand_contact_competing_margin)
+        self.load_hand_contact_competing_ratio = float(load_hand_contact_competing_ratio)
         self.slot2_below_slot3 = bool(slot2_below_slot3)
         # Preserve the historical unload behavior when callers omit the flag;
         # the main entry point explicitly enables it for both phases.
@@ -942,6 +956,10 @@ class SlotGroupTracker:
                       load_hand_contact_seconds=self.load_hand_contact_seconds,
                       load_hand_contact_min_frames=self.load_hand_contact_min_frames,
                       load_hand_contact_overlap_ratio=self.load_hand_contact_overlap_ratio,
+                      load_hand_contact_competing_slot_enabled=self.load_hand_contact_competing_slot_enabled,
+                      load_hand_contact_competing_slot_id=self.load_hand_contact_competing_slot_id,
+                      load_hand_contact_competing_margin=self.load_hand_contact_competing_margin,
+                      load_hand_contact_competing_ratio=self.load_hand_contact_competing_ratio,
                       slot2_below_slot3=self.slot2_below_slot3,
                       allow_three_point_initialization=self.allow_three_point_initialization)
 
@@ -1017,6 +1035,10 @@ class SlotGroupTracker:
                 load_hand_contact_seconds=self.load_hand_contact_seconds,
                 load_hand_contact_min_frames=self.load_hand_contact_min_frames,
                 load_hand_contact_overlap_ratio=self.load_hand_contact_overlap_ratio,
+                 load_hand_contact_competing_slot_enabled=self.load_hand_contact_competing_slot_enabled,
+                 load_hand_contact_competing_slot_id=self.load_hand_contact_competing_slot_id,
+                 load_hand_contact_competing_margin=self.load_hand_contact_competing_margin,
+                 load_hand_contact_competing_ratio=self.load_hand_contact_competing_ratio,
                 allow_three_point_initialization=self.allow_three_point_initialization)
             self._provisional.byte_track_ids = [raw_track_ids[int(i)] for i in order]
             self._provisional.track_store = self.track_store
@@ -1152,7 +1174,7 @@ class SlotGroupTracker:
         return track_ids[slot_index] if slot_index < len(track_ids) else None
 
     def _hand_contact(self, slot_index, hands):
-        """手接触状态推断只针对S4，支持中心覆盖或槽框边缘重叠。"""
+        """手接触状态推断只针对S4，支持中心覆盖、槽框重叠和竞争槽位抑制。"""
         if not self.load_hand_contact_enabled or slot_index != self._s4_index():
             return False
         points = self.reference_points if self.reference_points is not None else self._entry_points
@@ -1166,22 +1188,59 @@ class SlotGroupTracker:
             width, height = max(float(box_size[0]), 1.), max(float(box_size[1]), 1.)
             target_box = [point[0]-width/2, point[1]-height/2,
                           point[0]+width/2, point[1]+height/2]
+
+        competing_index = self.load_hand_contact_competing_slot_id - 1
+        competing_point = (np.asarray(points[competing_index], dtype=float)
+                           if 0 <= competing_index < len(points) else None)
+        competing_slot = (self.slots[competing_index]
+                          if competing_point is not None and competing_index < len(self.slots)
+                          else None)
+        competing_box = None
+        competing_size = None if competing_slot is None else competing_slot.box_size_wh
+        if competing_size is not None and np.isfinite(competing_size).all():
+            cwidth, cheight = max(float(competing_size[0]), 1.), max(float(competing_size[1]), 1.)
+            competing_box = [competing_point[0]-cwidth/2, competing_point[1]-cheight/2,
+                             competing_point[0]+cwidth/2, competing_point[1]+cheight/2]
+
+        def box_overlap_ratio(box, hand_box):
+            if box is None:
+                return 0.0
+            overlap = max(0., min(box[2], hand_box[2])-max(box[0], hand_box[0])) * \
+                      max(0., min(box[3], hand_box[3])-max(box[1], hand_box[1]))
+            target_area = max((box[2]-box[0])*(box[3]-box[1]), 1.)
+            return overlap/target_area
+
         for hand in hands:
-            a = hand["xyxy"]
-            covered = [i for i, point in enumerate(points)
-                       if a[0] <= point[0] <= a[2] and a[1] <= point[1] <= a[3]]
-            # 原有中心覆盖是最可靠的证据；检测框只擦到槽边时，
-            # 使用槽框面积上的重叠比例补足漏检/中心偏移情况。
+            hand_box = hand["xyxy"]
+            covered = [i for i, candidate_point in enumerate(points)
+                       if hand_box[0] <= candidate_point[0] <= hand_box[2]
+                       and hand_box[1] <= candidate_point[1] <= hand_box[3]]
+            # A hand that covers more than one slot center is ambiguous.
             if covered == [slot_index]:
                 return True
-            if target_box is not None:
-                overlap = max(0., min(target_box[2], a[2])-max(target_box[0], a[0])) * \
-                          max(0., min(target_box[3], a[3])-max(target_box[1], a[1]))
-                target_area = max((target_box[2]-target_box[0])*(target_box[3]-target_box[1]), 1.)
-                if overlap/target_area >= self.load_hand_contact_overlap_ratio:
-                    # 若手同时覆盖另一槽中心，则不把这次宽手框归给S4。
-                    if not covered or covered == [slot_index]:
-                        return True
+            if target_box is None:
+                continue
+            s4_ratio = box_overlap_ratio(target_box, hand_box)
+            if s4_ratio < self.load_hand_contact_overlap_ratio:
+                continue
+            if covered and covered != [slot_index]:
+                continue
+            if self.load_hand_contact_competing_slot_enabled:
+                s4_center_covered = (hand_box[0] <= point[0] <= hand_box[2]
+                                     and hand_box[1] <= point[1] <= hand_box[3])
+                s2_center_covered = (competing_point is not None
+                                     and hand_box[0] <= competing_point[0] <= hand_box[2]
+                                     and hand_box[1] <= competing_point[1] <= hand_box[3])
+                # Center coverage remains the strongest S4 evidence.
+                if s2_center_covered and not s4_center_covered:
+                    continue
+                s2_ratio = box_overlap_ratio(competing_box, hand_box)
+                dominant = (s2_ratio >= self.load_hand_contact_competing_margin
+                            and s2_ratio >= self.load_hand_contact_competing_ratio *
+                                max(s4_ratio, 1e-9))
+                if dominant and not s4_center_covered:
+                    continue
+            return True
         return False
 
     def _record_hand_contact(self, slot, now, contact, enabled, slot_index):

@@ -92,14 +92,18 @@ THREE_POINT_GROUP_INITIALIZATION = True  # 三个真实槽位可推算缺失S4�
 
 MATCH_DISTANCE_RATIO = .46    # 匹配门限=最近两槽间距×此比例；放宽以容纳空/满框中心偏移，必须小于0.5
 CONFIRM_SECONDS = 0.0          # 槽位空/满状态不再设置时间门槛，只按MIN_CONFIRM_FRAMES确认
-MIN_CONFIRM_FRAMES = 3
+MIN_CONFIRM_FRAMES = 4
 IDENTITY_LOST_SECONDS = 1.2   # 连续无匹配超时，锁定为unknown，避免下一组继承旧编号
 CONFLICT_CONF_MARGIN = .15    # 同位置空/满分数差小于该值时，输出unknown
 HAND_OVERLAP_RATIO = .2       # 手遮挡槽框达到此比例，或覆盖中心时，暂停该槽状态确认
 LOAD_HAND_CONTACT_ENABLED = True       # 仅S4的手接触可补足本工序的unknown空满变化
 LOAD_HAND_CONTACT_SECONDS = .1        # 手在同一槽位的最短连续接触时间
-LOAD_HAND_CONTACT_MIN_FRAMES = 2       # 接触至少需要的连续检测帧数
+LOAD_HAND_CONTACT_MIN_FRAMES = 3       # 接触至少需要的连续检测帧数
 LOAD_HAND_CONTACT_OVERLAP_RATIO = .03  # 手框覆盖S4检测框面积比例；中心覆盖仍优先
+LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED = True  # 启用竞争槽位抑制：其他槽位明显占优时不触发S4手接触
+LOAD_HAND_CONTACT_COMPETING_SLOT_ID = 2          # 竞争槽位编号；当前使用S2作为与S4比较的槽位
+LOAD_HAND_CONTACT_COMPETING_MARGIN = .10         # 竞争槽位的最低重叠率；S2重叠率低于此值不抑制S4
+LOAD_HAND_CONTACT_COMPETING_RATIO = 1.0          # 竞争倍数；S2重叠率至少是S4的该倍数才抑制S4
 ROI_TRACKING_MARGIN_PX = 40   # ROI外只跟踪当前已编号槽；区域外框不确认空满、不初始化
 LOCAL_REDETECT_ENABLED = True # 已编号槽被整图漏检时，用同一模型局部补检
 LOCAL_REDETECT_CROP_SIZE = (180, 140) # 原图裁剪宽、高（像素），保留槽周围背景
@@ -199,6 +203,10 @@ def make_tracker():
         load_hand_contact_seconds=LOAD_HAND_CONTACT_SECONDS,
         load_hand_contact_min_frames=LOAD_HAND_CONTACT_MIN_FRAMES,
         load_hand_contact_overlap_ratio=LOAD_HAND_CONTACT_OVERLAP_RATIO,
+        load_hand_contact_competing_slot_enabled=LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
+        load_hand_contact_competing_slot_id=LOAD_HAND_CONTACT_COMPETING_SLOT_ID,
+        load_hand_contact_competing_margin=LOAD_HAND_CONTACT_COMPETING_MARGIN,
+        load_hand_contact_competing_ratio=LOAD_HAND_CONTACT_COMPETING_RATIO,
         slot2_below_slot3=SLOT2_BELOW_SLOT3,
         allow_three_point_initialization=THREE_POINT_GROUP_INITIALIZATION)
 
@@ -649,6 +657,13 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
             "contact_seconds": LOAD_HAND_CONTACT_SECONDS,
             "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,
             "overlap_ratio": LOAD_HAND_CONTACT_OVERLAP_RATIO, "target_slot_ids": [4],
+            "competing_slot": {
+                "enabled": LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
+                "slot_id": LOAD_HAND_CONTACT_COMPETING_SLOT_ID,
+                "margin": LOAD_HAND_CONTACT_COMPETING_MARGIN,
+                "ratio": LOAD_HAND_CONTACT_COMPETING_RATIO,
+                "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,
+                "behavior": "suppress_S4_hand_contact_when_competing_slot_is_clearly_dominant"},
             "fallback_transitions": {"unload": ["unknown->empty", "filled->unknown"],
                                       "load": ["unknown->filled", "empty->unknown"]},
             "yolo_state_has_priority": True,"infer_after_unknown_grace": True},
