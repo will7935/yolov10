@@ -75,10 +75,11 @@ def draw_roi(frame, polygon):
                 cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 0), 2)
 
 
-def select_roi(source, path, initial_frame=0):
+def select_roi(source, path, initial_frame=0, *, purpose="slot"):
     """Select on a seekable video preview; no cropping of model input."""
     capture = cv2.VideoCapture(str(source))
-    window = "Select lower slots ROI - Enter save / Esc cancel"
+    window = ("Select S4 hand region - Enter save / Esc cancel" if purpose == "s4_hand"
+              else "Select lower slots ROI - Enter save / Esc cancel")
     try:
         if not capture.isOpened():
             raise RuntimeError(f"Cannot open video for ROI selection: {source}")
@@ -127,7 +128,8 @@ def select_roi(source, path, initial_frame=0):
                     cv2.circle(preview, (x, y), 4, (0, 255, 255), -1)
             for i, text in enumerate((f"Frame {displayed}: slider to choose a clear frame",
                                       "Left click vertices / Right click undo / R clear",
-                                      "Enter save / Esc cancel; select LOWER four slot centers", error)):
+                                      ("Enter save / Esc cancel; select S4 hand region" if purpose == "s4_hand"
+                                       else "Enter save / Esc cancel; select LOWER four slot centers"), error)):
                 if text:
                     cv2.putText(preview, text, (8, 22 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                                 .48, (0, 0, 0), 3)

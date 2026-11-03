@@ -1,0 +1,28 @@
+{
+  "coordinate_system": "normalized_xy",
+  "polygon": [
+    [
+      0.887499988079071,
+      0.6041666865348816
+    ],
+    [
+      0.9906250238418579,
+      0.6083333492279053
+    ],
+    [
+      0.9921875,
+      0.737500011920929
+    ],
+    [
+      0.828125,
+      0.7333333492279053
+    ]
+  ],
+  "reference_frame_size": [
+    640,
+    480
+  ],
+  "source": "I:\\youyan\\test_dataset\\\u6d4b\u8bd5\u89c6\u98911\\camera_B_20260924_021033.avi",
+  "reference_frame": 3031,
+  "filter_rule": "slot_box_center_inside_polygon"
+}

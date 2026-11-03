@@ -11,6 +11,22 @@ from scipy.optimize import linear_sum_assignment
 SLOT_STATES = {"wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}
 
 
+def sort_events_by_time_upper(events):
+    """仅按动作时间上界升序展示；上界相同则保留原记录顺序。"""
+    return sorted(events, key=lambda event: event.get("time_upper", float("inf")))
+
+
+def _event_slot_orders_by_time_upper(events):
+    """上界较小的事件在先；仅上界完全相同的事件保留先后歧义。
+
+    time_lower 可能来自上一轮空满基线，只用于审计，不参与本轮顺序判断。
+    每组最多四个事件，因此可以直接枚举上界非递减的排列。
+    """
+    for order in itertools.permutations(events):
+        if all(a["time_upper"] <= b["time_upper"] for a, b in zip(order, order[1:])):
+            yield tuple(event["slot_id"] for event in order)
+
+
 def validate_centers(centers):
     points = np.asarray(centers, dtype=float)
     if points.shape != (4, 2) or not np.isfinite(points).all():
@@ -188,7 +204,7 @@ class SlotGroupTracker:
                   load_hand_contact_competing_margin=.10,
                   load_hand_contact_competing_ratio=2.0,
                  slot2_below_slot3=False,
-                 allow_three_point_initialization=None):
+                 allow_three_point_initialization=None, s4_hand_region=None):
         if group_count != 5 or not 1 <= group_id <= group_count:
             raise ValueError("当前流程固定五组，group_id 必须在1..5之间")
         if phase not in ("load", "unload") or sorted(clockwise) != [1, 2, 3, 4]:
@@ -237,6 +253,8 @@ class SlotGroupTracker:
         self.conflict_margin, self.hand_overlap, self.ambiguity_ratio = conflict_margin, hand_overlap, ambiguity_ratio
         self.slots = [SlotState(i+1) for i in range(4)]
         self.events = []
+        self.s4_region_diagnostic = None
+        self._region_formal_numbering = True
         self.last_time = None
         self.last_geometry_time = None
         self.identity_lost = False
@@ -255,6 +273,8 @@ class SlotGroupTracker:
         self.load_hand_contact_competing_slot_id = int(load_hand_contact_competing_slot_id)
         self.load_hand_contact_competing_margin = float(load_hand_contact_competing_margin)
         self.load_hand_contact_competing_ratio = float(load_hand_contact_competing_ratio)
+        self.s4_hand_region = (None if s4_hand_region is None else
+                               np.asarray(s4_hand_region, dtype=np.float32))
         self.slot2_below_slot3 = bool(slot2_below_slot3)
         # Preserve the historical unload behavior when callers omit the flag;
         # the main entry point explicitly enables it for both phases.
@@ -960,6 +980,7 @@ class SlotGroupTracker:
                       load_hand_contact_competing_slot_id=self.load_hand_contact_competing_slot_id,
                       load_hand_contact_competing_margin=self.load_hand_contact_competing_margin,
                       load_hand_contact_competing_ratio=self.load_hand_contact_competing_ratio,
+                      s4_hand_region=self.s4_hand_region,
                       slot2_below_slot3=self.slot2_below_slot3,
                       allow_three_point_initialization=self.allow_three_point_initialization)
 
@@ -1039,7 +1060,9 @@ class SlotGroupTracker:
                  load_hand_contact_competing_slot_id=self.load_hand_contact_competing_slot_id,
                  load_hand_contact_competing_margin=self.load_hand_contact_competing_margin,
                  load_hand_contact_competing_ratio=self.load_hand_contact_competing_ratio,
+                s4_hand_region=self.s4_hand_region,
                 allow_three_point_initialization=self.allow_three_point_initialization)
+            self._provisional._region_formal_numbering = False
             self._provisional.byte_track_ids = [raw_track_ids[int(i)] for i in order]
             self._provisional.track_store = self.track_store
             self._provisional_inferred_slot_ids = set() if missing_index is None else {missing_index}
@@ -1173,10 +1196,26 @@ class SlotGroupTracker:
         track_ids = self.byte_track_ids if self.points is not None else self._entry_track_ids
         return track_ids[slot_index] if slot_index < len(track_ids) else None
 
+    def _s4_region_expected(self):
+        """按时间上界判断下一槽是否为S4；同上界的歧义不能开启区域门控。"""
+        if not self._region_formal_numbering or self.points is None or self._entry_points is not None:
+            return False
+        events = self.events
+        if (not 1 <= len(events) <= 3 or any(not e.get("expected_action", False) for e in events)
+                or any(e.get("slot_id") not in (1, 2, 3) for e in events)
+                or len({e["slot_id"] for e in events}) != len(events)):
+            return False
+        possible = list(_event_slot_orders_by_time_upper(events))
+        cycles = [self.clockwise[i:]+self.clockwise[:i] for i in range(4)]
+        return bool(possible) and all(any(
+            cycle[:len(order)] == order and cycle[len(order)] == 4 for cycle in cycles)
+            for order in possible)
+
     def _hand_contact(self, slot_index, hands):
-        """手接触状态推断只针对S4，支持中心覆盖、槽框重叠和竞争槽位抑制。"""
+        """手接触状态推断只针对S4，按当前帧最高置信度的相关手框判断。"""
         if not self.load_hand_contact_enabled or slot_index != self._s4_index():
             return False
+        self.s4_region_diagnostic = None
         points = self.reference_points if self.reference_points is not None else self._entry_points
         if points is None or len(points) != 4 or slot_index >= len(points):
             return False
@@ -1210,38 +1249,74 @@ class SlotGroupTracker:
             target_area = max((box[2]-box[0])*(box[3]-box[1]), 1.)
             return overlap/target_area
 
+        candidates = []
+        region_candidates = []
+        region_hits = []
+        region_expected = self._s4_region_expected()
         for hand in hands:
             hand_box = hand["xyxy"]
+            region_contact = False
+            if self.s4_hand_region is not None:
+                x1, y1, x2, y2 = hand_box
+                if x2 > x1 and y2 > y1:
+                    hand_contour = np.asarray([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+                    overlap, _ = cv2.intersectConvexConvex(self.s4_hand_region, hand_contour)
+                    region_contact = overlap > 0
+                    if region_contact:
+                        region_hits.append({"xyxy": [float(v) for v in hand_box],
+                                            "confidence": float(hand.get("confidence", 0.0))})
             covered = [i for i, candidate_point in enumerate(points)
                        if hand_box[0] <= candidate_point[0] <= hand_box[2]
                        and hand_box[1] <= candidate_point[1] <= hand_box[3]]
-            # A hand that covers more than one slot center is ambiguous.
+            s4_center_covered = slot_index in covered
+            s2_center_covered = (competing_index in covered)
+            s4_ratio = box_overlap_ratio(target_box, hand_box)
+            s2_ratio = box_overlap_ratio(competing_box, hand_box)
+            # Only compare hands that provide evidence near S2 or S4.  This
+            # prevents an unrelated high-confidence hand elsewhere in the
+            # image from suppressing a relevant S4 contact.
+            relevant = (s4_center_covered or s2_center_covered
+                        or s4_ratio >= self.load_hand_contact_overlap_ratio
+                        or s2_ratio >= self.load_hand_contact_competing_margin)
+            if relevant or (region_contact and region_expected):
+                try:
+                    confidence = float(hand.get("confidence", 0.0))
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                candidate = (confidence, hand_box, covered, s4_ratio,
+                             s2_ratio, s4_center_covered, s2_center_covered, region_contact)
+                if relevant:
+                    candidates.append(candidate)
+                region_candidates.append(candidate)
+        if region_hits:
+            self.s4_region_diagnostic = {"status": ("eligible" if region_expected else
+                                                       "suspected_unexpected_or_uncertain"),
+                                         "hands": region_hits}
+        def accepted(candidate, allow_region):
+            _, _, covered, s4_ratio, s2_ratio, s4_center_covered, s2_center_covered, region_contact = candidate
             if covered == [slot_index]:
                 return True
-            if target_box is None:
-                continue
-            s4_ratio = box_overlap_ratio(target_box, hand_box)
-            if s4_ratio < self.load_hand_contact_overlap_ratio:
-                continue
+            box_contact = target_box is not None and s4_ratio >= self.load_hand_contact_overlap_ratio
+            if not box_contact and not (allow_region and region_contact):
+                return False
             if covered and covered != [slot_index]:
-                continue
+                return False
             if self.load_hand_contact_competing_slot_enabled:
-                s4_center_covered = (hand_box[0] <= point[0] <= hand_box[2]
-                                     and hand_box[1] <= point[1] <= hand_box[3])
-                s2_center_covered = (competing_point is not None
-                                     and hand_box[0] <= competing_point[0] <= hand_box[2]
-                                     and hand_box[1] <= competing_point[1] <= hand_box[3])
-                # Center coverage remains the strongest S4 evidence.
                 if s2_center_covered and not s4_center_covered:
-                    continue
-                s2_ratio = box_overlap_ratio(competing_box, hand_box)
+                    return False
                 dominant = (s2_ratio >= self.load_hand_contact_competing_margin
                             and s2_ratio >= self.load_hand_contact_competing_ratio *
                                 max(s4_ratio, 1e-9))
                 if dominant and not s4_center_covered:
-                    continue
+                    return False
             return True
-        return False
+
+        # Evaluate the original hand selection first.  An additional regional
+        # candidate must never suppress a contact accepted by the old logic.
+        if candidates and accepted(max(candidates, key=lambda item: item[0]), False):
+            return True
+        return bool(region_expected and region_candidates and accepted(
+            max(region_candidates, key=lambda item: item[0]), True))
 
     def _record_hand_contact(self, slot, now, contact, enabled, slot_index):
         if slot_index != self._s4_index():
@@ -1301,6 +1376,7 @@ class SlotGroupTracker:
         if self.last_time is not None and now <= self.last_time:
             raise ValueError("源视频时间必须严格递增")
         self.last_time = float(now)
+        self.s4_region_diagnostic = None
         self.geometry_rejected = []
         self._history_events_this_frame = []
         if self._entry_points is not None:
@@ -1616,7 +1692,7 @@ class SlotGroupTracker:
         return event
 
     def order_result(self):
-        """按事件时间区间检查顺序；遮挡造成先后无法区分时不给通过结论。"""
+        """按时间上界检查环形顺序；同上界先后不明时不给通过结论。"""
         if any(not e["expected_action"] for e in self.events):
             return "fail"
         sequence = [e["slot_id"] for e in self.events]
@@ -1626,12 +1702,7 @@ class SlotGroupTracker:
             return "pending"
         legal = [self.clockwise[i:]+self.clockwise[:i] for i in range(4)]
         possible = []
-        for permutation in itertools.permutations(range(len(self.events))):
-            positions = {event_index: index for index,event_index in enumerate(permutation)}
-            if any(a["time_upper"] < b["time_lower"] and positions[i] > positions[j]
-                   for i,a in enumerate(self.events) for j,b in enumerate(self.events)):
-                continue
-            order = tuple(self.events[i]["slot_id"] for i in permutation)
+        for order in _event_slot_orders_by_time_upper(self.events):
             # 不完整序列可能漏掉了遮挡槽的事件，按环形子序列检查，不能直接判漏操作。
             possible.append(any(order == tuple(s for s in cycle if s in sequence) for cycle in legal))
         if possible and not any(possible):
@@ -1699,8 +1770,11 @@ class SlotGroupTracker:
                 "transform_support_byte_track_ids": list(getattr(self, "transform_support_byte_track_ids", [])),
                 "initialization": dict(self.initialization),
                 "slots": slots, "order_result": self.order_result(),
-                "confirmed_event_sequence": [e["slot_id"] for e in sorted(self.events,
-                    key=lambda e: (e["time_upper"],e["time_lower"])) if e["expected_action"]],
+                "event_ordering": "time_upper",
+                "s4_region_diagnostic": self.s4_region_diagnostic,
+                "s4_region_expected": self._s4_region_expected(),
+                "confirmed_event_sequence": [e["slot_id"] for e in sort_events_by_time_upper(self.events)
+                    if e["expected_action"]],
                 "current_target_count": sum(s.state == target for s in self.slots),
                 "last_verified_target_count": sum(s.confirmed == target for s in self.slots),
                 "all_four_currently_confirmed": all(s.state == target for s in self.slots),

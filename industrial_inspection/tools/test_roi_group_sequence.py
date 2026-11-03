@@ -69,6 +69,22 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(s.tracker.events,[])
         json.dumps(result,allow_nan=False)
 
+    def test_s4_hand_region_survives_group_and_phase_transitions(self):
+        region = np.array([[250,180],[290,180],[290,220],[250,220]], dtype=np.float32)
+        tracker = SlotGroupTracker(POINTS, s4_hand_region=region)
+        sequence = RoiGroupSequence(tracker, ROI)
+        sequence.tracker = sequence._new_tracker(2, entry=True)
+        np.testing.assert_array_equal(sequence.tracker.s4_hand_region, region)
+        sequence.tracker = sequence._new_tracker(5)
+        sequence.tracker = sequence._new_tracker(1, entry=True, phase='load')
+        self.assertEqual(sequence.tracker.phase, 'load')
+        np.testing.assert_array_equal(sequence.tracker.s4_hand_region, region)
+        sequence.tracker.reset_group(5, phase='load', centers=POINTS)
+        sequence.tracker.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
+                                 for j,i in enumerate((2,1,3))]
+        hand = {'class_name':'hand', 'confidence':.9, 'xyxy':[255,185,280,195]}
+        self.assertTrue(sequence.tracker._hand_contact(3, [hand]))
+
     def test_load_hand_contact_without_filled_stays_unconfirmed_at_end(self):
         tracker = SlotGroupTracker(POINTS,phase='load',confirm_seconds=.1,minimum_frames=2,
                                    load_hand_contact_seconds=.15)

@@ -39,8 +39,8 @@ class ByteTrackStateDisplayTests(unittest.TestCase):
         self.assertEqual(record["state_reason"], "unmapped_track")
 
     def test_final_numbering_keeps_formal_slot_mapping_alongside_track_id(self):
-        snapshot = {"slot_numbering_status": "final", "slots": [{
-            "group_id": 3, "slot_id": 4, "byte_track_id": 77,
+        snapshot = {"slot_numbering_status": "final", "display_absolute_slot_numbers": True, "slots": [{
+            "group_id": 3, "slot_id": 4, "display_slot_id": 11, "byte_track_id": 77,
             "state": "filled", "last_confirmed_state": "filled",
             "observation": "filled", "reason": "confirmed",
             "confirmation_source": "yolo"}]}
@@ -49,8 +49,10 @@ class ByteTrackStateDisplayTests(unittest.TestCase):
         label = slot_track_label(detection, snapshot)
 
         self.assertIn("BT:77", label)
-        self.assertIn("G3-S4", label)
+        self.assertIn("G3-11", label)
         self.assertIn("filled", label)
+        snapshot['display_absolute_slot_numbers'] = False
+        self.assertIn('G3-S4', slot_track_label(detection, snapshot))
 
 
 if __name__ == "__main__":

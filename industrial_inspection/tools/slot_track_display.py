@@ -67,7 +67,10 @@ def slot_track_label(item, snapshot):
         state_label = f"{record['last_confirmed_state']}*"
     slot_label = ""
     if record['mapping_status'] == 'final':
-        slot_label = f"G{record['group_id']}-S{record['slot_id']} "
+        slot = next((s for s in snapshot.get('slots', []) if s.get('slot_id') == record['slot_id']), None)
+        number = slot.get('display_slot_id') if slot else None
+        suffix = (str(number) if number is not None else 'pending') if snapshot.get('display_absolute_slot_numbers', False) else f"S{record['slot_id']}"
+        slot_label = f"G{record['group_id']}-{suffix} "
     else:
         slot_label = (f"G{record['group_id']} " if record['group_id'] is not None else '') + 'S:pending '
     detected = SLOT_STATES.get(item.get("class_name"), "unknown")

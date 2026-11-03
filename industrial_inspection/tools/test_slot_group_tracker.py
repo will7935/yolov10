@@ -29,6 +29,16 @@ def tracker(**kwargs):
     return SlotGroupTracker(CENTERS,confirm_seconds=.1,minimum_frames=2,**kwargs)
 
 
+def g5_recovered_load_events():
+    # 真实G5记录：故意按S1/S2/S3插入，S2/S3下界来自上一轮下料。
+    return [{'slot_id':slot_id, 'expected_action':True, 'action':'load',
+             'time_lower':lower, 'time_upper':upper}
+            for slot_id,lower,upper in (
+                (1,157.12361971451656,157.66226770805278),
+                (2,94.53272286560733,156.10018852679772),
+                (3,95.01750605978992,160.0861836789658))]
+
+
 class TrackingTests(unittest.TestCase):
     def test_bytetrack_keeps_empty_and_filled_as_one_slot_track(self):
         byte_tracker=SlotByteTracker(30,high_thresh=.35,low_thresh=.1,buffer_seconds=1)
@@ -253,6 +263,74 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(t.order_result(),'pending')
         self.assertTrue(t.snapshot()['all_four_target_previously_verified'])
 
+    def test_recovered_g5_order_and_s4_gate_use_only_time_upper(self):
+        t=tracker(phase='load')
+        t.events=g5_recovered_load_events()
+        snapshot=t.snapshot()
+        self.assertEqual(snapshot['confirmed_event_sequence'],[2,1,3])
+        self.assertEqual(snapshot['event_ordering'],'time_upper')
+        self.assertTrue(snapshot['s4_region_expected'])
+        self.assertEqual(snapshot['order_result'],'pending')
+        # 历史基线可以很早；改动下界不应再影响本轮排序、校验和区域门控。
+        for event in t.events:
+            event['time_lower']=-1000.
+        self.assertEqual(t.snapshot()['confirmed_event_sequence'],[2,1,3])
+        self.assertTrue(t._s4_region_expected())
+        self.assertEqual(t.order_result(),'pending')
+
+    def test_overlapping_intervals_pass_in_upper_order_for_both_phases(self):
+        for phase in ('load','unload'):
+            with self.subTest(phase=phase):
+                t=tracker(phase=phase)
+                t.events=g5_recovered_load_events()+[
+                    {'slot_id':4,'expected_action':True,'time_lower':96.,'time_upper':162.}]
+                self.assertEqual(t.snapshot()['confirmed_event_sequence'],[2,1,3,4])
+                self.assertEqual(t.order_result(),'pass')
+
+    def test_overlapping_intervals_do_not_hide_wrong_upper_order(self):
+        t=tracker(phase='load')
+        t.events=[{'slot_id':i,'expected_action':True,'time_lower':0.,'time_upper':upper}
+                  for i,upper in ((3,3.),(2,2.),(1,1.))]
+        self.assertEqual(t.snapshot()['confirmed_event_sequence'],[1,2,3])
+        self.assertEqual(t.order_result(),'fail')
+        self.assertFalse(t._s4_region_expected())
+
+    def test_equal_uppers_remain_uncertain_without_lower_tiebreak(self):
+        t=tracker(phase='load')
+        t.events=[{'slot_id':i,'expected_action':True,'time_lower':lower,'time_upper':upper}
+                  for i,lower,upper in ((2,.5,1.),(1,0.,1.),(3,0.,2.))]
+        self.assertEqual(t.snapshot()['confirmed_event_sequence'],[2,1,3])
+        self.assertFalse(t._s4_region_expected())
+        t.events.append({'slot_id':4,'expected_action':True,'time_lower':0.,'time_upper':3.})
+        self.assertEqual(t.order_result(),'pending')
+        t.events[0]['time_lower']=0.
+        t.events[1]['time_lower']=.9
+        self.assertEqual(t.snapshot()['confirmed_event_sequence'],[2,1,3,4])
+        self.assertEqual(t.order_result(),'pending')
+
+    def test_recovered_g5_order_allows_region_contact_to_detect_s4_load(self):
+        t=tracker(phase='load',load_hand_contact_seconds=.15,load_hand_contact_min_frames=3)
+        other_slots=[detection(i,'filled') for i in (1,2,3)]
+        for now in (161.,161.1):
+            t.update(other_slots+[detection(4,'empty')],now)
+        t.events=g5_recovered_load_events()
+        original_intervals=[(e['time_lower'],e['time_upper']) for e in t.events]
+        t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]],dtype=np.float32)
+        hand={'class_name':'hand','confidence':.9,'xyxy':[300,185,320,195]}
+        for now in (161.7,161.8,161.9):
+            result=t.update(other_slots+[hand],now)
+        self.assertEqual(result['s4_region_diagnostic']['status'],'eligible')
+        self.assertTrue(result['slots'][3]['load_contact_pending'])
+        for now in (162.,162.2,162.5):
+            result=t.update(other_slots,now)
+        self.assertEqual([(e['time_lower'],e['time_upper']) for e in t.events[:3]],original_intervals)
+        self.assertEqual(len(t.events),4)
+        self.assertEqual((t.events[-1]['slot_id'],t.events[-1]['action'],t.events[-1]['reason']),
+                         (4,'load','hand_contact_inferred_load'))
+        self.assertEqual(result['slots'][3]['last_confirmed_state'],'filled')
+        self.assertEqual(result['confirmed_event_sequence'],[2,1,3,4])
+        self.assertEqual(result['order_result'],'pass')
+
     def test_empty_to_unknown_after_contact_infers_hidden_s4_load(self):
         t=tracker(phase='load',load_hand_contact_seconds=.15)
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
@@ -437,6 +515,123 @@ class TrackingTests(unittest.TestCase):
         s4_center_hand={'class_name':'hand','class_id':0,'confidence':.9,
                         'xyxy':[180,180,220,220]}
         self.assertTrue(t._hand_contact(3,[s4_center_hand]))
+
+    def test_s4_previous_real_box_overlap_confirms_unload_without_center_coverage(self):
+        t=tracker(phase='unload', load_hand_contact_seconds=.1,
+                  load_hand_contact_min_frames=3, load_hand_contact_overlap_ratio=.03)
+        full=[detection(i,'filled') for i in range(1,5)]
+        t.update(full,0.)
+        t.update(full,.1)
+        hand={'class_name':'hand','confidence':.95,'xyxy':[180,180,193,198]}
+        self.assertTrue(t._hand_contact(3,[hand]))
+        visible=full[:3]
+        for now in (.2,.3,.4):
+            result=t.update(visible+[hand],now)
+        self.assertTrue(result['slots'][3]['load_contact_pending'])
+        events=[]
+        for now in (.5,.7,.9,1.1,1.3):
+            events.extend(t.update(visible,now)['new_events'])
+        self.assertTrue(any(e['slot_id']==4 and e['action']=='unload'
+                            and e.get('reason')=='hand_contact_inferred_unload'
+                            for e in events))
+
+    def test_original_retained_box_size_remains_usable(self):
+        t=tracker(phase='load')
+        t.slots[3].geometry_inferred=True
+        t.slots[3].box_size_wh=(40.,40.)
+        hand={'class_name':'hand','confidence':.95,'xyxy':[180,180,193,198]}
+        self.assertTrue(t._hand_contact(3,[hand]))
+
+    def test_region_candidate_cannot_suppress_original_center_contact(self):
+        t=tracker(phase='load')
+        t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
+        t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
+                  for j,i in enumerate((2,1,3))]
+        center={'class_name':'hand','confidence':.6,'xyxy':[190,190,210,210]}
+        region={'class_name':'hand','confidence':.99,'xyxy':[300,180,320,200]}
+        self.assertTrue(t._hand_contact(3,[center,region]))
+        t.s4_hand_region=None
+        self.assertTrue(t._hand_contact(3,[center,region]))
+
+    def test_enabling_region_never_rejects_an_original_contact(self):
+        t=tracker(phase='load')
+        t.update([detection(i,'empty') for i in range(1,5)], 0.)
+        t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
+                  for j,i in enumerate((2,1,3))]
+        region=np.asarray([[230,150],[300,150],[300,240],[230,240]], dtype=np.float32)
+        random=np.random.default_rng(42)
+        for _ in range(300):
+            hands=[]
+            for _ in range(3):
+                x,y=random.uniform(60,290,2)
+                w,h=random.uniform(5,100,2)
+                hands.append({'class_name':'hand','confidence':float(random.random()),
+                              'xyxy':[x,y,x+w,y+h]})
+            t.s4_hand_region=None
+            original=t._hand_contact(3,hands)
+            t.s4_hand_region=region
+            self.assertFalse(original and not t._hand_contact(3,hands))
+
+    def test_high_confidence_s2_hand_wins_over_lower_confidence_s4_hand(self):
+        t=tracker(phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
+                  load_hand_contact_competing_margin=.10,
+                  load_hand_contact_competing_ratio=2.0)
+        full=[detection(i,'empty') for i in range(1,5)]
+        t.update(full,0.)
+        high_s2={'class_name':'hand','class_id':0,'confidence':.92,
+                 'xyxy':[180,80,220,120]}
+        low_s4={'class_name':'hand','class_id':0,'confidence':.45,
+                'xyxy':[180,180,220,220]}
+        # The lower-confidence S4 hand must not create contact when the
+        # higher-confidence hand clearly operates S2 in the same frame.
+        self.assertFalse(t._hand_contact(3,[high_s2,low_s4]))
+
+    def test_s4_hand_region_contact_and_competing_slot(self):
+        t=tracker(phase='load', load_hand_contact_seconds=0., load_hand_contact_min_frames=1)
+        t.update([detection(i,'empty') for i in range(1,5)],0.)
+        t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
+        region_hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[290,185,320,195]}
+        self.assertFalse(t._hand_contact(3,[region_hand]))
+        self.assertEqual(t.s4_region_diagnostic['status'], 'suspected_unexpected_or_uncertain')
+        t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
+                  for j,i in enumerate((2,1,3))]
+        self.assertTrue(t._hand_contact(3,[region_hand]))
+        self.assertEqual(t.s4_region_diagnostic['status'], 'eligible')
+        outside={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[250,180,290,195]}
+        self.assertFalse(t._hand_contact(3,[outside]))
+        t.s4_hand_region=np.asarray([[180,80],[220,80],[220,120],[180,120]], dtype=np.float32)
+        s2_hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[180,80,220,120]}
+        self.assertFalse(t._hand_contact(3,[s2_hand]))
+
+    def test_s4_region_requires_unambiguous_formal_order(self):
+        t=tracker(phase='load')
+        t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
+        hand={'class_name':'hand','confidence':.9,'xyxy':[300,185,320,195]}
+        t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
+                  for j,i in enumerate((2,1,3))]
+        self.assertTrue(t._hand_contact(3,[hand]))
+        t.events[0]['time_upper']=1.5
+        self.assertFalse(t._hand_contact(3,[hand]))
+        self.assertEqual(t.s4_region_diagnostic['status'], 'suspected_unexpected_or_uncertain')
+        center={'class_name':'hand','confidence':.9,'xyxy':[190,190,210,210]}
+        self.assertTrue(t._hand_contact(3,[center]))
+        t._region_formal_numbering=False
+        self.assertFalse(t._s4_region_expected())
+
+    def test_s4_region_can_be_expected_before_final_slot(self):
+        t=tracker(phase='load', clockwise=(2,1,4,3))
+        t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
+        hand={'class_name':'hand','confidence':.9,'xyxy':[300,185,320,195]}
+        t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
+                  for j,i in enumerate((2,1))]
+        self.assertTrue(t._hand_contact(3,[hand]))
+        t.events[0]['time_upper']=1.5
+        self.assertFalse(t._hand_contact(3,[hand]))
+        t.events=t.events[:1]
+        t.events[0]['time_upper']=.1
+        self.assertFalse(t._hand_contact(3,[hand]))
+        t.events[0]['slot_id']=1
+        self.assertTrue(t._hand_contact(3,[hand]))
 
     def test_incremental_entry_hand_contact_uses_formal_s4_mapping(self):
         t=SlotGroupTracker(None,phase='unload',slot2_below_slot3=True)

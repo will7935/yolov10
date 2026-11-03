@@ -64,13 +64,30 @@ class GroupProcessReportTests(unittest.TestCase):
 
     def test_load_phase_and_early_stop_are_labeled_correctly(self):
         current=snapshot(3,(1,3,4),states=('filled','empty','filled','filled'),phase='load')
-        report=predict.build_process_report(summary(current,status='frame_limit'))
+        data=summary(current,status='frame_limit')
+        data['display_absolute_slot_numbers']=True
+        data['display_slot_numbering']={'3': {'mapping': predict._number_map(3, 2, (1,3,4,2))}}
+        report=predict.build_process_report(data)
         self.assertEqual(report['matrix'][2],[1,0,1,1])
         text=predict.format_process_report(report)
         self.assertIn('游星片槽位上料完成矩阵',text)
-        self.assertIn('G3：1 → 3 → 4',text)
+        self.assertIn('G3：10 → 11 → 12',text)
         self.assertIn('G1：未记录',text)
         self.assertIn('已处理视频范围',text)
+
+    def test_numbering_starts_at_first_slot_and_wraps_per_group(self):
+        self.assertEqual(predict._number_map(1,2,(1,3,4,2)), {2:1,1:2,3:3,4:4})
+        self.assertEqual(predict._number_map(2,2,(1,3,4,2)), {2:5,1:6,3:7,4:8})
+        self.assertEqual(predict._number_map(5,4,(1,3,4,2)), {4:17,2:18,1:19,3:20})
+
+    def test_display_mapping_follows_unload_even_if_load_starts_elsewhere(self):
+        current=snapshot(2,(3,1),states=('filled','empty','filled','empty'),phase='load')
+        data=summary(current)
+        data['display_absolute_slot_numbers']=True
+        data['display_slot_numbering']={'2': {'mapping': predict._number_map(2,2,(1,3,4,2))}}
+        report=predict.build_process_report(data)
+        self.assertEqual(report['groups'][1]['display_sequence'],[7,6])
+        self.assertIn('G2：7 → 6',predict.format_process_report(report))
 
 
 if __name__ == '__main__':
