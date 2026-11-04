@@ -28,7 +28,7 @@ from industrial_inspection.tools.detection_display import draw_detection_legend,
 # 用户配置：在这里修改，然后在 PyCharm / VS Code 中直接运行此文件。
 # Windows 路径请保留 r 前缀，避免反斜杠被解释为转义字符。
 # =============================================================================
-SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频2\camera_B_20260923_143845.avi")
+SOURCE_VIDEO = Path(r"I:\德州有研视频数据集\第二次数据\2026-09-24\event_20260924_013432\camera_B_20260924_013432.avi")
 MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp4.2\weights\best.pt")
 
 # 每次在此目录内新建“视频名_时间”文件夹，可重复运行而不覆盖结果。
@@ -43,11 +43,11 @@ FRAME_STRIDE = 1         # 1 = 逐帧；2 = 每两帧处理一帧
 MAX_FRAMES = 0           # 0 = 整段视频；300 = 只处理 300 帧试跑
 UI_ENABLED = True       # True = UI7V 界面，点击开始/停止；False = 命令行批处理
 SHOW_PREVIEW = False     # 仅命令行模式：True 显示 OpenCV 窗口，Q / Escape 停止
-DISPLAY_STYLE = "point" # "point"：中心点＋左上角颜色图例；"box"：矩形框＋标注
+DISPLAY_STYLE = "point" # "point"：中心点＋右上角颜色图例；"box"：矩形框＋标注
 SHOW_LABELS = True       # 仅框模式：True 显示类别名；False 只画框
 SHOW_CONFIDENCE = True   # 仅框模式：显示标签时附带置信度
 POINT_RADIUS = 4         # 点半径，单位像素
-POINT_FONT_SCALE = 0.4   # 左上角图例文字大小
+POINT_FONT_SCALE = 0.4   # 右上角图例文字大小
 # 图例使用简短名称；修改右侧显示名即可，JSON/CSV 仍记录模型原类别名。
 POINT_LABEL_NAMES = {"hand": "hand", "hatch_handle": "handle", "water_gun": "water_gun",
                      "wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}

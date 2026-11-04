@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from industrial_inspection.tools.s4_hand_contact import HandContactPolicy, evaluate_s4_contact
+
 SLOT_STATES = {"wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}
 
 
@@ -254,6 +256,7 @@ class SlotGroupTracker:
         self.slots = [SlotState(i+1) for i in range(4)]
         self.events = []
         self.s4_region_diagnostic = None
+        self.s4_contact_diagnostic = None
         self._region_formal_numbering = True
         self.last_time = None
         self.last_geometry_time = None
@@ -1212,113 +1215,65 @@ class SlotGroupTracker:
             for order in possible)
 
     def _hand_contact(self, slot_index, hands):
-        """手接触状态推断只针对S4，按当前帧最高置信度的相关手框判断。"""
-        if not self.load_hand_contact_enabled or slot_index != self._s4_index():
+        """策略只返回接触证据；计时、状态和事件仍由当前跟踪器统一管理。"""
+        if slot_index != self._s4_index():
             return False
         self.s4_region_diagnostic = None
+        self.s4_contact_diagnostic = None
+        if not self.load_hand_contact_enabled:
+            self.s4_contact_diagnostic = {"contact_detected": False, "decision_reason": "contact_disabled"}
+            return False
         points = self.reference_points if self.reference_points is not None else self._entry_points
         if points is None or len(points) != 4 or slot_index >= len(points):
+            self.s4_contact_diagnostic = {"contact_detected": False, "decision_reason": "geometry_unavailable"}
             return False
-        point = np.asarray(points[slot_index], dtype=float)
-        slot = self.slots[slot_index] if slot_index < len(self.slots) else None
-        box_size = None if slot is None else slot.box_size_wh
-        target_box = None
-        if box_size is not None and np.isfinite(box_size).all():
-            width, height = max(float(box_size[0]), 1.), max(float(box_size[1]), 1.)
-            target_box = [point[0]-width/2, point[1]-height/2,
-                          point[0]+width/2, point[1]+height/2]
+        box_sizes = [slot.box_size_wh for slot in self.slots]
+        evidence = evaluate_s4_contact(points, box_sizes, slot_index, hands,
+            HandContactPolicy(self.load_hand_contact_overlap_ratio,
+                self.load_hand_contact_competing_slot_enabled,
+                self.load_hand_contact_competing_slot_id-1,
+                self.load_hand_contact_competing_margin, self.load_hand_contact_competing_ratio),
+            region=self.s4_hand_region, region_expected=self._s4_region_expected())
+        self.s4_contact_diagnostic = evidence.diagnostic()
+        if evidence.region_hits:
+            # status保留旧字段含义：eligible仅代表顺序允许；实际接触结果看contact_accepted。
+            self.s4_region_diagnostic = {
+                "status": "eligible" if self._s4_region_expected() else "suspected_unexpected_or_uncertain",
+                "hands": evidence.region_hits, "contact_accepted": evidence.accepted,
+                "decision_reason": evidence.reason, "source": evidence.source}
+        return evidence.accepted
 
-        competing_index = self.load_hand_contact_competing_slot_id - 1
-        competing_point = (np.asarray(points[competing_index], dtype=float)
-                           if 0 <= competing_index < len(points) else None)
-        competing_slot = (self.slots[competing_index]
-                          if competing_point is not None and competing_index < len(self.slots)
-                          else None)
-        competing_box = None
-        competing_size = None if competing_slot is None else competing_slot.box_size_wh
-        if competing_size is not None and np.isfinite(competing_size).all():
-            cwidth, cheight = max(float(competing_size[0]), 1.), max(float(competing_size[1]), 1.)
-            competing_box = [competing_point[0]-cwidth/2, competing_point[1]-cheight/2,
-                             competing_point[0]+cwidth/2, competing_point[1]+cheight/2]
+    def _record_hand_contact(self, slot, now, contact, enabled, slot_index, *, disabled_reason=None):
+        previous_count = slot.load_contact_count
+        self._advance_hand_contact(slot, now, contact, enabled, slot_index)
+        if slot_index != self._s4_index():
+            return
+        if not self.load_hand_contact_enabled:
+            status = "disabled"
+        elif not enabled and not slot.load_contact_pending:
+            status = disabled_reason or "observations_disabled"
+        elif slot.load_contact_pending:
+            status = "pending_contact" if contact else "released_waiting_verification"
+        elif slot.load_contact_count:
+            status = "collecting_contact"
+        elif previous_count and not contact:
+            status = "contact_interrupted_before_confirmation"
+        else:
+            status = "no_accepted_contact"
+        diagnostic = self.s4_contact_diagnostic or {}
+        diagnostic.update(contact_accepted=bool(contact and enabled and self.load_hand_contact_enabled),
+            recording_enabled=bool(enabled), accumulation_status=status,
+            contact_count=slot.load_contact_count, required_frames=self.load_hand_contact_min_frames,
+            contact_duration_seconds=(0. if slot.load_contact_since is None else
+                float(now-slot.load_contact_since)), required_seconds=self.load_hand_contact_seconds,
+            evidence_ready=slot.load_contact_pending)
+        self.s4_contact_diagnostic = diagnostic
+        if self.s4_region_diagnostic is not None:
+            self.s4_region_diagnostic.update(contact_accepted=diagnostic["contact_accepted"],
+                accumulation_status=status, contact_count=slot.load_contact_count,
+                evidence_ready=slot.load_contact_pending)
 
-        def box_overlap_ratio(box, hand_box):
-            if box is None:
-                return 0.0
-            overlap = max(0., min(box[2], hand_box[2])-max(box[0], hand_box[0])) * \
-                      max(0., min(box[3], hand_box[3])-max(box[1], hand_box[1]))
-            target_area = max((box[2]-box[0])*(box[3]-box[1]), 1.)
-            return overlap/target_area
-
-        candidates = []
-        region_candidates = []
-        region_hits = []
-        region_expected = self._s4_region_expected()
-        for hand in hands:
-            hand_box = hand["xyxy"]
-            region_contact = False
-            if self.s4_hand_region is not None:
-                x1, y1, x2, y2 = hand_box
-                if x2 > x1 and y2 > y1:
-                    hand_contour = np.asarray([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
-                    overlap, _ = cv2.intersectConvexConvex(self.s4_hand_region, hand_contour)
-                    region_contact = overlap > 0
-                    if region_contact:
-                        region_hits.append({"xyxy": [float(v) for v in hand_box],
-                                            "confidence": float(hand.get("confidence", 0.0))})
-            covered = [i for i, candidate_point in enumerate(points)
-                       if hand_box[0] <= candidate_point[0] <= hand_box[2]
-                       and hand_box[1] <= candidate_point[1] <= hand_box[3]]
-            s4_center_covered = slot_index in covered
-            s2_center_covered = (competing_index in covered)
-            s4_ratio = box_overlap_ratio(target_box, hand_box)
-            s2_ratio = box_overlap_ratio(competing_box, hand_box)
-            # Only compare hands that provide evidence near S2 or S4.  This
-            # prevents an unrelated high-confidence hand elsewhere in the
-            # image from suppressing a relevant S4 contact.
-            relevant = (s4_center_covered or s2_center_covered
-                        or s4_ratio >= self.load_hand_contact_overlap_ratio
-                        or s2_ratio >= self.load_hand_contact_competing_margin)
-            if relevant or (region_contact and region_expected):
-                try:
-                    confidence = float(hand.get("confidence", 0.0))
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                candidate = (confidence, hand_box, covered, s4_ratio,
-                             s2_ratio, s4_center_covered, s2_center_covered, region_contact)
-                if relevant:
-                    candidates.append(candidate)
-                region_candidates.append(candidate)
-        if region_hits:
-            self.s4_region_diagnostic = {"status": ("eligible" if region_expected else
-                                                       "suspected_unexpected_or_uncertain"),
-                                         "hands": region_hits}
-        def accepted(candidate, allow_region):
-            _, _, covered, s4_ratio, s2_ratio, s4_center_covered, s2_center_covered, region_contact = candidate
-            if covered == [slot_index]:
-                return True
-            box_contact = target_box is not None and s4_ratio >= self.load_hand_contact_overlap_ratio
-            if not box_contact and not (allow_region and region_contact):
-                return False
-            if covered and covered != [slot_index]:
-                return False
-            if self.load_hand_contact_competing_slot_enabled:
-                if s2_center_covered and not s4_center_covered:
-                    return False
-                dominant = (s2_ratio >= self.load_hand_contact_competing_margin
-                            and s2_ratio >= self.load_hand_contact_competing_ratio *
-                                max(s4_ratio, 1e-9))
-                if dominant and not s4_center_covered:
-                    return False
-            return True
-
-        # Evaluate the original hand selection first.  An additional regional
-        # candidate must never suppress a contact accepted by the old logic.
-        if candidates and accepted(max(candidates, key=lambda item: item[0]), False):
-            return True
-        return bool(region_expected and region_candidates and accepted(
-            max(region_candidates, key=lambda item: item[0]), True))
-
-    def _record_hand_contact(self, slot, now, contact, enabled, slot_index):
+    def _advance_hand_contact(self, slot, now, contact, enabled, slot_index):
         if slot_index != self._s4_index():
             self._clear_load_contact(slot)
             return
@@ -1377,6 +1332,7 @@ class SlotGroupTracker:
             raise ValueError("源视频时间必须严格递增")
         self.last_time = float(now)
         self.s4_region_diagnostic = None
+        self.s4_contact_diagnostic = None
         self.geometry_rejected = []
         self._history_events_this_frame = []
         if self._entry_points is not None:
@@ -1595,7 +1551,11 @@ class SlotGroupTracker:
             roi_contour, tuple(point), False) >= 0)
         self._record_hand_contact(slot, now, contact,
                                   enabled and record_load_contact and inside and not self.identity_lost,
-                                  slot.slot_id-1)
+                                  slot.slot_id-1, disabled_reason=(
+                                      "identity_lost" if self.identity_lost else
+                                      "outside_roi" if not inside else
+                                      "contact_recording_paused" if not record_load_contact else
+                                      "observations_disabled"))
         pending_contact = slot.load_contact_pending
         contact_evidence = None
         if (pending_contact and slot.confirmed == "unknown"
@@ -1689,6 +1649,17 @@ class SlotGroupTracker:
                 byte_track_id=self._byte_track_id_at(slot.slot_id-1),
                 expected_action=event["action"] == self.phase,
                 reported_at=float(now), recovered_before_initialization=False)
+        if slot.slot_id-1 == self._s4_index() and self.s4_contact_diagnostic is not None:
+            diagnostic = self.s4_contact_diagnostic
+            if event is not None:
+                diagnostic.update(accumulation_status="event_confirmed", event_reason=slot.reason,
+                                  confirmation_source=slot.confirmation_source)
+            elif diagnostic.get("evidence_ready") and not slot.load_contact_pending:
+                diagnostic["accumulation_status"] = "cancelled_by_visual_state"
+            diagnostic.update(contact_count=slot.load_contact_count, evidence_ready=slot.load_contact_pending)
+            if self.s4_region_diagnostic is not None:
+                self.s4_region_diagnostic.update(accumulation_status=diagnostic["accumulation_status"],
+                    contact_count=slot.load_contact_count, evidence_ready=slot.load_contact_pending)
         return event
 
     def order_result(self):
@@ -1771,6 +1742,7 @@ class SlotGroupTracker:
                 "initialization": dict(self.initialization),
                 "slots": slots, "order_result": self.order_result(),
                 "event_ordering": "time_upper",
+                "s4_contact_diagnostic": self.s4_contact_diagnostic,
                 "s4_region_diagnostic": self.s4_region_diagnostic,
                 "s4_region_expected": self._s4_region_expected(),
                 "confirmed_event_sequence": [e["slot_id"] for e in sort_events_by_time_upper(self.events)

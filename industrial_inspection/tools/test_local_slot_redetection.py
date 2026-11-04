@@ -45,6 +45,16 @@ class LocalRedetectionTests(unittest.TestCase):
         self.assertEqual(attempts,[])
         model.predict.assert_not_called()
 
+    def test_local_hand_threshold_does_not_lower_slot_evidence_threshold(self):
+        self.sequence.tracker.phase='load'
+        local=[{'class_name':'hand','confidence':.025,'xyxy':[80,60,100,80]},
+               {'class_name':'wafer_slot_filled','confidence':.25,'xyxy':[80,60,100,80]}]
+        with patch.object(predict,'HAND_DETECTION_CONFIDENCE',.02):
+            result,_,model=self.recover(boxes(visible=(0,1,2)),local)
+        self.assertEqual(model.predict.call_args.kwargs['conf'],.02)
+        additions=result[3:]
+        self.assertEqual([item['class_name'] for item in additions],['hand'])
+
     def test_crop_coordinates_return_to_source_and_wrong_slot_is_rejected(self):
         # 槽4中心(200,200)，裁剪原点(110,130)；第二个框属于邻槽3，不能用于槽4。
         local=[{'class_name':'wafer_slot_empty','confidence':.9,'xyxy':[80,60,100,80]},
