@@ -1122,7 +1122,9 @@ class SlotGroupTracker:
                 or now-self._initial_since+1e-9 < self.geometry_initialization_seconds):
             return []
         order = self._numbering_order(p.points) if self.slot2_below_slot3 else np.arange(4)
-        self.points, self.reference_points = p.points[order].copy(), p.reference_points[order].copy()
+        self.points = p.points[order].copy()
+        # 正式编号时以当帧位置建立参考，避免继承候选阶段的旧参考点。
+        self.reference_points = self.points.copy()
         self.canonical_points = self.points.copy()
         self.group_transform = np.array([[1., 0., 0.], [0., 1., 0.]])
         self.transform_valid_this_frame = True
