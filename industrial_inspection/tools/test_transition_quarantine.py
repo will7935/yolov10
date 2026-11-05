@@ -28,29 +28,36 @@ def group(points=POINTS, visible=(0, 1, 2, 3)):
 
 
 class TransitionQuarantineTests(unittest.TestCase):
-    def make(self, *, enabled=True, single_exit=True):
+    def make(self, *, enabled=True, single_exit=True, min_frames=4):
         tracker = SlotGroupTracker(POINTS, confirm_seconds=0, minimum_frames=2,
             lost_seconds=1.2, initialization_seconds=.1, initialization_frames=2)
         sequence = RoiGroupSequence(tracker, ROI, exit_min_slots=1 if single_exit else 3,
             partial_exit_slots=1 if single_exit else 2, exit_direction=(0, -1),
-            entry_seconds=.1, reject_transition_roi_detections=enabled)
+            entry_seconds=.1, reject_transition_roi_detections=enabled,
+            transition_quarantine_min_frames=min_frames)
         for now in (0., .1, .2):
             sequence.update(group(), now)
         return sequence
 
-    def close(self, sequence, now=.5):
+    def close(self, sequence, now=.5, extra=()):
         points = POINTS.copy()
         points[0] = [100, 75]
-        result = sequence.update(group(points), now)
+        result = sequence.update(group(points)+list(extra), now)
         self.assertEqual(result['group_id'], 2)
         self.assertEqual(len(sequence.closed_groups), 1)
         return result
+
+    def observe_stable_unassigned(self, sequence, center=(350, 150)):
+        for now in (.3, .35, .4, .45):
+            sequence.update(group()+[slot(283, center)], now)
+        self.assertIsNone(sequence.track_store.owner(283))
 
     def test_records_all_roi_ids_including_unassigned_and_keeps_closed_history(self):
         sequence = self.make()
         hand = dict(class_name='hand', confidence=.9, track_id=999, xyxy=[330, 130, 370, 170])
         result = sequence.update(group()+[slot(283, [350, 150]), slot(900, [450, 150]), hand], .3)
         self.assertEqual(result['roi_observed_track_ids'], [101, 102, 103, 104, 283])
+        self.assertEqual(result['roi_observed_track_frame_counts'][283], 1)
         self.assertIsNone(sequence.track_store.owner(283))
         self.assertFalse(sequence.is_transition_quarantined_track(283))
         self.close(sequence)
@@ -74,7 +81,7 @@ class TransitionQuarantineTests(unittest.TestCase):
 
     def test_unassigned_track_missing_at_handoff_never_enters_established_next_group(self):
         sequence = self.make()
-        sequence.update(group()+[slot(283, [350, 150])], .3)
+        self.observe_stable_unassigned(sequence)
         self.close(sequence)
         self.assertTrue(sequence.is_transition_quarantined_track(283))
         incoming = [slot(309, [300, 270]), slot(311, [390, 270])]
@@ -90,7 +97,7 @@ class TransitionQuarantineTests(unittest.TestCase):
 
     def test_long_missing_unassigned_id_is_recorded_without_being_quarantined(self):
         sequence = self.make()
-        sequence.update(group()+[slot(283, [350, 150])], .3)
+        self.observe_stable_unassigned(sequence)
         for now in (.8, 1.3, 1.9):
             sequence.update(group(), now)
         self.close(sequence, now=2.)
@@ -99,15 +106,15 @@ class TransitionQuarantineTests(unittest.TestCase):
 
     def test_latest_real_position_outside_roi_prevents_stale_inside_quarantine(self):
         sequence = self.make()
-        sequence.update(group()+[slot(283, [350, 150])], .3)
-        sequence.update(group()+[slot(283, [430, 150])], .4)
+        self.observe_stable_unassigned(sequence)
+        sequence.update(group()+[slot(283, [430, 150])], .47)
         self.close(sequence)
         self.assertIn(283, sequence.closed_groups[0]['roi_observed_track_ids'])
         self.assertFalse(sequence.is_transition_quarantined_track(283))
 
     def test_missing_track_only_quarantines_its_id_not_its_old_position(self):
         sequence = self.make()
-        sequence.update(group()+[slot(283, [350, 270])], .3)
+        self.observe_stable_unassigned(sequence, center=(350, 270))
         self.close(sequence)
         result = sequence.update([slot(309, [350, 270])], .6)
         self.assertTrue(sequence.is_transition_quarantined_track(283))
@@ -117,9 +124,65 @@ class TransitionQuarantineTests(unittest.TestCase):
 
     def test_disabled_quarantine_still_records_roi_ids(self):
         sequence = self.make(enabled=False)
-        sequence.update(group()+[slot(283, [350, 150])], .3)
+        self.observe_stable_unassigned(sequence)
         self.close(sequence)
         self.assertIn(283, sequence.closed_groups[0]['roi_observed_track_ids'])
+        self.assertFalse(sequence.is_transition_quarantined_track(283))
+
+    def test_short_lived_id_at_handoff_keeps_spatial_quarantine_then_can_enter(self):
+        sequence = self.make()
+        candidate = slot(192, [350, 270])
+        sequence.update(group()+[candidate], .45)
+        self.close(sequence, extra=[candidate])
+        self.assertFalse(sequence.is_transition_quarantined_track(192))
+        self.assertEqual(sequence.closed_groups[0]['roi_observed_track_frame_counts'][192], 2)
+        result = sequence.update([candidate], .6)
+        record = next(r for r in result['track_states'] if r['byte_track_id'] == 192)
+        self.assertEqual(record['mapping_reason'], 'transition_roi_quarantine')
+        self.assertIsNone(sequence.track_store.owner(192))
+        for now in (1.8, 1.9, 2., 2.1):
+            result = sequence.update([candidate], now)
+        self.assertEqual(sequence.track_store.owner(192), ('unload', 2))
+        self.assertFalse(sequence.is_transition_quarantined_track(192))
+        self.assertEqual(sequence.closed_groups[0]['roi_observed_track_frame_counts'][192], 2)
+        self.assertEqual(result['roi_observed_track_frame_counts'][192], 5)
+
+    def test_three_old_group_frames_do_not_meet_four_frame_threshold(self):
+        sequence = self.make()
+        candidate = slot(192, [350, 270])
+        for now in (.3, .4):
+            sequence.update(group()+[candidate], now)
+        self.close(sequence, extra=[candidate])
+        self.assertEqual(sequence.closed_groups[0]['roi_observed_track_frame_counts'][192], 3)
+        self.assertFalse(sequence.is_transition_quarantined_track(192))
+
+    def test_fourth_frame_at_handoff_is_sufficient_old_group_evidence(self):
+        sequence = self.make()
+        candidate = slot(283, [350, 150])
+        for now in (.3, .35, .4):
+            sequence.update(group()+[candidate], now)
+        self.close(sequence, extra=[candidate])
+        self.assertEqual(sequence.closed_groups[0]['roi_observed_track_frame_counts'][283], 4)
+        self.assertTrue(sequence.is_transition_quarantined_track(283))
+
+    def test_only_real_roi_frames_count_once_per_id_despite_short_gaps(self):
+        sequence = self.make()
+        candidate = slot(283, [350, 150])
+        sequence.update(group()+[candidate, candidate], .3)
+        result = sequence.update(group(), .35)
+        self.assertEqual(result['roi_observed_track_frame_counts'][283], 1)
+        result = sequence.update(group()+[slot(283, [430, 150])], .4)
+        self.assertEqual(result['roi_observed_track_frame_counts'][283], 1)
+        for now in (.45, .6, .7):
+            result = sequence.update(group()+[candidate], now)
+        self.assertEqual(result['roi_observed_track_frame_counts'][283], 4)
+        self.close(sequence, now=.8)
+        self.assertTrue(sequence.is_transition_quarantined_track(283))
+
+    def test_old_group_frame_threshold_is_configurable(self):
+        sequence = self.make(min_frames=5)
+        self.observe_stable_unassigned(sequence)
+        self.close(sequence)
         self.assertFalse(sequence.is_transition_quarantined_track(283))
 
     def test_closed_owner_is_excluded_even_after_long_missing_and_geometry_expiry(self):
@@ -130,6 +193,7 @@ class TransitionQuarantineTests(unittest.TestCase):
         moved[0] = [100, 75]
         result = sequence.update(group(moved, visible=(0, 2, 3)), 1.9)
         self.assertEqual(result['group_id'], 2)
+        self.assertEqual(sequence.closed_groups[0]['roi_observed_track_frame_counts'][102], 3)
         result = sequence.update([slot(102, POINTS[1])], 3.2)
         record = next(r for r in result['track_states'] if r['byte_track_id'] == 102)
         self.assertEqual(record['mapping_reason'], 'previous_group_track')

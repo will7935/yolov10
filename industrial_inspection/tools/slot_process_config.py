@@ -46,7 +46,8 @@ NEXT_GROUP_STABLE_SECONDS = .1 # 收齐可靠轨迹且几何停稳后一次性�
 NEXT_GROUP_STABILITY_RATIO = .1 # 停稳期间各槽偏离起始位置不得超过最小槽间距×此比例
 NEXT_GROUP_MATCH_DISTANCE_PX = 40 # 新点/旧组残留点逐帧匹配的最大距离（像素）
 NEXT_GROUP_ENTRY_FRACTION = .6 # 沿EXIT_DIRECTION从入口到出口的前60%允许建立新轨迹
-REJECT_TRANSITION_ROI_DETECTIONS = True # 旧组切换瞬间ROI内的轨迹ID不参与下一组映射
+REJECT_TRANSITION_ROI_DETECTIONS = True # 换组时隔离有稳定旧组证据的未绑定ID，并启用短时空间隔离
+TRANSITION_QUARANTINE_MIN_FRAMES = 4 # 未绑定ID在旧组ROI内累计真实出现至少此帧数，才持续隔离
 SLOT2_BELOW_SLOT3 = True      # 左上S1、顺时针1→3→4→2，y辅助核验S2通常在S3下方；编号后不重排
 EXIT_DIRECTION = (0, -1)     # 本视频已核实旧组从右下ROI向左上退出；None可恢复自动方向判断
 

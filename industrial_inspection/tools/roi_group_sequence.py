@@ -27,7 +27,7 @@ class RoiGroupSequence:
                  auto_load_after_unload=False, entry_birth_fraction=.6,
                  reidentification_enabled=False, reidentification_max_gap_seconds=15.0,
                  reidentification_max_distance_px=40.0,
-                 reject_transition_roi_detections=True):
+                 reject_transition_roi_detections=True, transition_quarantine_min_frames=4):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
@@ -42,6 +42,10 @@ class RoiGroupSequence:
             raise ValueError("新组逐点匹配距离须为正有限像素值")
         if not np.isfinite(entry_birth_fraction) or not 0 < entry_birth_fraction <= 1:
             raise ValueError("新轨迹入口深度比例须在0..1之间")
+        if (not isinstance(transition_quarantine_min_frames, (int, np.integer))
+                or isinstance(transition_quarantine_min_frames, bool)
+                or transition_quarantine_min_frames < 1):
+            raise ValueError("旧组未绑定轨迹的隔离出现帧数须为正整数")
         self.enabled, self.buffer_px, self.margin = enabled, buffer_px, boundary_margin_px
         self.auto_load_after_unload = bool(auto_load_after_unload)
         self.exit_seconds, self.exit_min_slots = exit_seconds, exit_min_slots
@@ -51,6 +55,7 @@ class RoiGroupSequence:
         self.entry_match_distance_px = float(entry_match_distance_px)
         self.entry_birth_fraction = float(entry_birth_fraction)
         self.reject_transition_roi_detections = bool(reject_transition_roi_detections)
+        self.transition_quarantine_min_frames = int(transition_quarantine_min_frames)
         self._entry_rejected = []
         self._entry_revision = 0
         self.configured_direction = None
@@ -107,7 +112,7 @@ class RoiGroupSequence:
         # 按工序和组号保留所有曾进入ROI的槽框，包括未绑定槽号的ID。
         # 这里只记录历史；当前组内漏检后恢复时不因此拒绝该ID。
         self._group_roi_tracks = {}
-        # 换组时隔离仍在ROI内或短暂漏检的轨迹；ID持续隔离，空间限制短时生效。
+        # 换组时隔离仍在ROI内或短暂漏检的稳定未绑定轨迹；空间限制短时生效。
         self._transition_quarantine_track_ids = set()
         self._transition_quarantine_centers = []
         self._transition_quarantine_until = None
@@ -123,7 +128,7 @@ class RoiGroupSequence:
         return owner in self.track_store.closed
 
     def is_transition_quarantined_track(self, track_id):
-        """Return whether a track was already in the ROI at the last group handoff."""
+        """Return whether an unassigned track has stable old-group ROI evidence."""
         return (track_id is not None and int(track_id) in self._transition_quarantine_track_ids)
 
     def _entry_progress(self, point):
@@ -205,12 +210,13 @@ class RoiGroupSequence:
             self._track_rejections[int(obj['track_id'])] = reason
 
     def _record_group_roi_tracks(self, objects, now):
-        """记录本组所有入过ROI的ID，并用后续真实框更新其最后位置。"""
+        """记录本组ROI真实出现帧数和最后位置；每个ID每帧最多计一次。"""
         if self.state == "sequence_complete":
             return
         tracker = (self.pending_tracker if self.state in ("waiting_next", "stabilizing_next")
                    and self.pending_tracker is not None else self.tracker)
         history = self._group_roi_tracks.setdefault((tracker.phase, tracker.group_id), {})
+        seen = set()
         for obj in objects:
             if obj.get('class_name') not in SLOT_STATES or obj.get('track_id') is None:
                 continue
@@ -218,26 +224,31 @@ class RoiGroupSequence:
             if box is None:
                 continue
             track_id = int(obj['track_id'])
+            if track_id in seen:
+                continue
+            seen.add(track_id)
             center = [(box[0]+box[2])/2, (box[1]+box[3])/2]
             inside = self._distance(center) >= 0
             if not inside and track_id not in history:
                 continue
-            record = history.setdefault(track_id, {'first_inside': float(now)})
+            record = history.setdefault(track_id, {'first_inside': float(now), 'inside_frames': 0})
             record.update(last_seen=float(now), center=center, inside_roi=inside)
             if inside:
+                record['inside_frames'] += 1
                 record['last_inside'] = float(now)
 
     def _arm_transition_quarantine(self, objects, now):
-        """隔离切组时仍在ROI内或短暂漏检的槽框，禁止其进入下一组。"""
-        # 有ByteTrack ID的框属于“换组时已经存在的轨迹”，整个后续组
-        # 都不再允许其参与槽号映射；仅无ID框使用短时空间隔离。
+        """按旧组稳定证据隔离未绑定ID，并保留换组瞬间的短时空间隔离。"""
         self._transition_quarantine_centers = []
         self._transition_quarantine_until = None
         if not self.reject_transition_roi_detections:
             return
         history = self._group_roi_tracks.get((self.tracker.phase, self.tracker.group_id), {})
         for track_id, record in history.items():
-            if record['inside_roi'] and now-record['last_seen'] <= self.tracker.lost_seconds:
+            if (self.track_store.owner(track_id) is None
+                    and record['inside_frames'] >= self.transition_quarantine_min_frames
+                    and record['inside_roi']
+                    and now-record['last_seen'] <= self.tracker.lost_seconds):
                 self._transition_quarantine_track_ids.add(track_id)
         # 已绑定旧组的ID由_close登记为closed，再由旧组归属过滤排除；
         # 即使它们最后已经出ROI或漏检超过时限，也不会成为下一组的槽。
@@ -252,14 +263,12 @@ class RoiGroupSequence:
             if self._distance(center) < 0:
                 continue
             self._transition_quarantine_centers.append(center)
-            if obj.get('track_id') is not None:
-                self._transition_quarantine_track_ids.add(int(obj['track_id']))
         if self._transition_quarantine_centers:
             duration = max(float(self.tracker.lost_seconds), self.entry_seconds, .5)
             self._transition_quarantine_until = float(now)+duration
 
     def _exclude_transition_quarantine(self, objects, now):
-        """过滤换组瞬间已在ROI内的框；ID轨迹整个下一组持续隔离。"""
+        """持续排除有稳定旧组证据的ID，短时过滤换组瞬间ROI中心附近的框。"""
         if not self._transition_quarantine_track_ids and not self._transition_quarantine_centers:
             return objects
         if (self._transition_quarantine_until is not None
@@ -519,6 +528,9 @@ class RoiGroupSequence:
                   "at": now,"close_reason": "observed_roi_exit","operation_result": operation,
                   "roi_observed_track_ids": sorted(self._group_roi_tracks.get(
                       (self.tracker.phase, self.tracker.group_id), {})),
+                  "roi_observed_track_frame_counts": {track_id: track['inside_frames']
+                      for track_id, track in self._group_roi_tracks.get(
+                          (self.tracker.phase, self.tracker.group_id), {}).items()},
                   "crossed_slot_ids": [i+1 for i in sorted(self.crossed)],
                   "required_crossings": self._required_crossings,"snapshot": snap,
                   "events": deepcopy(self.tracker.events)}
@@ -846,8 +858,8 @@ class RoiGroupSequence:
         elif self.state == "sequence_complete":
             self._exclude_departing(objects, now)
         else:
-            # 换组瞬间已有ID的轨迹在整个下一组期间都不能回流到当前
-            # 槽号跟踪；先让旧组尾部逻辑观察，再从当前组候选中移除。
+            # 已归属旧组或具有稳定旧组证据的ID不能回流到当前槽号跟踪；
+            # 先让旧组尾部逻辑观察，再从当前组候选中移除。
             active = self._active_objects(self._exclude_transition_quarantine(
                 self._exclude_departing(objects, now), now))
             initial = [o for o in active if o["class_name"] not in SLOT_STATES or self._distance(
@@ -860,8 +872,8 @@ class RoiGroupSequence:
                 self._arm(now)
             if self.state == "exiting" and (self.exit_min_slots == 1 or
                     self.exit_since is not None and now-self.exit_since+1e-9 >= self.exit_seconds):
-                # 换组时把当前ROI内及最后在ROI内短暂漏检的槽框加入隔离名单；
-                # 它们仍可用于旧组尾部排除，但不能作为下一组入口候选。
+                # 未绑定ID仅在旧组真实出现帧数足够且仍在ROI/短暂漏检时隔离；
+                # 已绑定ID继续由旧组归属排除，空间隔离保持不变。
                 self._arm_transition_quarantine(objects, now)
                 self._close(now)
                 if self.exit_min_slots == 1 and self.state != "sequence_complete":
@@ -910,6 +922,9 @@ class RoiGroupSequence:
                 "entry_rejected_slot_detections": deepcopy(self._entry_rejected),
                 "roi_observed_track_ids": sorted(self._group_roi_tracks.get(
                     (self.tracker.phase, self.tracker.group_id), {})),
+                "roi_observed_track_frame_counts": {track_id: track['inside_frames']
+                    for track_id, track in self._group_roi_tracks.get(
+                        (self.tracker.phase, self.tracker.group_id), {}).items()},
                 "transition_quarantine_track_ids": sorted(self._transition_quarantine_track_ids),
                 "transition_quarantine_until": self._transition_quarantine_until,
                 "departing_untrackable_slot_ids": [index + 1 for index in

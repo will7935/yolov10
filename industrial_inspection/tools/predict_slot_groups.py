@@ -81,7 +81,7 @@ from industrial_inspection.tools.slot_process_config import (
     EXIT_BOUNDARY_MARGIN_PX, EXIT_MIN_SLOTS, PARTIAL_EXIT_MIN_SLOTS,
     EXIT_MIN_MOTION_RATIO, MOTION_PAUSE_RATIO, NEXT_GROUP_STABLE_SECONDS,
     NEXT_GROUP_STABILITY_RATIO, NEXT_GROUP_MATCH_DISTANCE_PX, NEXT_GROUP_ENTRY_FRACTION,
-    REJECT_TRANSITION_ROI_DETECTIONS, SLOT2_BELOW_SLOT3, EXIT_DIRECTION,
+    REJECT_TRANSITION_ROI_DETECTIONS, TRANSITION_QUARANTINE_MIN_FRAMES, SLOT2_BELOW_SLOT3, EXIT_DIRECTION,
     START_FRAME, END_FRAME, INITIALIZATION_SECONDS,
     MIN_INITIALIZATION_FRAMES, INITIAL_GROUP_STABLE_SECONDS, INITIALIZATION_HISTORY_SECONDS,
     THREE_POINT_GROUP_INITIALIZATION, MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
@@ -222,6 +222,7 @@ def make_sequence(polygon,size,hand_region=None):
         exit_direction=EXIT_DIRECTION,auto_load_after_unload=AUTO_LOAD_AFTER_UNLOAD,
         entry_birth_fraction=NEXT_GROUP_ENTRY_FRACTION,
         reject_transition_roi_detections=REJECT_TRANSITION_ROI_DETECTIONS,
+        transition_quarantine_min_frames=TRANSITION_QUARANTINE_MIN_FRAMES,
         reidentification_enabled=REIDENTIFICATION_ENABLED,
         reidentification_max_gap_seconds=REIDENTIFICATION_MAX_GAP_SECONDS,
         reidentification_max_distance_px=REIDENTIFICATION_MAX_DISTANCE_PX)
@@ -627,11 +628,12 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "transition_roi_quarantine": {
             "enabled": REJECT_TRANSITION_ROI_DETECTIONS,
             "record_scope": "all_roi_slot_track_ids_during_group",
+            "unassigned_min_roi_frames": TRANSITION_QUARANTINE_MIN_FRAMES,
             "missing_roi_track_max_gap_seconds": IDENTITY_LOST_SECONDS,
             "id_scope": "entire_next_group",
             "spatial_duration_seconds": max(IDENTITY_LOST_SECONDS, NEXT_GROUP_STABLE_SECONDS, .5),
             "distance_px": NEXT_GROUP_MATCH_DISTANCE_PX,
-            "description": "closed-group owners and current/recently-missing ROI track IDs are excluded from the next group; ID-less boxes use temporary spatial quarantine"},
+            "description": "closed-group owners remain excluded; unassigned ROI IDs require sufficient old-group detection frames and recent presence; all handoff ROI centers retain temporary spatial quarantine"},
         "closed_group_inferred_s4_reassociation": {
             "enabled": False,
             "description": "an inferred S4 is frozen at group handoff and cannot bind a new ByteTrack ID"},
