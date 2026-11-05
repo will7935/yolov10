@@ -55,6 +55,19 @@ ROI_SELECT_FRAME = base.ROI_SELECT_FRAME
 DRAW_SLOT_ROI = base.DRAW_SLOT_ROI
 POINT_RADIUS = base.POINT_RADIUS
 
+# 每次完成主视频后，自动用同一套模型和分组逻辑处理这两个原始视频。
+# 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
+# 临时仅处理主视频可传 --no-regression-tests。
+REGRESSION_TESTS_ENABLED = True
+REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
+REGRESSION_TEST_VIDEOS = (
+    ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
+     REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033_slot_roi.json"),
+    ("测试视频2", REGRESSION_DATASET_ROOT / "测试视频2" / "camera_B_20260923_143845.avi",
+     REGRESSION_DATASET_ROOT / "测试视频2" / "camera_B_20260923_143845_slot_roi.json"),
+)
+REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
+
 # 算法参数统一在 slot_process_config.py 修改；显式导入保留旧脚本的配置名称。
 from industrial_inspection.tools.slot_process_config import (
     SLOT_STATE_CONFIDENCE, HAND_DETECTION_CONFIDENCE, HATCH_HANDLE_CONFIDENCE,
@@ -96,6 +109,11 @@ GROUP_TEXT = {"initializing": "等待四槽初始化","active": "操作中","exi
 
 
 def build_args(argv=None):
+    argv = list(argv or [])
+    run_regression_tests = REGRESSION_TESTS_ENABLED
+    if "--no-regression-tests" in argv:
+        argv = [argument for argument in argv if argument != "--no-regression-tests"]
+        run_regression_tests = False
     defaults = ["--source",str(SOURCE_VIDEO),"--weights",str(MODEL_WEIGHTS),
         "--conf",str(CONFIDENCE),"--audit-conf",str(AUDIT_CONFIDENCE),
         "--imgsz",str(IMAGE_SIZE),"--device",str(DEVICE),
@@ -104,7 +122,8 @@ def build_args(argv=None):
         "--roi-file",str(SLOT_ROI_FILE or base.DEFAULT_SLOT_ROI_FILE),
         "--reselect-roi" if ROI_RESELECT else "--no-reselect-roi",
         "--roi-select-frame",str(ROI_SELECT_FRAME)]
-    args = base.parse_args(defaults + list(argv or []))
+    args = base.parse_args(defaults + argv)
+    args.run_regression_tests = run_regression_tests
     args.slot_roi = True
     args.group_completion_log_only = True
     resolve_detection_thresholds(args)  # 在打开视频和创建输出前检查各职责门槛。
@@ -161,7 +180,7 @@ def prepare_context(args):
         raise ValueError("开始帧超出视频范围，或结束帧不大于开始帧")
     hand_region = None
     if S4_HAND_REGION_ENABLED:
-        if S4_HAND_REGION_RESELECT or not S4_HAND_REGION_FILE.exists():
+        if (S4_HAND_REGION_RESELECT and not getattr(args, "regression_run", False)) or not S4_HAND_REGION_FILE.exists():
             hand_region = select_roi(args.source, S4_HAND_REGION_FILE, ROI_SELECT_FRAME, purpose="s4_hand")
         else:
             hand_region = load_roi(S4_HAND_REGION_FILE, (w, h))
@@ -487,7 +506,7 @@ def draw_predicted_slot_boxes(frame, slots, roi_contour, *, color=(0, 220, 255),
     return frame
 
 
-def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon=None):
+def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon=None):
     """接口兼容现有UI7V：roi_polygon参数携带ROI及视频信息。"""
     thresholds = resolve_detection_thresholds(args)
     context = prepare_context(args) if roi_polygon is None else roi_polygon
@@ -607,10 +626,12 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
         "auto_load_after_unload": sequence.auto_load_after_unload,
         "transition_roi_quarantine": {
             "enabled": REJECT_TRANSITION_ROI_DETECTIONS,
+            "record_scope": "all_roi_slot_track_ids_during_group",
+            "missing_roi_track_max_gap_seconds": IDENTITY_LOST_SECONDS,
             "id_scope": "entire_next_group",
             "spatial_duration_seconds": max(IDENTITY_LOST_SECONDS, NEXT_GROUP_STABLE_SECONDS, .5),
             "distance_px": NEXT_GROUP_MATCH_DISTANCE_PX,
-            "description": "old-group-exit ROI track IDs are excluded from the next group; ID-less boxes use temporary spatial quarantine"},
+            "description": "closed-group owners and current/recently-missing ROI track IDs are excluded from the next group; ID-less boxes use temporary spatial quarantine"},
         "closed_group_inferred_s4_reassociation": {
             "enabled": False,
             "description": "an inferred S4 is frozen at group handoff and cannot bind a new ByteTrack ID"},
@@ -1150,6 +1171,102 @@ def run_prediction(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon
     if not processed and status != "user_stopped":
         raise RuntimeError("没有处理任何帧")
     log(report_text)
+    return summary
+
+
+def _run_regression_tests(primary_args, primary_summary, *, on_log=None, should_stop=None):
+    """Run the configured raw-video regression set after the main video."""
+    def log(message):
+        print(message, flush=True)
+        if on_log is not None:
+            on_log(message)
+
+    if primary_summary.get("status") in {"user_stopped", "interrupted", "preview_stopped"}:
+        log("主视频未正常完成，跳过回归视频。")
+        return []
+
+    primary_source = Path(primary_args.source).resolve()
+    results = []
+    for name, source, roi_file in REGRESSION_TEST_VIDEOS:
+        source = Path(source)
+        roi_file = Path(roi_file)
+        record = {"name": name, "source": str(source.resolve()),
+                  "roi_file": str(roi_file.resolve()), "status": "skipped"}
+        primary_roi = Path(primary_args.roi_file).resolve() if primary_args.roi_file else None
+        if source.resolve() == primary_source and roi_file.resolve() == primary_roi:
+            record.update(status=primary_summary["status"], reused_primary_result=True,
+                          output_dir=primary_summary["output_dir"],
+                          processed_frames=primary_summary.get("processed_frames"),
+                          group_process_reports=primary_summary.get("group_process_reports"))
+            results.append(record)
+            log(f"回归验证 {name}：视频与 ROI 均相同，复用主视频结果。")
+            continue
+        if not source.is_file():
+            record["reason"] = "source_not_found"
+            results.append(record)
+            log(f"回归验证 {name}：找不到原始视频，跳过：{source}")
+            continue
+        if not roi_file.is_file():
+            record["reason"] = "roi_not_found"
+            results.append(record)
+            log(f"回归验证 {name}：找不到 ROI 配置，跳过：{roi_file}")
+            continue
+        if should_stop is not None and should_stop():
+            record["reason"] = "stopped_before_start"
+            results.append(record)
+            log(f"回归验证 {name}：收到停止请求，跳过。")
+            break
+
+        regression_args = type(primary_args)(**vars(primary_args))
+        regression_args.source = source
+        regression_args.roi_file = roi_file
+        regression_args.reselect_roi = False
+        regression_args.output_dir = REGRESSION_OUTPUT_ROOT / (
+            f"{source.stem}_slots_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+        # 回归视频只落盘验证结果，不抢占主视频的 Qt/OpenCV 预览窗口。
+        regression_args.ui = False
+        regression_args.show = False
+        regression_args.slot_roi = True
+        regression_args.group_completion_log_only = True
+        regression_args.regression_run = True
+        log(f"回归验证 {name}：开始处理 {source.name}")
+        try:
+            if S4_HAND_REGION_ENABLED and not S4_HAND_REGION_FILE.is_file():
+                raise RuntimeError("回归验证缺少 S4 手部区域配置，请先在主视频完成区域标定。")
+            context = prepare_context(regression_args)
+            summary = _run_prediction_once(regression_args, on_log=on_log,
+                                            should_stop=should_stop, roi_polygon=context)
+            record.update(status=summary.get("status"),
+                          output_dir=summary.get("output_dir"),
+                          processed_frames=summary.get("processed_frames"),
+                          group_process_reports=summary.get("group_process_reports"))
+            status_text = {"frame_limit": "达到帧数上限", "user_stopped": "已停止",
+                           "interrupted": "已中断"}.get(summary.get("status"), "完成")
+            log(f"回归验证 {name}：{status_text}，结果保存到 {summary.get('output_dir')}")
+        except Exception as exc:
+            record.update(status="failed", error=str(exc))
+            log(f"回归验证 {name}：失败：{exc}")
+        results.append(record)
+    return results
+
+
+def run_prediction(args, *, on_frame=None, on_log=None, should_stop=None, roi_polygon=None):
+    """Process the requested video, then run the configured raw-video regression set."""
+    summary = _run_prediction_once(args, on_frame=on_frame, on_log=on_log,
+                                   should_stop=should_stop, roi_polygon=roi_polygon)
+    # 只有 build_args 创建的正式脚本入口会设置此开关；保留旧的程序化
+    # 调用行为，避免测试或外部调用传入精简 Namespace 时意外跑整段视频。
+    if not getattr(args, "run_regression_tests", False):
+        return summary
+    regression_results = _run_regression_tests(args, summary, on_log=on_log,
+                                                should_stop=should_stop)
+    summary["regression_tests"] = regression_results
+    primary_output = Path(summary["output_dir"])
+    (primary_output / "regression_tests.json").write_text(
+        json.dumps(regression_results, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 主摘要已由单视频管线保存；补写回归结果索引，方便自动化回归检查统一读取。
+    (primary_output / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
 

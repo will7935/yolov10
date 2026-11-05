@@ -104,8 +104,10 @@ class RoiGroupSequence:
         self.departing_track_ids = []
         self.departing_phase = None
         self._track_rejections = {}
-        # 换组瞬间仍在ROI内的框先隔离，防止旧组尾框或残留框被新组
-        # 当作入口点/槽位。仅在短暂换组窗口内生效，避免永久屏蔽新组。
+        # 按工序和组号保留所有曾进入ROI的槽框，包括未绑定槽号的ID。
+        # 这里只记录历史；当前组内漏检后恢复时不因此拒绝该ID。
+        self._group_roi_tracks = {}
+        # 换组时隔离仍在ROI内或短暂漏检的轨迹；ID持续隔离，空间限制短时生效。
         self._transition_quarantine_track_ids = set()
         self._transition_quarantine_centers = []
         self._transition_quarantine_until = None
@@ -202,14 +204,44 @@ class RoiGroupSequence:
         if obj.get('track_id') is not None:
             self._track_rejections[int(obj['track_id'])] = reason
 
+    def _record_group_roi_tracks(self, objects, now):
+        """记录本组所有入过ROI的ID，并用后续真实框更新其最后位置。"""
+        if self.state == "sequence_complete":
+            return
+        tracker = (self.pending_tracker if self.state in ("waiting_next", "stabilizing_next")
+                   and self.pending_tracker is not None else self.tracker)
+        history = self._group_roi_tracks.setdefault((tracker.phase, tracker.group_id), {})
+        for obj in objects:
+            if obj.get('class_name') not in SLOT_STATES or obj.get('track_id') is None:
+                continue
+            box = obj.get('xyxy')
+            if box is None:
+                continue
+            track_id = int(obj['track_id'])
+            center = [(box[0]+box[2])/2, (box[1]+box[3])/2]
+            inside = self._distance(center) >= 0
+            if not inside and track_id not in history:
+                continue
+            record = history.setdefault(track_id, {'first_inside': float(now)})
+            record.update(last_seen=float(now), center=center, inside_roi=inside)
+            if inside:
+                record['last_inside'] = float(now)
+
     def _arm_transition_quarantine(self, objects, now):
-        """记录旧组离开瞬间ROI内的全部槽框，禁止其进入下一组。"""
+        """隔离切组时仍在ROI内或短暂漏检的槽框，禁止其进入下一组。"""
         # 有ByteTrack ID的框属于“换组时已经存在的轨迹”，整个后续组
         # 都不再允许其参与槽号映射；仅无ID框使用短时空间隔离。
         self._transition_quarantine_centers = []
         self._transition_quarantine_until = None
         if not self.reject_transition_roi_detections:
             return
+        history = self._group_roi_tracks.get((self.tracker.phase, self.tracker.group_id), {})
+        for track_id, record in history.items():
+            if record['inside_roi'] and now-record['last_seen'] <= self.tracker.lost_seconds:
+                self._transition_quarantine_track_ids.add(track_id)
+        # 已绑定旧组的ID由_close登记为closed，再由旧组归属过滤排除；
+        # 即使它们最后已经出ROI或漏检超过时限，也不会成为下一组的槽。
+        # 历史漏检点只隔离ID，不把滞后坐标扩成空间屏蔽区域。
         for obj in objects:
             if obj.get('class_name') not in SLOT_STATES:
                 continue
@@ -485,6 +517,8 @@ class RoiGroupSequence:
         operation = "fail" if order == "fail" else ("pass" if order == "pass" and snap["all_four_target_previously_verified"] else "pending")
         record = {"type": "group_closed","group_id": self.tracker.group_id,"phase": self.tracker.phase,
                   "at": now,"close_reason": "observed_roi_exit","operation_result": operation,
+                  "roi_observed_track_ids": sorted(self._group_roi_tracks.get(
+                      (self.tracker.phase, self.tracker.group_id), {})),
                   "crossed_slot_ids": [i+1 for i in sorted(self.crossed)],
                   "required_crossings": self._required_crossings,"snapshot": snap,
                   "events": deepcopy(self.tracker.events)}
@@ -562,21 +596,17 @@ class RoiGroupSequence:
     def _entry_objects(self, objects, now):
         # 旧组的局部补检不能在同帧换组后成为下一组的新轨迹。
         objects = [o for o in objects if o.get("detection_source") != "local_crop"]
-        if (self.state == "entering" or self.departing_points is not None
-                or self._transition_quarantine_centers):
-            tracker = self.tracker if self.state == "entering" else self.pending_tracker
-            # 先让旧组尾部排除逻辑观察原始框，再把换组瞬间已经位于
-            # ROI 内的框从下一组候选中移除。
-            objects = self._exclude_departing(objects, now)
-            objects = self._exclude_transition_quarantine(objects, now)
-            return self._admit_entry_objects(objects, tracker, now)
-        inside,others = [],[]
-        # 旧组预测点机制已移除；这里仅依靠真实轨迹归属和入口规则筛选。
-        return self._admit_entry_objects(objects, self.pending_tracker, now)
+        tracker = self.tracker if self.state == "entering" else self.pending_tracker
+        # 即使空间隔离或退出几何已超时，旧组归属和被隔离的ID仍须过滤。
+        objects = self._exclude_departing(objects, now)
+        objects = self._exclude_transition_quarantine(objects, now)
+        return self._admit_entry_objects(objects, tracker, now)
 
     def _exclude_departing(self, objects, now):
         """旧组退出后继续沿用旧身份匹配，残留点不能成为下一组的初始槽。"""
-        identity = (self.tracker.phase, self.tracker.group_id)
+        current_tracker = (self.pending_tracker if self.state in ("waiting_next", "stabilizing_next")
+                           and self.pending_tracker is not None else self.tracker)
+        identity = (current_tracker.phase, current_tracker.group_id)
         known_old = []
         remaining = []
         for obj in objects:
@@ -803,6 +833,7 @@ class RoiGroupSequence:
         self._track_rejections = {}
         self._observations_enabled = observations_enabled
         self._hands = [o for o in objects if o["class_name"] == "hand"]
+        self._record_group_roi_tracks(objects, now)
         self.track_store.observe(objects, now, observations_enabled,
             reentry_allowed=lambda center: self._distance(center) >= self.margin and (
                 self._entry_progress(center) is None
@@ -829,7 +860,7 @@ class RoiGroupSequence:
                 self._arm(now)
             if self.state == "exiting" and (self.exit_min_slots == 1 or
                     self.exit_since is not None and now-self.exit_since+1e-9 >= self.exit_seconds):
-                # 换组时把当前ROI内全部槽位框加入隔离名单；
+                # 换组时把当前ROI内及最后在ROI内短暂漏检的槽框加入隔离名单；
                 # 它们仍可用于旧组尾部排除，但不能作为下一组入口候选。
                 self._arm_transition_quarantine(objects, now)
                 self._close(now)
@@ -877,6 +908,8 @@ class RoiGroupSequence:
                 "motion_support_slot_ids": list(self._motion_support),
                 "entry_candidate_count": self._entry_count,
                 "entry_rejected_slot_detections": deepcopy(self._entry_rejected),
+                "roi_observed_track_ids": sorted(self._group_roi_tracks.get(
+                    (self.tracker.phase, self.tracker.group_id), {})),
                 "transition_quarantine_track_ids": sorted(self._transition_quarantine_track_ids),
                 "transition_quarantine_until": self._transition_quarantine_until,
                 "departing_untrackable_slot_ids": [index + 1 for index in
