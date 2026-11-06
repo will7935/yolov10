@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import itertools
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -206,7 +207,8 @@ class SlotGroupTracker:
                   load_hand_contact_competing_margin=.10,
                   load_hand_contact_competing_ratio=2.0,
                  slot2_below_slot3=False,
-                 allow_three_point_initialization=None, s4_hand_region=None):
+                 allow_three_point_initialization=None, s4_hand_region=None,
+                 unload_entry_numbering_seconds=None, machine_center=None):
         if group_count != 5 or not 1 <= group_id <= group_count:
             raise ValueError("当前流程固定五组，group_id 必须在1..5之间")
         if phase not in ("load", "unload") or sorted(clockwise) != [1, 2, 3, 4]:
@@ -219,6 +221,10 @@ class SlotGroupTracker:
                 or (geometry_initialization_seconds is not None
                     and geometry_initialization_seconds < 0)):
             raise ValueError("初始化持续时间不能为负，帧数至少为1")
+        if (unload_entry_numbering_seconds is not None
+                and (not np.isfinite(unload_entry_numbering_seconds)
+                     or unload_entry_numbering_seconds <= 0)):
+            raise ValueError("下料换组后的编号停稳时间须为正有限数")
         if not 0 < initialization_stability_ratio < .5 or not np.isfinite(initialization_history_seconds) or initialization_history_seconds <= 0:
             raise ValueError("初始化停稳比例须在0..0.5之间，观测缓存秒数须为正有限数")
         if (not np.isfinite(load_hand_contact_seconds) or load_hand_contact_seconds < 0
@@ -266,6 +272,12 @@ class SlotGroupTracker:
         self.initialization_seconds, self.initialization_frames = initialization_seconds, initialization_frames
         self.geometry_initialization_seconds = (initialization_seconds if
             geometry_initialization_seconds is None else geometry_initialization_seconds)
+        self.unload_entry_numbering_seconds = unload_entry_numbering_seconds
+        self.machine_center = None if machine_center is None else np.asarray(machine_center, dtype=float)
+        if self.machine_center is not None and (
+                self.machine_center.shape != (2,) or not np.isfinite(self.machine_center).all()):
+            raise ValueError("机心必须是两个有限的像素坐标")
+        self._machine_center_votes = deque(maxlen=8)
         self.initialization_stability_ratio = initialization_stability_ratio
         self.initialization_history_seconds = initialization_history_seconds
         self.load_hand_contact_enabled = bool(load_hand_contact_enabled)
@@ -365,6 +377,58 @@ class SlotGroupTracker:
             order.remove(predicted)
             order.append(predicted)
         return np.asarray(order, dtype=int)
+
+    def _observe_machine_s4(self, observed, now, enabled):
+        if self.machine_center is None:
+            return
+        if not enabled:
+            self._machine_center_votes.clear()
+            return
+        if len(observed) != 4 or any(obj.get("detection_source") == "local_crop"
+                                    or obj["conflict"] for obj in observed):
+            return
+        track_ids = [obj.get("track_id") for obj in observed]
+        if len(set(track_ids) - {None}) != 4:
+            return
+        points = np.asarray([obj["center"] for obj in observed], dtype=float)
+        if not valid_slot_geometry(points):
+            return
+        distance = np.linalg.norm(points - self.machine_center, axis=1)
+        first, second = np.argsort(distance)[:2]
+        gap = float(distance[second] - distance[first])
+        nearest = track_ids[first] if gap >= 2.0 else None
+        self._machine_center_votes.append((now, frozenset(track_ids), nearest, gap))
+
+    def _machine_numbering_order(self, points, track_ids, legacy, now, *, inferred, slots, events):
+        if self.machine_center is None:
+            return legacy
+        diagnostic = {"status": "insufficient_distance_evidence"}
+        self.initialization["machine_center_numbering"] = diagnostic
+        if inferred:
+            diagnostic["status"] = "three_point_fallback"
+            return legacy
+        votes = [vote for vote in self._machine_center_votes
+                 if now-vote[0] <= .25 and vote[1] == frozenset(track_ids)][-3:]
+        if len(votes) < 3 or votes[-1][2] is None or any(v[2] != votes[-1][2] for v in votes):
+            return legacy
+        s4 = track_ids.index(votes[-1][2])
+        if s4 != int(np.argmin(np.linalg.norm(points - self.machine_center, axis=1))):
+            return legacy
+        offsets = points - points.mean(axis=0)
+        ring = np.argsort(np.arctan2(offsets[:, 1], offsets[:, 0]))
+        anchor = int(np.flatnonzero(ring == s4)[0])
+        order = np.roll(ring, 2-anchor)[[0, 3, 1, 2]]
+        spacing = np.min(np.linalg.norm(points[:, None]-points[None, :], axis=2)[np.triu_indices(4, 1)])
+        if self.slot2_below_slot3 and points[order[1], 1]-points[order[2], 1] < -.2*spacing:
+            diagnostic["status"] = "position_constraint_fallback"
+            return legacy
+        if any(slot.load_contact_pending and i != s4 for i, slot in enumerate(slots)) or any(
+                e.get("inferred") and e["slot_id"] != s4+1 for e in events):
+            diagnostic["status"] = "contact_evidence_fallback"
+            return legacy
+        diagnostic.update(status="confirmed", s4_byte_track_id=track_ids[s4],
+                          minimum_gap_px=min(v[3] for v in votes))
+        return order
 
     def _s4_index(self):
         """Return the current point-array index for formal S4, if known."""
@@ -522,6 +586,7 @@ class SlotGroupTracker:
         return matches
 
     def _update_incremental_entry(self, objects, now, enabled, roi_contour):
+        numbering_seconds = self.unload_entry_numbering_seconds if self.phase == "unload" else None
         self._predicted_indices.clear()
         self._expire_entry_tracks(now)
         self._predicted_indices.update(self._entry_inferred_indices)
@@ -717,6 +782,7 @@ class SlotGroupTracker:
         # 已完成的状态变化随有效轨迹保留到正式编号；不能按旧状态证据的
         # 年龄清掉已确认事件。轨迹失效时由_expire_entry_tracks连同身份清理。
         self.unmatched = [c for j, c in enumerate(candidates) if j not in matches.values()]
+        self._observe_machine_s4([candidates[col] for col in matches.values()], now, enabled and not overflow)
         reliable = [i for i, col in matches.items() if not candidates[col]["conflict"]
                     and not self._occluded(candidates[col], hands)]
         # 三个可靠点即可判断进入运动是否已停止；新增第四点后重新计时。
@@ -735,6 +801,10 @@ class SlotGroupTracker:
             self._initial_points, self._initial_since, self._initial_count = None, None, 0
         stable = (self._initial_count >= self.initialization_frames and self._initial_since is not None
                   and now-self._initial_since+1e-9 >= self.geometry_initialization_seconds)
+        if numbering_seconds is not None and enabled and inferred_now:
+            # 先用推算的 S4 记录接触，正式编号从当前姿态重新计时。
+            self._initial_since, self._initial_count = float(now), 1
+            stable = False
         if stable:
             self._entry_reference_points = np.asarray(self._entry_points).copy()
             if self._entry_canonical_points is None:
@@ -782,6 +852,9 @@ class SlotGroupTracker:
                 self.initialization.update(reason="invalid_initial_geometry")
                 return {**self.snapshot(), "new_events": []}
             self.initialization.update(reason="confirming_group_geometry", stable_frames=self._initial_count)
+            if numbering_seconds is not None and (
+                    not stable or now-self._initial_since+1e-9 < numbering_seconds):
+                return {**self.snapshot(), "new_events": []}
             numbering_points = points
             if not stable:
                 # 第四槽可能直到下一次转位才解除遮挡。已有三槽的停稳姿态可
@@ -811,6 +884,12 @@ class SlotGroupTracker:
             # 历史停稳几何用于确认身份，不能让两点还原误差旋转整套编号。
             pose = points if self.slot2_below_slot3 else numbering_points
             order = self._numbering_order_with_predicted_s4(pose)
+            if stable:
+                order = self._machine_numbering_order(
+                    points, self._entry_track_ids, order, now, inferred=bool(self._entry_inferred_indices),
+                    slots=self.slots, events=self._entry_events)
+            elif self.machine_center is not None:
+                self.initialization["machine_center_numbering"] = {"status": "current_pose_not_stable"}
             if self.slot2_below_slot3 and (not valid_slot_geometry(numbering_points)
                     or pose[order[1], 1]-pose[order[2], 1] < -spacing*.2):
                 self.initialization.update(reason="waiting_for_numbering_pose")
@@ -972,6 +1051,8 @@ class SlotGroupTracker:
                       ambiguity_ratio=self.ambiguity_ratio,
                       initialization_seconds=self.initialization_seconds,
                       geometry_initialization_seconds=self.geometry_initialization_seconds,
+                      unload_entry_numbering_seconds=self.unload_entry_numbering_seconds,
+                      machine_center=self.machine_center,
                       initialization_frames=self.initialization_frames,
                       initialization_stability_ratio=self.initialization_stability_ratio,
                       initialization_history_seconds=self.initialization_history_seconds,
@@ -993,6 +1074,7 @@ class SlotGroupTracker:
             for track_id in self._provisional.byte_track_ids:
                 self.track_store.release_candidate(track_id, (self.phase, self.group_id))
         self._provisional = None
+        self._machine_center_votes.clear()
         self._provisional_inferred_slot_ids = set()
         self._three_point_stable_points = None
         self._three_point_stable_since = None
@@ -1086,6 +1168,7 @@ class SlotGroupTracker:
                 slot.confirmed_since, slot.confirmed_at = None, None
                 slot.confirmation_source = None
         matches = p._associate(candidates, p._spacing()*p.match_distance_ratio)
+        self._observe_machine_s4([candidates[col] for col in matches.values()], now, enabled)
         reliable = {i: candidates[col] for i,col in matches.items()
                     if not self._occluded(candidates[col], hands)}
         self._provisional_inferred_slot_ids.difference_update(reliable)
@@ -1122,6 +1205,9 @@ class SlotGroupTracker:
                 or now-self._initial_since+1e-9 < self.geometry_initialization_seconds):
             return []
         order = self._numbering_order(p.points) if self.slot2_below_slot3 else np.arange(4)
+        order = self._machine_numbering_order(
+            p.points, p.byte_track_ids, order, now, inferred=bool(self._provisional_inferred_slot_ids),
+            slots=p.slots, events=p.events)
         self.points = p.points[order].copy()
         # 正式编号时以当帧位置建立参考，避免继承候选阶段的旧参考点。
         self.reference_points = self.points.copy()

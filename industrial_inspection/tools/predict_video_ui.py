@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QVBoxLayout)
 
-from industrial_inspection.tools.UI7V import MainWindow
+from industrial_inspection.tools.UI7V import MainWindow, SYSTEM_TITLE
 from industrial_inspection.tools.slot_roi import DEFAULT_SLOT_ROI_FILE
 
 
@@ -68,7 +68,7 @@ class VideoMainWindow(MainWindow):
         self.prepare_roi = prepare_roi
         self.thread = None
         self.close_when_finished = False
-        self.setWindowTitle("晶圆外延工艺智能检测系统 - 本地视频检测")
+        self.setWindowTitle(f"{SYSTEM_TITLE} - 本地视频检测")
         self.image_label.setText("本地视频画面")
         self.start_btn.setText("▶️ 开始检测")
         self.stop_btn.setText("⏹️ 停止检测")

@@ -49,6 +49,7 @@ NEXT_GROUP_ENTRY_FRACTION = .6 # 沿EXIT_DIRECTION从入口到出口的前60%允
 REJECT_TRANSITION_ROI_DETECTIONS = True # 换组时隔离有稳定旧组证据的未绑定ID，并启用短时空间隔离
 TRANSITION_QUARANTINE_MIN_FRAMES = 4 # 未绑定ID在旧组ROI内累计真实出现至少此帧数，才持续隔离
 SLOT2_BELOW_SLOT3 = True      # 左上S1、顺时针1→3→4→2，y辅助核验S2通常在S3下方；编号后不重排
+MACHINE_CENTER_NORMALIZED = (637 / 640, 266 / 480) # 机心点选坐标；四槽证据充分时最近点为S4，None关闭
 EXIT_DIRECTION = (0, -1)     # 本视频已核实旧组从右下ROI向左上退出；None可恢复自动方向判断
 
 # 每轮五组按顺序计数；自动模式运行五组下料再五组上料。

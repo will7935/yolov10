@@ -55,6 +55,10 @@ ROI_SELECT_FRAME = base.ROI_SELECT_FRAME
 DRAW_SLOT_ROI = base.DRAW_SLOT_ROI
 POINT_RADIUS = base.POINT_RADIUS
 
+# 下料停稳编号试验。开启后主视频和自动回归使用同一规则。
+TRY_SETTLED_UNLOAD_NUMBERING = True
+_TRIAL_UNLOAD_STABLE_SECONDS = .20
+
 # 每次完成主视频后，自动用同一套模型和分组逻辑处理这两个原始视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
@@ -82,6 +86,7 @@ from industrial_inspection.tools.slot_process_config import (
     EXIT_MIN_MOTION_RATIO, MOTION_PAUSE_RATIO, NEXT_GROUP_STABLE_SECONDS,
     NEXT_GROUP_STABILITY_RATIO, NEXT_GROUP_MATCH_DISTANCE_PX, NEXT_GROUP_ENTRY_FRACTION,
     REJECT_TRANSITION_ROI_DETECTIONS, TRANSITION_QUARANTINE_MIN_FRAMES, SLOT2_BELOW_SLOT3, EXIT_DIRECTION,
+    MACHINE_CENTER_NORMALIZED,
     START_FRAME, END_FRAME, INITIALIZATION_SECONDS,
     MIN_INITIALIZATION_FRAMES, INITIAL_GROUP_STABLE_SECONDS, INITIALIZATION_HISTORY_SECONDS,
     THREE_POINT_GROUP_INITIALIZATION, MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
@@ -110,6 +115,8 @@ GROUP_TEXT = {"initializing": "等待四槽初始化","active": "操作中","exi
 
 def build_args(argv=None):
     argv = list(argv or [])
+    settled_unload_trial = TRY_SETTLED_UNLOAD_NUMBERING or "--settled-unload-numbering" in argv
+    argv = [argument for argument in argv if argument != "--settled-unload-numbering"]
     run_regression_tests = REGRESSION_TESTS_ENABLED
     if "--no-regression-tests" in argv:
         argv = [argument for argument in argv if argument != "--no-regression-tests"]
@@ -123,6 +130,7 @@ def build_args(argv=None):
         "--reselect-roi" if ROI_RESELECT else "--no-reselect-roi",
         "--roi-select-frame",str(ROI_SELECT_FRAME)]
     args = base.parse_args(defaults + argv)
+    args.settled_unload_trial = settled_unload_trial
     args.run_regression_tests = run_regression_tests
     args.slot_roi = True
     args.group_completion_log_only = True
@@ -184,19 +192,21 @@ def prepare_context(args):
             hand_region = select_roi(args.source, S4_HAND_REGION_FILE, ROI_SELECT_FRAME, purpose="s4_hand")
         else:
             hand_region = load_roi(S4_HAND_REGION_FILE, (w, h))
-    make_sequence(polygon,(w,h),hand_region)  # 提前验证配置。
+    make_sequence(polygon,(w,h),hand_region,args=args)  # 提前验证配置。
     return {"polygon": polygon,"size": (w,h),"start_frame": start_frame,
             "s4_hand_region": hand_region,
             "roi_file": str(Path(args.roi_file or base.DEFAULT_SLOT_ROI_FILE).resolve())}
 
 
-def make_tracker(hand_region=None):
+def make_tracker(hand_region=None, *, unload_entry_numbering_seconds=None, machine_center=None):
     return SlotGroupTracker(group_id=CURRENT_GROUP_ID,phase=PROCESS_PHASE,
         clockwise=CLOCKWISE_ORDER,match_distance_ratio=MATCH_DISTANCE_RATIO,confirm_seconds=CONFIRM_SECONDS,
         minimum_frames=MIN_CONFIRM_FRAMES,lost_seconds=IDENTITY_LOST_SECONDS,
         conflict_margin=CONFLICT_CONF_MARGIN,hand_overlap=HAND_OVERLAP_RATIO,
         initialization_seconds=INITIALIZATION_SECONDS,initialization_frames=MIN_INITIALIZATION_FRAMES,
         geometry_initialization_seconds=INITIAL_GROUP_STABLE_SECONDS,
+        unload_entry_numbering_seconds=unload_entry_numbering_seconds,
+        machine_center=machine_center,
         initialization_history_seconds=INITIALIZATION_HISTORY_SECONDS,
         load_hand_contact_enabled=LOAD_HAND_CONTACT_ENABLED,
         load_hand_contact_seconds=LOAD_HAND_CONTACT_SECONDS,
@@ -211,9 +221,17 @@ def make_tracker(hand_region=None):
         allow_three_point_initialization=THREE_POINT_GROUP_INITIALIZATION)
 
 
-def make_sequence(polygon,size,hand_region=None):
+def make_sequence(polygon,size,hand_region=None,*,args=None):
     region_px = None if hand_region is None else pixel_polygon(hand_region, size)
-    return RoiGroupSequence(make_tracker(region_px),pixel_polygon(polygon,size),enabled=AUTO_GROUP_SWITCH,
+    numbering_seconds = None
+    if (PROCESS_PHASE == "unload" and AUTO_GROUP_SWITCH and EXIT_MIN_SLOTS == 1
+            and getattr(args, "settled_unload_trial", False)):
+        numbering_seconds = _TRIAL_UNLOAD_STABLE_SECONDS
+    machine_center = (None if MACHINE_CENTER_NORMALIZED is None else
+                      np.asarray(MACHINE_CENTER_NORMALIZED, dtype=float)*size)
+    tracker = make_tracker(region_px, unload_entry_numbering_seconds=numbering_seconds,
+                           machine_center=machine_center)
+    return RoiGroupSequence(tracker,pixel_polygon(polygon,size),enabled=AUTO_GROUP_SWITCH,
         buffer_px=ROI_TRACKING_MARGIN_PX,boundary_margin_px=EXIT_BOUNDARY_MARGIN_PX,
         exit_seconds=EXIT_CONFIRM_SECONDS,exit_min_slots=EXIT_MIN_SLOTS,
         partial_exit_slots=PARTIAL_EXIT_MIN_SLOTS,minimum_motion_ratio=EXIT_MIN_MOTION_RATIO,
@@ -574,7 +592,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
     audit_confidence = float(getattr(args, "audit_conf", AUDIT_CONFIDENCE))
     if not 0 < audit_confidence <= args.conf:
         raise ValueError("检测框审计置信度必须满足 0 < audit-conf <= conf")
-    sequence = make_sequence(polygon,context["size"],context.get("s4_hand_region"))
+    sequence = make_sequence(polygon,context["size"],context.get("s4_hand_region"),args=args)
     tracker = sequence.tracker
     inspection = HatchLoadingInspection(HatchHandleMonitor(HATCH_OPEN_POLYGON, HATCH_CLOSED_POLYGON,
         confirm_seconds=HATCH_CONFIRM_SECONDS, minimum_frames=HATCH_MIN_CONFIRM_FRAMES,
@@ -700,6 +718,11 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             "conf": thresholds.slot_state,"hand_conf": thresholds.hand,"match_distance": "same_as_slot_tracker"},
         "rotation_intervals": ROTATION_INTERVALS,"start_frame": index,"end_frame_exclusive": END_FRAME,
         "timestamp_method": "source_frame/source_fps","audio_included": False}
+    if tracker.unload_entry_numbering_seconds is not None:
+        summary["unload_next_group_numbering_stable_seconds"] = tracker.unload_entry_numbering_seconds
+    if tracker.machine_center is not None:
+        summary["machine_center_xy"] = tracker.machine_center.tolist()
+        summary["numbering_method"] = "nearest_machine_center_s4_with_geometric_fallback"
     try:
         if not cap.isOpened():
             raise RuntimeError("无法打开源视频")
@@ -1059,6 +1082,9 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     absolute=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
                 if DRAW_SLOT_ROI:
                     draw_roi(plotted,polygon)
+                if tracker.machine_center is not None:
+                    center = tuple(int(round(value)) for value in tracker.machine_center)
+                    cv2.drawMarker(plotted, center, (0, 255, 255), cv2.MARKER_CROSS, 16, 1)
                 overlay_status(plotted,snapshot,SHOW_SLOT_TEXT,
                                inspection.snapshot() if inspection is not None else None)
                 writer.write(plotted)

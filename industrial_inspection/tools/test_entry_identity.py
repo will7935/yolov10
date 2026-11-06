@@ -62,6 +62,49 @@ class EntryIdentityTests(unittest.TestCase):
         np.testing.assert_allclose(result['slots'][1]['center_xy'], points[1], atol=.01)
         np.testing.assert_allclose(result['slots'][2]['center_xy'], points[2], atol=.01)
 
+    def test_settled_unload_entry_keeps_the_same_slot_order_as_load(self):
+        points = np.array([[418.62, 195.73], [388.84, 230.07],
+                           [532.00, 238.99], [521.03, 283.46]])
+        for phase in ("unload", "load"):
+            with self.subTest(phase=phase):
+                tracker = SlotGroupTracker(group_id=5, phase=phase, initialization_seconds=.10,
+                    initialization_frames=2, minimum_frames=2, confirm_seconds=0,
+                    slot2_below_slot3=True, unload_entry_numbering_seconds=.20)
+                tracker.start_incremental_entry(40)
+                for frame in range(7):
+                    result = tracker.update(boxes(points), frame*.05)
+                self.assertEqual(result["slot_numbering_status"], "final")
+                np.testing.assert_allclose(tracker.points, points)
+
+    def test_machine_center_numbers_the_same_nearest_s4_in_both_phases(self):
+        points = np.array([[418.62, 195.73], [388.84, 230.07],
+                           [532.00, 238.99], [521.03, 283.46]])
+        detections = [dict(obj, track_id=i+1) for i, obj in enumerate(boxes(points))]
+        for phase in ("unload", "load"):
+            with self.subTest(phase=phase):
+                tracker = SlotGroupTracker(group_id=5, phase=phase, initialization_seconds=.10,
+                    initialization_frames=2, minimum_frames=2, confirm_seconds=0,
+                    slot2_below_slot3=True, unload_entry_numbering_seconds=.20, machine_center=(637, 266))
+                tracker.start_incremental_entry(40)
+                for frame in range(6):
+                    result = tracker.update(detections, frame*.05)
+                self.assertEqual(tracker.byte_track_ids, [2, 4, 1, 3])
+                self.assertEqual(result["initialization"]["machine_center_numbering"]["status"], "confirmed")
+
+    def test_nearly_equal_machine_distances_keep_legacy_numbering(self):
+        points = np.array([[418.62, 195.73], [388.84, 230.07],
+                           [532.00, 238.99], [521.03, 283.46]])
+        tracker = SlotGroupTracker(initialization_seconds=.10, initialization_frames=2,
+            minimum_frames=2, confirm_seconds=0, slot2_below_slot3=True,
+            machine_center=points[2:].mean(axis=0))
+        tracker.start_incremental_entry(40)
+        detections = [dict(obj, track_id=i+1) for i, obj in enumerate(boxes(points))]
+        for frame in range(6):
+            result = tracker.update(detections, frame*.05)
+        self.assertEqual(tracker.byte_track_ids, [1, 2, 3, 4])
+        self.assertEqual(result["initialization"]["machine_center_numbering"]["status"],
+                         "insufficient_distance_evidence")
+
     def test_live_entry_tracks_keep_early_events_until_late_numbering(self):
         tracker = SlotGroupTracker(group_id=1, phase='load', confirm_seconds=.1,
             minimum_frames=2, initialization_seconds=.3, initialization_frames=2,

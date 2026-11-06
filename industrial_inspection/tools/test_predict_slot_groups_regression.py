@@ -24,6 +24,8 @@ class RegressionDispatchTests(TestCase):
             source.write_bytes(b"video")
             roi.write_text("{}", encoding="utf-8")
             seen = []
+            primary = self.args(root)
+            primary.settled_unload_trial = True
 
             def prepare(args):
                 seen.append(("prepare", args.source, args.roi_file, args.ui,
@@ -32,6 +34,7 @@ class RegressionDispatchTests(TestCase):
                         "s4_hand_region": None}
 
             def run_once(args, **kwargs):
+                self.assertTrue(args.settled_unload_trial)
                 seen.append(("run", args.source, args.output_dir, args.ui,
                              args.show, kwargs.get("on_frame")))
                 return {"status": "end_of_stream", "output_dir": str(args.output_dir),
@@ -44,7 +47,7 @@ class RegressionDispatchTests(TestCase):
                  patch.object(prediction, "prepare_context", prepare), \
                  patch.object(prediction, "_run_prediction_once", run_once):
                 results = prediction._run_regression_tests(
-                    self.args(root), {"status": "end_of_stream"})
+                    primary, {"status": "end_of_stream"})
 
             self.assertEqual(results[0]["status"], "end_of_stream")
             self.assertEqual(seen[0][0], "prepare")
@@ -131,8 +134,29 @@ class RegressionDispatchTests(TestCase):
             args.stride, args.imgsz, args.device = 1, 640, "cpu"
             with patch.object(prediction.base, "parse_args", return_value=args) as parse_args:
                 self.assertTrue(prediction.build_args([]).run_regression_tests)
-                self.assertFalse(prediction.build_args(["--no-regression-tests"]).run_regression_tests)
+                trial = prediction.build_args(["--no-regression-tests", "--settled-unload-numbering"])
+                self.assertFalse(trial.run_regression_tests)
+                self.assertTrue(trial.settled_unload_trial)
                 self.assertNotIn("--no-regression-tests", parse_args.call_args.args[0])
+                self.assertNotIn("--settled-unload-numbering", parse_args.call_args.args[0])
+
+    def test_settled_numbering_trial_applies_to_regression_as_well_as_primary(self):
+        polygon = ((.1, .1), (.9, .1), (.9, .9), (.1, .9))
+        cases = (
+            ("camera_B_20260924_021033.avi", True, True, .20),
+            ("camera_B_20260923_143845.avi", True, True, .20),
+            ("camera_B_20260924_013432.avi", True, False, .20),
+            ("camera_B_20260924_015247.avi", True, False, .20),
+            ("new_video.avi", False, False, None),
+            ("new_video.avi", True, False, .20),
+        )
+        with patch.multiple(prediction, PROCESS_PHASE="unload", AUTO_GROUP_SWITCH=True, EXIT_MIN_SLOTS=1):
+            for name, trial, regression, expected in cases:
+                with self.subTest(name=name, trial=trial, regression=regression):
+                    args = SimpleNamespace(source=Path(name), settled_unload_trial=trial,
+                                           regression_run=regression)
+                    sequence = prediction.make_sequence(polygon, (640, 480), args=args)
+                    self.assertEqual(sequence.tracker.unload_entry_numbering_seconds, expected)
 
 
 if __name__ == "__main__":

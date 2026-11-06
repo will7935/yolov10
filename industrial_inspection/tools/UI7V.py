@@ -16,6 +16,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QObject
 from PyQt5.QtGui import QImage, QPixmap, QFont
 
+SYSTEM_TITLE = "晶圆研磨过程人员SOP智能检测系统"
+
 # ==========================================
 # 异步抓图器：负责清空缓冲区，只保留最新一帧
 # ==========================================
@@ -329,7 +331,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"初始化失败: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("智能晶圆外延工艺检测系统")
+        self.setWindowTitle(SYSTEM_TITLE)
         self.setStyleSheet("background-color: #ecf0f1;")
 
         central_widget = QWidget()
@@ -340,7 +342,7 @@ class MainWindow(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
 
-        title = QLabel("智能晶圆外延工艺检测系统")
+        title = QLabel(SYSTEM_TITLE)
         title.setStyleSheet("""
             font-size: 20px; font-weight: bold; color: #2c3e50;
             padding: 10px; background-color: #ecf0f1; margin-bottom: 20px;
