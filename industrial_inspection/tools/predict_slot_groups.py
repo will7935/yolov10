@@ -62,13 +62,17 @@ _TRIAL_UNLOAD_STABLE_SECONDS = .20
 # 每次完成主视频后，自动用同一套模型和分组逻辑处理这两个原始视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
-REGRESSION_TESTS_ENABLED = True
+REGRESSION_TESTS_ENABLED = False
 REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
 REGRESSION_TEST_VIDEOS = (
     ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
      REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033_slot_roi.json"),
     ("测试视频2", REGRESSION_DATASET_ROOT / "测试视频2" / "camera_B_20260923_143845.avi",
      REGRESSION_DATASET_ROOT / "测试视频2" / "camera_B_20260923_143845_slot_roi.json"),
+    ("测试视频3", REGRESSION_DATASET_ROOT / "测试视频3" / "camera_B_20260924_013432.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频4", REGRESSION_DATASET_ROOT / "测试视频4" / "camera_B_20260924_015247.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
 )
 REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
 

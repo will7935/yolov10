@@ -46,6 +46,15 @@ def box_iou(a, b):
     return area / max(union, 1e-9)
 
 
+def box_containment(a, b):
+    """Return the intersection as a fraction of the smaller box area."""
+    area = max(0, min(a[2], b[2])-max(a[0], b[0])) * max(
+        0, min(a[3], b[3])-max(a[1], b[1]))
+    area_a = max(0, a[2]-a[0])*max(0, a[3]-a[1])
+    area_b = max(0, b[2]-b[0])*max(0, b[3]-b[1])
+    return area / max(min(area_a, area_b), 1e-9)
+
+
 def valid_slot_geometry(points):
     """四槽应形成有面积的凸四边形，不能用同槽偏移框凑出第四点。"""
     hull = cv2.convexHull(np.asarray(points, dtype=np.float32)).reshape(-1, 2)
@@ -1239,17 +1248,45 @@ class SlotGroupTracker:
 
     def _candidates(self, objects):
         candidates = []
-        # 高度重合候选先合并位置；分数接近的空满冲突仍保留为unknown，不按高分强判。
+        # 高度重合或包含候选先合并位置；分数接近的空满冲突仍保留为unknown，
+        # 不按高分强判。包含关系用于处理一个槽框包住另一个重复框时 IoU 偏低的情况。
         for obj in sorted((o for o in objects if o["class_name"] in SLOT_STATES),
                           key=lambda o: o["confidence"], reverse=True):
-            duplicate = next((c for c in candidates if box_iou(c["xyxy"], obj["xyxy"]) > .85), None)
+            duplicate = next((c for c in candidates if (
+                box_iou(c["xyxy"], obj["xyxy"]) > .85
+                or box_containment(c["xyxy"], obj["xyxy"]) >= .9)), None)
             if duplicate is not None:
                 if obj["class_name"] != duplicate["class_name"] and duplicate["confidence"]-obj["confidence"] < self.conflict_margin:
                     duplicate["conflict"] = True
+                elif obj["class_name"] == duplicate["class_name"]:
+                    # 已连续存在的轨迹优先于刚出现的重复框，避免小框抢走旧身份。
+                    duplicate_record = (self.track_store.tracks.get(duplicate.get("track_id"))
+                                         if self.track_store is not None else None)
+                    current_record = (self.track_store.tracks.get(obj.get("track_id"))
+                                      if self.track_store is not None else None)
+                    duplicate_key = self._duplicate_track_priority(duplicate, duplicate_record)
+                    current_key = self._duplicate_track_priority(obj, current_record)
+                    if current_key > duplicate_key:
+                        index = next(index for index, candidate in enumerate(candidates)
+                                     if candidate is duplicate)
+                        a = obj["xyxy"]
+                        candidates[index] = {**obj,
+                            "center": [(a[0]+a[2])/2, (a[1]+a[3])/2],
+                            "conflict": False}
                 continue
             a = obj["xyxy"]
             candidates.append({**obj, "center": [(a[0]+a[2])/2, (a[1]+a[3])/2], "conflict": False})
         return candidates
+
+    def _duplicate_track_priority(self, obj, record):
+        """Rank overlapping same-class boxes by identity continuity first."""
+        if record is None:
+            return (0, 0, 0., float(obj.get("confidence", 0.)))
+        owner = record.get("owner")
+        active_owner = int(owner == (self.phase, self.group_id))
+        reliable_count = int(record.get("reliable_count") or 0)
+        first_seen = float(record.get("first_seen") or 0.)
+        return (active_owner, reliable_count, -first_seen, float(obj.get("confidence", 0.)))
 
     def _occluded(self, obj, hands):
         a = obj["xyxy"]

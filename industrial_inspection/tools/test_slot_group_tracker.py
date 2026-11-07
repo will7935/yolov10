@@ -5,6 +5,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 
@@ -979,6 +980,23 @@ class AutomaticInitializationTests(unittest.TestCase):
         result=t.update(objects,.1)
         self.assertEqual(result['initialization']['eligible_slot_count'],4)
         self.assertIsNotNone(t.points)
+
+    def test_contained_same_class_duplicate_keeps_existing_track(self):
+        t=self.make_auto(group_id=2)
+        t.track_store=SimpleNamespace(tracks={
+            291: {'owner': ('unload', 2), 'reliable_count': 20, 'first_seen': 1.0},
+            312: {'owner': None, 'reliable_count': 1, 'first_seen': 2.0},
+        })
+        objects=[detection(i) for i in range(1,5)]
+        objects[0].update(track_id=291, confidence=.62)
+        objects.append({"class_name":"wafer_slot_empty", "class_id":3,
+                        "confidence":.63, "track_id":312,
+                        "xyxy":[85,85,115,115]})
+        candidates=t._candidates(objects)
+        self.assertEqual(len(candidates),4)
+        candidate_ids = [candidate.get("track_id") for candidate in candidates]
+        self.assertIn(291, candidate_ids)
+        self.assertNotIn(312, candidate_ids)
 
     def test_roi_buffer_cannot_supply_fourth_initial_slot(self):
         t=self.make_auto()
