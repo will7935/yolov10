@@ -35,6 +35,9 @@ SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频6\camera_B_20260924_024
 # I:\youyan\test_dataset\测试视频4\camera_B_20260924_015247.avi
 # I:\youyan\test_dataset\测试视频5\camera_B_20260924_022902.avi
 # I:\youyan\test_dataset\测试视频6\camera_B_20260924_024720.avi
+# I:\youyan\test_dataset\测试视频7\camera_B_20260924_052446.avi
+# I:\youyan\test_dataset\测试视频8\camera_B_20260924_054543.avi
+# I:\youyan\test_dataset\测试视频9\camera_B_20260924_060103.avi
 MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp4.2\weights\best.pt")
 
 # 每次在此目录内新建“视频名_时间”文件夹，可重复运行而不覆盖结果。

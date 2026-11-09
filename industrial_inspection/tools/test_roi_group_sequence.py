@@ -113,6 +113,27 @@ class GroupSequenceTests(unittest.TestCase):
         for _ in range(3): result=self.step(s,boxes())
         self.assertEqual(result['group_status'],'active')
 
+    def test_unconfirmed_initial_g1_candidate_is_discarded_after_leaving_roi(self):
+        t=SlotGroupTracker(None, group_id=1, phase='unload',
+                           require_unload_event_before_numbering=True,
+                           confirm_seconds=0, minimum_frames=1,
+                           initialization_seconds=.1, initialization_frames=2)
+        s=RoiGroupSequence(t, ROI, exit_min_slots=1, partial_exit_slots=1,
+                           require_first_unload_event_for_g1=True)
+        initial=[{**obj, 'track_id': 500+i}
+                 for i,obj in enumerate(boxes(filled=(0,1,2,3)))]
+        s.update(initial, 0.)
+        s.update(initial, .1)
+        s.update(initial, .2)
+        moved=[{**obj, 'track_id': 500+i} for i,obj in enumerate(
+            boxes(POINTS + np.array([-160.,0.]), filled=(0,1,2,3)))]
+        result=s.update(moved, .3)
+        self.assertEqual(result['group_status'], 'initializing')
+        self.assertEqual(s.closed_groups, [])
+        self.assertTrue(any(event['type'] == 'group_candidate_discarded'
+                            for event in result['new_group_events']))
+        self.assertIsNone(s.tracker.points)
+
     def test_disappearance_does_not_count_as_exit(self):
         s=self.make()
         self.baseline(s)

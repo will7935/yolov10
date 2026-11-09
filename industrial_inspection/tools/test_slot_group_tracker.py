@@ -130,6 +130,26 @@ class TrackingTests(unittest.TestCase):
         mapped={slot["slot_id"]:slot["byte_track_id"] for slot in result["slots"]}
         self.assertEqual(mapped,{1:201,2:203,3:202,4:204})
 
+    def test_initial_g1_waits_for_confirmed_unload_before_formal_numbering(self):
+        t=SlotGroupTracker(None, group_id=1, phase="unload",
+                           require_unload_event_before_numbering=True,
+                           confirm_seconds=0, minimum_frames=1,
+                           initialization_seconds=.1, initialization_frames=2)
+        filled=[detection(i, "filled", track_id=300+i) for i in range(1,5)]
+        for now in (0., .1, .2):
+            result=t.update(filled, now)
+        self.assertIsNone(t.points)
+        self.assertEqual(result["slot_numbering_status"], "provisional")
+        self.assertEqual(result["initialization"]["reason"],
+                         "waiting_for_first_unload_event")
+
+        emptied=[detection(i, "empty", track_id=300+i) if i == 1
+                 else detection(i, "filled", track_id=300+i) for i in range(1,5)]
+        result=t.update(emptied, .3)
+        self.assertIsNotNone(t.points)
+        self.assertEqual(result["slot_numbering_status"], "final")
+        self.assertEqual(result["new_events"][0]["action"], "unload")
+
     def test_baseline_does_not_create_events(self):
         t=tracker()
         objects=[detection(i,"filled") for i in range(1,5)]

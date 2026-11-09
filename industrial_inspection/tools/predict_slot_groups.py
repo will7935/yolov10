@@ -59,10 +59,10 @@ POINT_RADIUS = base.POINT_RADIUS
 TRY_SETTLED_UNLOAD_NUMBERING = True
 _TRIAL_UNLOAD_STABLE_SECONDS = .20
 
-# 每次完成主视频后，自动用同一套模型和分组逻辑处理这两个原始视频。
+# 每次完成主视频后，自动用同一套模型和分组逻辑处理五个原始回归视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
-REGRESSION_TESTS_ENABLED = False
+REGRESSION_TESTS_ENABLED = True
 REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
 REGRESSION_TEST_VIDEOS = (
     ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
@@ -73,8 +73,11 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频4", REGRESSION_DATASET_ROOT / "测试视频4" / "camera_B_20260924_015247.avi",
      base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频5", REGRESSION_DATASET_ROOT / "测试视频5" / "camera_B_20260924_022902.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
 )
 REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
+REGRESSION_WRITE_VIDEO = False  # 回归默认只保存流程数据；--with-video可显式打开
 
 # 算法参数统一在 slot_process_config.py 修改；显式导入保留旧脚本的配置名称。
 from industrial_inspection.tools.slot_process_config import (
@@ -89,11 +92,13 @@ from industrial_inspection.tools.slot_process_config import (
     EXIT_BOUNDARY_MARGIN_PX, EXIT_MIN_SLOTS, PARTIAL_EXIT_MIN_SLOTS,
     EXIT_MIN_MOTION_RATIO, MOTION_PAUSE_RATIO, NEXT_GROUP_STABLE_SECONDS,
     NEXT_GROUP_STABILITY_RATIO, NEXT_GROUP_MATCH_DISTANCE_PX, NEXT_GROUP_ENTRY_FRACTION,
-    REJECT_TRANSITION_ROI_DETECTIONS, TRANSITION_QUARANTINE_MIN_FRAMES, SLOT2_BELOW_SLOT3, EXIT_DIRECTION,
+    REJECT_TRANSITION_ROI_DETECTIONS, TRANSITION_QUARANTINE_MIN_FRAMES,
+    OUTSIDE_MAPPING_QUARANTINE_SECONDS, SLOT2_BELOW_SLOT3, EXIT_DIRECTION,
     MACHINE_CENTER_NORMALIZED,
     START_FRAME, END_FRAME, INITIALIZATION_SECONDS,
     MIN_INITIALIZATION_FRAMES, INITIAL_GROUP_STABLE_SECONDS, INITIALIZATION_HISTORY_SECONDS,
-    THREE_POINT_GROUP_INITIALIZATION, MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
+    THREE_POINT_GROUP_INITIALIZATION, REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1,
+    MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
     MIN_CONFIRM_FRAMES, IDENTITY_LOST_SECONDS, CONFLICT_CONF_MARGIN,
     HAND_OVERLAP_RATIO, LOAD_HAND_CONTACT_ENABLED, LOAD_HAND_CONTACT_SECONDS,
     LOAD_HAND_CONTACT_MIN_FRAMES, LOAD_HAND_CONTACT_OVERLAP_RATIO, LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
@@ -125,6 +130,10 @@ def build_args(argv=None):
     if "--no-regression-tests" in argv:
         argv = [argument for argument in argv if argument != "--no-regression-tests"]
         run_regression_tests = False
+    write_video_output = True
+    if "--no-video" in argv:
+        argv = [argument for argument in argv if argument != "--no-video"]
+        write_video_output = False
     defaults = ["--source",str(SOURCE_VIDEO),"--weights",str(MODEL_WEIGHTS),
         "--conf",str(CONFIDENCE),"--audit-conf",str(AUDIT_CONFIDENCE),
         "--imgsz",str(IMAGE_SIZE),"--device",str(DEVICE),
@@ -135,6 +144,7 @@ def build_args(argv=None):
         "--roi-select-frame",str(ROI_SELECT_FRAME)]
     args = base.parse_args(defaults + argv)
     args.settled_unload_trial = settled_unload_trial
+    args.write_video_output = write_video_output
     args.run_regression_tests = run_regression_tests
     args.slot_roi = True
     args.group_completion_log_only = True
@@ -245,6 +255,8 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
         entry_birth_fraction=NEXT_GROUP_ENTRY_FRACTION,
         reject_transition_roi_detections=REJECT_TRANSITION_ROI_DETECTIONS,
         transition_quarantine_min_frames=TRANSITION_QUARANTINE_MIN_FRAMES,
+        outside_mapping_quarantine_seconds=OUTSIDE_MAPPING_QUARANTINE_SECONDS,
+        require_first_unload_event_for_g1=REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1,
         reidentification_enabled=REIDENTIFICATION_ENABLED,
         reidentification_max_gap_seconds=REIDENTIFICATION_MAX_GAP_SECONDS,
         reidentification_max_distance_px=REIDENTIFICATION_MAX_DISTANCE_PX)
@@ -613,7 +625,10 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
     inspection_processed = 0
     started = time.perf_counter()
     summary = {"source": str(args.source.resolve()),"weights": str(args.weights.resolve()),
-        "output_dir": str(output.resolve()),"output_video": str((output/"annotated.mp4").resolve()),
+        "output_dir": str(output.resolve()),
+        "output_video": (str((output/"annotated.mp4").resolve())
+                         if getattr(args, "write_video_output", True) else None),
+        "video_output_enabled": bool(getattr(args, "write_video_output", True)),
         "architecture": architecture,"conf": args.conf,"audit_conf": audit_confidence,
         "effective_detection_thresholds": thresholds.snapshot(),
         "algorithm_configuration": snapshot_algorithm_config(globals()),
@@ -647,6 +662,18 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "group_id": CURRENT_GROUP_ID,"group_count": 5,"phase": PROCESS_PHASE,"clockwise_order": CLOCKWISE_ORDER,
         "event_ordering": "time_upper", "equal_time_upper_policy": "uncertain",
         "auto_load_after_unload": sequence.auto_load_after_unload,
+        "g1_initial_unload_gate": {
+            "enabled": REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1,
+            "rule": "wait_for_confirmed_unload_event_before_formal_numbering",
+            "discard_if_candidate_leaves_roi": True,
+        },
+        "outside_mapping_quarantine": {
+            "seconds": OUTSIDE_MAPPING_QUARANTINE_SECONDS,
+            "scope": "unbound_ids_outside_roi_after_group_mapping",
+            "lifetime": "until_current_group_closes",
+            "reset_on": "group_change",
+            "formal_slot_ids_remain_eligible_for_exit": True,
+        },
         "transition_roi_quarantine": {
             "enabled": REJECT_TRANSITION_ROI_DETECTIONS,
             "record_scope": "all_roi_slot_track_ids_during_group",
@@ -821,7 +848,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                 if (source_frame-context["start_frame"]) % args.stride:
                     continue
                 h,w = frame.shape[:2]
-                if writer is None:
+                if getattr(args, "write_video_output", True) and writer is None:
                     writer = cv2.VideoWriter(str(output/"annotated.mp4"),cv2.VideoWriter_fourcc(*"mp4v"),fps/args.stride,(w,h))
                     if not writer.isOpened():
                         raise RuntimeError("无法创建输出MP4")
@@ -1065,33 +1092,37 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     row["s4_contact_diagnostic"] = (json.dumps(snapshot.get("s4_contact_diagnostic"),
                         ensure_ascii=False) if slot.get("slot_id") == 4 else None)
                     rows.writerow(row)
-                plotted = frame.copy()
-                if SHOW_ALL_DETECTION_BOXES:
-                    draw_all_detection_boxes(plotted, tracked_raw, snapshot, sequence)
-                else:
-                    others = [o for o in raw if o["class_name"] not in SLOT_STATES
-                              and o["confidence"] >= thresholds.display]
-                    plotted = draw_detection_points(frame, others, radius=POINT_RADIUS)
-                    if slot_track_detections:
-                        # Retired IDs remain in the raw track log for diagnosis,
-                        # but must not visually occupy a slot in the current group.
-                        display_slots = [item for item in slot_track_detections
-                                         if item["tracking_confidence"] >= thresholds.display
-                                         and not sequence.is_retired_track(item.get('track_id'))]
-                        draw_slot_tracks(plotted, display_slots, snapshot, sequence.contour)
-                draw_predicted_slot_boxes(plotted,
-                    [slot for slot in snapshot.get("slots", []) if slot.get("position_is_prediction")],
-                    sequence.contour,
-                    label_prefix="S" if snapshot.get("slot_numbering_status") == "final" else None,
-                    absolute=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
-                if DRAW_SLOT_ROI:
-                    draw_roi(plotted,polygon)
-                if tracker.machine_center is not None:
-                    center = tuple(int(round(value)) for value in tracker.machine_center)
-                    cv2.drawMarker(plotted, center, (0, 255, 255), cv2.MARKER_CROSS, 16, 1)
-                overlay_status(plotted,snapshot,SHOW_SLOT_TEXT,
-                               inspection.snapshot() if inspection is not None else None)
-                writer.write(plotted)
+                render_frame = (getattr(args, "write_video_output", True)
+                                or args.show or on_frame is not None)
+                plotted = frame.copy() if render_frame else None
+                if render_frame:
+                    if SHOW_ALL_DETECTION_BOXES:
+                        draw_all_detection_boxes(plotted, tracked_raw, snapshot, sequence)
+                    else:
+                        others = [o for o in raw if o["class_name"] not in SLOT_STATES
+                                  and o["confidence"] >= thresholds.display]
+                        plotted = draw_detection_points(frame, others, radius=POINT_RADIUS)
+                        if slot_track_detections:
+                            # Retired IDs remain in the raw track log for diagnosis,
+                            # but must not visually occupy a slot in the current group.
+                            display_slots = [item for item in slot_track_detections
+                                             if item["tracking_confidence"] >= thresholds.display
+                                             and not sequence.is_retired_track(item.get('track_id'))]
+                            draw_slot_tracks(plotted, display_slots, snapshot, sequence.contour)
+                    draw_predicted_slot_boxes(plotted,
+                        [slot for slot in snapshot.get("slots", []) if slot.get("position_is_prediction")],
+                        sequence.contour,
+                        label_prefix="S" if snapshot.get("slot_numbering_status") == "final" else None,
+                        absolute=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
+                    if DRAW_SLOT_ROI:
+                        draw_roi(plotted,polygon)
+                    if tracker.machine_center is not None:
+                        center = tuple(int(round(value)) for value in tracker.machine_center)
+                        cv2.drawMarker(plotted, center, (0, 255, 255), cv2.MARKER_CROSS, 16, 1)
+                    overlay_status(plotted,snapshot,SHOW_SLOT_TEXT,
+                                   inspection.snapshot() if inspection is not None else None)
+                    if getattr(args, "write_video_output", True):
+                        writer.write(plotted)
                 processed += 1
                 if snapshot["slot_numbering_status"] == "provisional":
                     text = "；".join(
@@ -1261,6 +1292,8 @@ def _run_regression_tests(primary_args, primary_summary, *, on_log=None, should_
         regression_args.slot_roi = True
         regression_args.group_completion_log_only = True
         regression_args.regression_run = True
+        regression_args.write_video_output = bool(
+            getattr(primary_args, "regression_write_video", REGRESSION_WRITE_VIDEO))
         log(f"回归验证 {name}：开始处理 {source.name}")
         try:
             if S4_HAND_REGION_ENABLED and not S4_HAND_REGION_FILE.is_file():
@@ -1300,6 +1333,44 @@ def run_prediction(args, *, on_frame=None, on_log=None, should_stop=None, roi_po
     (primary_output / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
+
+
+def run_regression_suite(extra_args=None, *, on_log=None, should_stop=None,
+                         write_video=False):
+    """Run all configured raw videos without first processing a primary video.
+
+    This is the reusable project-level entry point for regression checks.  Each
+    video still gets its own ROI and output directory through
+    ``_run_regression_tests``; a compact index is written beside those outputs.
+    """
+    argv = ["--no-ui", "--no-show", "--no-regression-tests"]
+    if not write_video:
+        argv.append("--no-video")
+    if extra_args:
+        argv.extend(list(extra_args))
+    args = build_args(argv)
+    args.regression_write_video = bool(write_video)
+    report_dir = REGRESSION_OUTPUT_ROOT / (
+        f"regression_suite_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+    report_dir.mkdir(parents=True, exist_ok=False)
+    primary_summary = {"status": "regression_only", "output_dir": str(report_dir)}
+    results = _run_regression_tests(args, primary_summary, on_log=on_log,
+                                    should_stop=should_stop)
+    failed = [record for record in results if record.get("status") == "failed"]
+    skipped = [record for record in results if record.get("status") == "skipped"]
+    completed = [record for record in results
+                 if record.get("status") not in {"failed", "skipped"}]
+    report = {"status": "failed" if failed else "completed",
+              "suite_output_dir": str(report_dir.resolve()),
+              "video_count": len(results),
+              "completed_count": len(completed),
+              "failed_count": len(failed),
+              "skipped_count": len(skipped),
+              "results": results}
+    report_path = report_dir / "regression_suite_report.json"
+    report["report_path"] = str(report_path.resolve())
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
 
 
 def main():

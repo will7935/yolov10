@@ -217,7 +217,8 @@ class SlotGroupTracker:
                   load_hand_contact_competing_ratio=2.0,
                  slot2_below_slot3=False,
                  allow_three_point_initialization=None, s4_hand_region=None,
-                 unload_entry_numbering_seconds=None, machine_center=None):
+                 unload_entry_numbering_seconds=None, machine_center=None,
+                 require_unload_event_before_numbering=False):
         if group_count != 5 or not 1 <= group_id <= group_count:
             raise ValueError("当前流程固定五组，group_id 必须在1..5之间")
         if phase not in ("load", "unload") or sorted(clockwise) != [1, 2, 3, 4]:
@@ -282,6 +283,10 @@ class SlotGroupTracker:
         self.geometry_initialization_seconds = (initialization_seconds if
             geometry_initialization_seconds is None else geometry_initialization_seconds)
         self.unload_entry_numbering_seconds = unload_entry_numbering_seconds
+        # G1下料候选在确认首个真实下料事件前只保留为暂定轨迹，
+        # 不把这段过渡位置发布成正式S1-S4。后续组仍按原有停稳规则编号。
+        self.require_unload_event_before_numbering = bool(
+            require_unload_event_before_numbering)
         self.machine_center = None if machine_center is None else np.asarray(machine_center, dtype=float)
         if self.machine_center is not None and (
                 self.machine_center.shape != (2,) or not np.isfinite(self.machine_center).all()):
@@ -325,6 +330,11 @@ class SlotGroupTracker:
         self._entry_revision = 0
         self._initial_seen = set()
         self._initial_points, self._initial_since, self._initial_count = None, None, 0
+        # When G1 waits for its first unload event, preserve the first stable
+        # pose/order.  The candidate may move before the event; numbering must
+        # still use the pose that was stable before that movement.
+        self._pending_numbering_points = None
+        self._pending_numbering_order = None
         self.initialization = {"status": "waiting" if centers is None else "ready",
             "method": "yolo_box_centers" if centers is None else "provided_centers",
             "reason": "waiting_for_four_detections" if centers is None else "provided_centers",
@@ -1075,7 +1085,9 @@ class SlotGroupTracker:
                       load_hand_contact_competing_ratio=self.load_hand_contact_competing_ratio,
                       s4_hand_region=self.s4_hand_region,
                       slot2_below_slot3=self.slot2_below_slot3,
-                      allow_three_point_initialization=self.allow_three_point_initialization)
+                      allow_three_point_initialization=self.allow_three_point_initialization,
+                      require_unload_event_before_numbering=(
+                          self.require_unload_event_before_numbering))
 
     def _reset_initialization(self, reason):
         """候选混组或轨迹中断时丢弃未归属的历史，不能接到另一组上。"""
@@ -1090,8 +1102,10 @@ class SlotGroupTracker:
         self._three_point_stable_count = 0
         self._initial_seen.clear()
         self._initial_points, self._initial_since, self._initial_count = None, None, 0
+        self._pending_numbering_points = self._pending_numbering_order = None
         self.initialization.update(status="waiting", reason=reason, stable_frames=0,
             provisional_started_at=None, initial_centers_xy=None,
+            numbering_reference_centers_xy=None,
             geometry_seen_slot_ids=[], geometry_seen_track_ids=[], inferred_slot_ids=[], required_slot_count=4,
             buffered_event_count=0)
 
@@ -1155,7 +1169,9 @@ class SlotGroupTracker:
                  load_hand_contact_competing_margin=self.load_hand_contact_competing_margin,
                  load_hand_contact_competing_ratio=self.load_hand_contact_competing_ratio,
                 s4_hand_region=self.s4_hand_region,
-                allow_three_point_initialization=self.allow_three_point_initialization)
+                allow_three_point_initialization=self.allow_three_point_initialization,
+                require_unload_event_before_numbering=(
+                    self.require_unload_event_before_numbering))
             self._provisional._region_formal_numbering = False
             self._provisional.byte_track_ids = [raw_track_ids[int(i)] for i in order]
             self._provisional.track_store = self.track_store
@@ -1213,9 +1229,32 @@ class SlotGroupTracker:
                 or self._initial_since is None
                 or now-self._initial_since+1e-9 < self.geometry_initialization_seconds):
             return []
-        order = self._numbering_order(p.points) if self.slot2_below_slot3 else np.arange(4)
+        if (self.require_unload_event_before_numbering and self.group_id == 1
+                and self.phase == "unload"
+                and not any(event.get("action") == "unload"
+                            and event.get("expected_action", False)
+                            and event.get("confirmed_at") is not None
+                            for event in p.events)):
+            # 几何已经稳定，但这是尚未确认首个下料动作的G1候选。
+            # 继续调用候选跟踪器记录空满和事件，等动作证据出现后再一次性映射。
+            if self._pending_numbering_order is None:
+                stable_points = p.points.copy()
+                self._pending_numbering_points = stable_points
+                self._pending_numbering_order = np.asarray(
+                    self._numbering_order(stable_points), dtype=int)
+            self.initialization.update(reason="waiting_for_first_unload_event",
+                                       numbering_reference_centers_xy=(
+                                           self._pending_numbering_points.tolist()),
+                                       buffered_event_count=len(p.events))
+            return []
+        numbering_points = (self._pending_numbering_points
+                            if self._pending_numbering_points is not None else p.points)
+        order = (self._pending_numbering_order.copy()
+                 if self._pending_numbering_order is not None else
+                 (self._numbering_order(numbering_points)
+                  if self.slot2_below_slot3 else np.arange(4)))
         order = self._machine_numbering_order(
-            p.points, p.byte_track_ids, order, now, inferred=bool(self._provisional_inferred_slot_ids),
+            numbering_points, p.byte_track_ids, order, now, inferred=bool(self._provisional_inferred_slot_ids),
             slots=p.slots, events=p.events)
         self.points = p.points[order].copy()
         # 正式编号时以当帧位置建立参考，避免继承候选阶段的旧参考点。
@@ -1237,6 +1276,8 @@ class SlotGroupTracker:
         self._provisional = None
         self._provisional_inferred_slot_ids = set()
         self.initialization.update(status="ready", reason="initialized", initialized_at=float(now),
+            numbering_reference_centers_xy=(None if numbering_points is None
+                                             else numbering_points.tolist()),
             geometry_seen_slot_ids=sorted(mapping[i+1] for i in self._initial_seen),
             geometry_seen_track_ids=[self.byte_track_ids[mapping[i+1]-1] for i in sorted(self._initial_seen)
                                      if self.byte_track_ids[mapping[i+1]-1] is not None])

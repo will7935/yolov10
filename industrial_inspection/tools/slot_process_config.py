@@ -48,6 +48,7 @@ NEXT_GROUP_MATCH_DISTANCE_PX = 40 # 新点/旧组残留点逐帧匹配的最大�
 NEXT_GROUP_ENTRY_FRACTION = .6 # 沿EXIT_DIRECTION从入口到出口的前60%允许建立新轨迹
 REJECT_TRANSITION_ROI_DETECTIONS = True # 换组时隔离有稳定旧组证据的未绑定ID，并启用短时空间隔离
 TRANSITION_QUARANTINE_MIN_FRAMES = 5 # 未绑定ID在旧组ROI内累计真实出现至少此帧数，才持续隔离
+OUTSIDE_MAPPING_QUARANTINE_SECONDS = 3.0 # 新组映射后短时间内，ROI外新ID不参与当前组判断
 SLOT2_BELOW_SLOT3 = True      # 左上S1、顺时针1→3→4→2，y辅助核验S2通常在S3下方；编号后不重排
 MACHINE_CENTER_NORMALIZED = (637 / 640, 266 / 480) # 机心点选坐标；四槽证据充分时最近点为S4，None关闭
 EXIT_DIRECTION = (0, -1)     # 本视频已核实旧组从右下ROI向左上退出；None可恢复自动方向判断
@@ -60,6 +61,8 @@ MIN_INITIALIZATION_FRAMES = 2 # 同时满足最少帧数；编号后不再按x�
 INITIAL_GROUP_STABLE_SECONDS = .3  # G1正式建立S号前的独立几何稳定时间
 INITIALIZATION_HISTORY_SECONDS = 5.0 # 基线及可靠临时轨迹有效期；未获多帧支持的点按IDENTITY_LOST_SECONDS清理
 THREE_POINT_GROUP_INITIALIZATION = True  # 三个真实槽位可推算缺失S4后建立组几何
+# G1下料在首个可信下料事件前只作为候选；若候选先离开ROI则自动释放，不占用G1。
+REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1 = True
 
 
 # 槽位关联、空满状态确认

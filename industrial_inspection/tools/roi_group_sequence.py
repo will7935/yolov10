@@ -27,7 +27,9 @@ class RoiGroupSequence:
                  auto_load_after_unload=False, entry_birth_fraction=.6,
                  reidentification_enabled=False, reidentification_max_gap_seconds=15.0,
                  reidentification_max_distance_px=40.0,
-                 reject_transition_roi_detections=True, transition_quarantine_min_frames=4):
+                 reject_transition_roi_detections=True, transition_quarantine_min_frames=4,
+                 require_first_unload_event_for_g1=False,
+                 outside_mapping_quarantine_seconds=3.0):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
@@ -56,6 +58,11 @@ class RoiGroupSequence:
         self.entry_birth_fraction = float(entry_birth_fraction)
         self.reject_transition_roi_detections = bool(reject_transition_roi_detections)
         self.transition_quarantine_min_frames = int(transition_quarantine_min_frames)
+        self.require_first_unload_event_for_g1 = bool(require_first_unload_event_for_g1)
+        if (not np.isfinite(outside_mapping_quarantine_seconds)
+                or outside_mapping_quarantine_seconds < 0):
+            raise ValueError("映射后ROI外框隔离时间必须是非负有限秒数")
+        self.outside_mapping_quarantine_seconds = float(outside_mapping_quarantine_seconds)
         self._entry_rejected = []
         self._entry_revision = 0
         self.configured_direction = None
@@ -116,6 +123,16 @@ class RoiGroupSequence:
         self._transition_quarantine_track_ids = set()
         self._transition_quarantine_centers = []
         self._transition_quarantine_until = None
+        self.mapping_time = None
+        self._g1_waiting_event = bool(
+            self.require_first_unload_event_for_g1
+            and tracker.phase == "unload" and tracker.group_id == 1)
+        self._g1_pending_events = []
+        # IDs observed outside the ROI during the short handoff window are
+        # permanently rejected for this group.  The set is group-scoped and
+        # is cleared when the next group is armed.
+        self._outside_mapping_quarantine_track_ids = set()
+        self._outside_mapping_quarantine_group = (tracker.phase, tracker.group_id)
 
     def _distance(self, point):
         return cv2.pointPolygonTest(self.contour,tuple(float(v) for v in point),True)
@@ -209,6 +226,45 @@ class RoiGroupSequence:
         if obj.get('track_id') is not None:
             self._track_rejections[int(obj['track_id'])] = reason
 
+    def _record_outside_mapping_quarantine(self, objects, now):
+        """Remember unbound ROI-outside IDs seen during this group's handoff."""
+        if (self.mapping_time is None
+                or self._outside_mapping_quarantine_group !=
+                   (self.tracker.phase, self.tracker.group_id)
+                or self.outside_mapping_quarantine_seconds <= 0):
+            return
+        elapsed = float(now) - self.mapping_time
+        if elapsed < 0 or elapsed >= self.outside_mapping_quarantine_seconds:
+            return
+        formal_ids = {int(track_id) for track_id in self.tracker.byte_track_ids
+                      if track_id is not None}
+        for obj in objects:
+            if obj.get('class_name') not in SLOT_STATES:
+                continue
+            track_id = obj.get('track_id')
+            if track_id is None or int(track_id) in formal_ids:
+                continue
+            box = obj.get('xyxy')
+            if box is None:
+                continue
+            center = np.array([(box[0]+box[2])/2, (box[1]+box[3])/2], dtype=float)
+            if self._distance(center) < 0:
+                self._outside_mapping_quarantine_track_ids.add(int(track_id))
+
+    def _exclude_outside_mapping_quarantine(self, objects):
+        """Reject IDs blacklisted for the current group at every later frame."""
+        if not self._outside_mapping_quarantine_track_ids:
+            return objects
+        result = []
+        for obj in objects:
+            track_id = obj.get('track_id')
+            if (obj.get('class_name') in SLOT_STATES and track_id is not None
+                    and int(track_id) in self._outside_mapping_quarantine_track_ids):
+                self._reject_track(obj, 'outside_mapping_quarantine')
+                continue
+            result.append(obj)
+        return result
+
     def _record_group_roi_tracks(self, objects, now):
         """记录本组ROI真实出现帧数和最后位置；每个ID每帧最多计一次。"""
         if self.state == "sequence_complete":
@@ -236,6 +292,127 @@ class RoiGroupSequence:
             if inside:
                 record['inside_frames'] += 1
                 record['last_inside'] = float(now)
+
+    def _initial_g1_waiting_for_unload(self):
+        """Return whether the initial G1 candidate is still unconfirmed.
+
+        The slot tracker keeps a provisional geometry and buffers its state
+        evidence.  Until an expected unload event exists, that geometry is
+        not allowed to occupy G1 as a formal group.
+        """
+        tracker = self.tracker
+        events = list(getattr(tracker, "events", []))
+        if tracker._provisional is not None:
+            events.extend(tracker._provisional.events)
+        return bool(self._g1_waiting_event
+                    and not any(event.get("action") == "unload"
+                                and event.get("expected_action", False)
+                                and event.get("confirmed_at") is not None
+                                for event in events))
+
+    def _release_initial_g1_event_gate(self, result):
+        """Publish buffered evidence once the first unload event is confirmed."""
+        if not self._g1_waiting_event:
+            return result
+        events = list(getattr(self.tracker, "events", []))
+        if self.tracker._provisional is not None:
+            events.extend(self.tracker._provisional.events)
+        if not any(event.get("action") == "unload"
+                   and event.get("expected_action", False)
+                   and event.get("confirmed_at") is not None
+                   for event in events):
+            return result
+        self._g1_waiting_event = False
+        buffered = self._g1_pending_events
+        self._g1_pending_events = []
+        result["new_events"] = buffered + list(result.get("new_events", []))
+        return result
+
+    def _mask_initial_g1_result(self, result):
+        """Hide formal S numbers while G1 is waiting for its first unload."""
+        if not self._initial_g1_waiting_for_unload():
+            return result
+        result["slot_numbering_status"] = "provisional"
+        result["identity_status"] = "waiting_first_unload_event"
+        result["group_assignment"] = "configured"
+        result["confirmed_event_sequence"] = []
+        result["initialization"] = dict(result.get("initialization", {}),
+                                          reason="waiting_for_first_unload_event")
+        for slot in result.get("slots", []):
+            slot["slot_id"] = None
+            slot["formal_slot_id"] = None
+        return result
+
+    def _discard_unconfirmed_initial_g1(self, now, objects=None):
+        """Drop an unconfirmed G1 candidate after it actually leaves the ROI."""
+        if not self._initial_g1_waiting_for_unload():
+            return False
+        identity = (self.tracker.phase, self.tracker.group_id)
+        history = self._group_roi_tracks.get(identity, {})
+        outside = any(not record.get("inside_roi", True)
+                      and record.get("center") is not None
+                      and self._distance(record["center"]) < -self.margin
+                      for record in history.values())
+        # If ByteTrack changed the ID on the exit frame, the history key alone
+        # is insufficient.  Accept only a frame that is both outside and close
+        # to a known provisional/formal point, so an unrelated outside object
+        # cannot discard G1.
+        if not outside and objects is not None:
+            provisional = getattr(self.tracker, "_provisional", None)
+            known_ids = set(self.tracker.byte_track_ids)
+            reference = self.tracker.reference_points
+            if provisional is not None:
+                known_ids.update(provisional.byte_track_ids)
+                reference = provisional.reference_points
+            reference = None if reference is None else np.asarray(reference, dtype=float)
+            for obj in objects:
+                if obj.get("class_name") not in SLOT_STATES:
+                    continue
+                box = obj.get("xyxy")
+                if box is None:
+                    continue
+                center = np.array([(box[0]+box[2])/2, (box[1]+box[3])/2], dtype=float)
+                if self._distance(center) >= -self.margin:
+                    continue
+                near_known_point = (reference is not None and len(reference)
+                                    and np.min(np.linalg.norm(reference-center, axis=1))
+                                    <= self.entry_match_distance_px)
+                if obj.get("track_id") in known_ids or near_known_point:
+                    outside = True
+                    break
+        if not outside:
+            return False
+
+        # The provisional IDs have never been bound to a formal group, but
+        # release defensively in case an external caller bound one meanwhile.
+        provisional = getattr(self.tracker, "_provisional", None)
+        for track_id in getattr(provisional, "byte_track_ids", []):
+            if track_id is not None:
+                self.track_store.release_candidate(track_id, identity)
+        self._group_roi_tracks.pop(identity, None)
+        self.tracker.reset_group(1, phase="unload")
+        self.tracker.track_store = self.track_store
+        self.state = "initializing"
+        self.pending_tracker = None
+        self.anchor = self.anchor_distance = self.anchor_points = self.anchor_spacing = None
+        self.inside_seen.clear()
+        self.crossed.clear()
+        self.visible_history.clear()
+        self.center_history.clear()
+        self.direction = self.exit_since = self.return_since = None
+        self._entry_count = 0
+        self._g1_pending_events = []
+        self.mapping_time = None
+        self._outside_mapping_quarantine_track_ids.clear()
+        self._outside_mapping_quarantine_group = identity
+        self._group_events.append({
+            "type": "group_candidate_discarded",
+            "group_id": 1,
+            "phase": "unload",
+            "at": float(now),
+            "reason": "initial_g1_left_roi_without_confirmed_unload",
+        })
+        return True
 
     def _arm_transition_quarantine(self, objects, now):
         """按旧组稳定证据隔离未绑定ID，并保留换组瞬间的短时空间隔离。"""
@@ -294,6 +471,11 @@ class RoiGroupSequence:
 
     def _sync_track_bindings(self, result, now=None):
         tracker = self.tracker
+        # A pre-event G1 candidate must not occupy the shared store as a
+        # formal group; otherwise a later candidate could be rejected as an
+        # old G1 track even though this candidate is about to be discarded.
+        if self._initial_g1_waiting_for_unload():
+            return
         identity = (tracker.phase, tracker.group_id)
         slots = result.get('slots', [])
         for slot in slots:
@@ -363,6 +545,11 @@ class RoiGroupSequence:
 
     def _arm(self, now):
         self.state = "active"
+        identity = (self.tracker.phase, self.tracker.group_id)
+        if self._outside_mapping_quarantine_group != identity:
+            self._outside_mapping_quarantine_track_ids.clear()
+            self._outside_mapping_quarantine_group = identity
+        self.mapping_time = float(now)
         self.anchor = self.tracker.reference_points.mean(axis=0).copy()
         self.anchor_distance = self._distance(self.anchor)
         self.anchor_points = self.tracker.points.copy()
@@ -376,12 +563,18 @@ class RoiGroupSequence:
         self._entry_count = 0
         self._motion_support = []
 
-    def _active_objects(self, objects):
+    def _active_objects(self, objects, now):
         """ROI外只接受能关联到当前已编号槽的候选，其他外部槽不参与。"""
+        objects = self._exclude_outside_mapping_quarantine(objects)
         result = []
         reference = self.tracker.reference_points
         gate = None if reference is None else (self.tracker._point_tracking_gate
             or self.tracker._spacing()*self.tracker.match_distance_ratio)
+        formal_ids = {int(track_id) for track_id in self.tracker.byte_track_ids
+                      if track_id is not None}
+        quarantine_active = (self.mapping_time is not None
+                             and self.outside_mapping_quarantine_seconds > 0
+                             and now - self.mapping_time < self.outside_mapping_quarantine_seconds)
         for obj in objects:
             if obj["class_name"] not in SLOT_STATES:
                 result.append(obj)
@@ -389,6 +582,10 @@ class RoiGroupSequence:
             a = obj["xyxy"]
             center = np.array([(a[0]+a[2])/2,(a[1]+a[3])/2])
             distance = self._distance(center)
+            if (quarantine_active and distance < 0 and obj.get('track_id') is not None
+                    and int(obj['track_id']) not in formal_ids):
+                self._reject_track(obj, 'outside_mapping_quarantine')
+                continue
             if distance >= 0 or (reference is not None and distance >= -self.buffer_px
                     and ((obj.get('track_id') is not None and obj.get('track_id') in self.tracker.byte_track_ids)
                          or np.min(np.linalg.norm(reference-center,axis=1)) <= gate)):
@@ -573,6 +770,8 @@ class RoiGroupSequence:
         else:
             self.state = "waiting_next"
             self.pending_tracker = self._new_tracker(self.tracker.group_id+1,entry=True)
+        # 旧组已关闭，永久隔离集合只对该组有效；下一组重新建立自己的集合。
+        self._outside_mapping_quarantine_track_ids.clear()
 
     def _refresh_closed_load(self, tracker, now):
         record = next(g for g in self.closed_groups
@@ -846,22 +1045,29 @@ class RoiGroupSequence:
         self._observations_enabled = observations_enabled
         self._hands = [o for o in objects if o["class_name"] == "hand"]
         self._record_group_roi_tracks(objects, now)
-        self.track_store.observe(objects, now, observations_enabled,
-            reentry_allowed=lambda center: self._distance(center) >= self.margin and (
-                self._entry_progress(center) is None
-                or self._entry_progress(center) <= self.entry_birth_fraction))
+        self._record_outside_mapping_quarantine(objects, now)
         result = None
-        if self.state == "entering":
-            result = self._update_immediate_entry(objects, now, observations_enabled)
-        elif self.state in ("waiting_next","stabilizing_next"):
-            result = self._update_entry(objects,now,observations_enabled)
-        elif self.state == "sequence_complete":
-            self._exclude_departing(objects, now)
+        discarded_initial_candidate = self._discard_unconfirmed_initial_g1(now, objects)
+        if discarded_initial_candidate:
+            # Do not feed the just-discarded outside frame back into the new
+            # G1 candidate.  The next frame starts a clean initialization.
+            result = {**self.tracker.snapshot(), "new_events": []}
         else:
+            self.track_store.observe(objects, now, observations_enabled,
+                reentry_allowed=lambda center: self._distance(center) >= self.margin and (
+                    self._entry_progress(center) is None
+                    or self._entry_progress(center) <= self.entry_birth_fraction))
+        if not discarded_initial_candidate and self.state == "entering":
+            result = self._update_immediate_entry(objects, now, observations_enabled)
+        elif not discarded_initial_candidate and self.state in ("waiting_next","stabilizing_next"):
+            result = self._update_entry(objects,now,observations_enabled)
+        elif not discarded_initial_candidate and self.state == "sequence_complete":
+            self._exclude_departing(objects, now)
+        elif not discarded_initial_candidate:
             # 已归属旧组或具有稳定旧组证据的ID不能回流到当前槽号跟踪；
             # 先让旧组尾部逻辑观察，再从当前组候选中移除。
             active = self._active_objects(self._exclude_transition_quarantine(
-                self._exclude_departing(objects, now), now))
+                self._exclude_departing(objects, now), now), now)
             initial = [o for o in active if o["class_name"] not in SLOT_STATES or self._distance(
                 ((o["xyxy"][0]+o["xyxy"][2])/2,(o["xyxy"][1]+o["xyxy"][3])/2)) >= 0]
             result = self.tracker.update(active,now,observations_enabled=observations_enabled,
@@ -883,6 +1089,17 @@ class RoiGroupSequence:
                     result["new_events"] = closing_events + result["new_events"]
         if result is None:
             result = {**self.tracker.snapshot(),"new_events": []}
+        g1_waiting_before_release = self._g1_waiting_event
+        result = self._release_initial_g1_event_gate(result)
+        if (g1_waiting_before_release and not self._g1_waiting_event
+                and self.tracker.group_id == 1 and self.tracker.phase == 'unload'):
+            # G1的内部几何可能先于首个事件进入active；事件确认时重新起算隔离窗口。
+            self._outside_mapping_quarantine_track_ids.clear()
+            self.mapping_time = float(now)
+        if self._initial_g1_waiting_for_unload():
+            self._g1_pending_events.extend(deepcopy(result.get("new_events", [])))
+            result["new_events"] = []
+            result = self._mask_initial_g1_result(result)
         self._sync_track_bindings(result, now)
         result["new_events"] = list(result.get("new_events", [])) + deepcopy(self._deferred_new_events)
         self.all_events.extend(deepcopy(result["new_events"]))
@@ -927,6 +1144,12 @@ class RoiGroupSequence:
                         (self.tracker.phase, self.tracker.group_id), {}).items()},
                 "transition_quarantine_track_ids": sorted(self._transition_quarantine_track_ids),
                 "transition_quarantine_until": self._transition_quarantine_until,
+                "mapping_time": self.mapping_time,
+                "outside_mapping_quarantine_seconds": self.outside_mapping_quarantine_seconds,
+                "outside_mapping_quarantine_until": (None if self.mapping_time is None else
+                    self.mapping_time + self.outside_mapping_quarantine_seconds),
+                "outside_mapping_quarantine_track_ids": sorted(
+                    self._outside_mapping_quarantine_track_ids),
                 "departing_untrackable_slot_ids": [index + 1 for index in
                     sorted(self.departing_untrackable_indices)],
                 "pending_initialization": deepcopy(self.pending_tracker.initialization)
