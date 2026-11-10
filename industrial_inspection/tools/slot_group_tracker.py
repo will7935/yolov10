@@ -152,6 +152,11 @@ class SlotState:
     load_contact_released_at: float | None = None
     load_contact_unknown_since: float | None = None
     load_contact_unknown_count: int = 0
+    # 空满检测短时中断的审计状态。消失本身不构成操作证据；只有后续
+    # 重新看到目标状态并完成确认时，才使用保存的最早状态证据修正事件时间。
+    missing_since: float | None = None
+    empty_evidence_since: float | None = None
+    empty_evidence_last_seen: float | None = None
 
     def observe(self, state, now, confidence, reason, confirm_seconds, minimum_frames,
                 contact_evidence=None):
@@ -335,6 +340,13 @@ class SlotGroupTracker:
         # still use the pose that was stable before that movement.
         self._pending_numbering_points = None
         self._pending_numbering_order = None
+        # 临时四槽集合的短时漏检恢复状态。正式映射前若某个点暂时消失，
+        # 不立即把新出现的无关ID当成该槽；先保留原槽的最后真实中心，
+        # 在有限窗口内尝试原位换ID恢复。
+        self._provisional_missing_since = {}
+        self._provisional_last_real_centers = {}
+        self._provisional_quarantined_track_ids = set()
+        self._provisional_reidentification_events = []
         self.initialization = {"status": "waiting" if centers is None else "ready",
             "method": "yolo_box_centers" if centers is None else "provided_centers",
             "reason": "waiting_for_four_detections" if centers is None else "provided_centers",
@@ -345,7 +357,9 @@ class SlotGroupTracker:
             "inferred_slot_ids": [],
             "buffered_event_count": 0,
             "three_point_stable_frames": 0,
-            "three_point_stable_since": None}
+            "three_point_stable_since": None,
+            "provisional_quarantined_track_ids": [],
+            "provisional_reidentification_events": []}
 
     def start_incremental_entry(self, match_distance):
         """新组逐点进入；下料阶段三点可推算第四点，几何停稳后映射槽号。"""
@@ -1103,15 +1117,142 @@ class SlotGroupTracker:
         self._initial_seen.clear()
         self._initial_points, self._initial_since, self._initial_count = None, None, 0
         self._pending_numbering_points = self._pending_numbering_order = None
+        self._provisional_missing_since.clear()
+        self._provisional_last_real_centers.clear()
+        self._provisional_quarantined_track_ids.clear()
+        self._provisional_reidentification_events.clear()
         self.initialization.update(status="waiting", reason=reason, stable_frames=0,
             provisional_started_at=None, initial_centers_xy=None,
             numbering_reference_centers_xy=None,
             geometry_seen_slot_ids=[], geometry_seen_track_ids=[], inferred_slot_ids=[], required_slot_count=4,
-            buffered_event_count=0)
+            buffered_event_count=0,
+            provisional_quarantined_track_ids=[],
+            provisional_reidentification_events=[])
+
+    def _provisional_recovery_limits(self, provisional):
+        """Return the bounded pre-numbering ID recovery window and distance gate."""
+        spacing = provisional._spacing() if provisional.points is not None else 0.0
+        # Keep this window short enough that a genuinely new carrier can still
+        # replace a lost point, while covering the observed BT124 -> BT202 gap.
+        window = min(max(float(self.lost_seconds), 1.0), 1.2)
+        distance = max(40.0, float(spacing) * self.match_distance_ratio)
+        return window, distance
+
+    def _reconcile_provisional_candidates(self, provisional, candidates, now, hands):
+        """Keep a stable provisional slot alive across a short ByteTrack ID gap.
+
+        The old implementation reset the whole provisional group whenever a
+        new unmatched box appeared.  That allowed an unrelated previous-group
+        box to replace a temporarily missing slot.  Here unmatched boxes are
+        quarantined first; a new ID can claim a missing slot only when it is
+        close to that slot's last real center, or after the recovery window has
+        expired.
+        """
+        if not candidates:
+            matches = {}
+        else:
+            matches = provisional._associate(
+                candidates, provisional._spacing() * provisional.match_distance_ratio)
+        row_count = len(provisional.points)
+        window, recovery_gate = self._provisional_recovery_limits(provisional)
+        last_real = self._provisional_last_real_centers
+        missing_since = self._provisional_missing_since
+        for row in range(row_count):
+            if row not in last_real:
+                last_real[row] = np.asarray(provisional.points[row], dtype=float).copy()
+
+        missing_rows = {row for row in range(row_count) if row not in matches}
+        for row in missing_rows:
+            missing_since.setdefault(row, float(now))
+        for row in list(missing_since):
+            if row in matches:
+                missing_since.pop(row, None)
+
+        unmatched_cols = set(range(len(candidates))) - set(matches.values())
+
+        # First try to recover a disappeared slot from its last *real*
+        # detection.  This is deliberately independent of the predicted point
+        # that the provisional tracker may use for display.
+        recovery_pairs = []
+        for row in sorted(missing_rows):
+            center = last_real[row]
+            for col in unmatched_cols:
+                distance = float(np.linalg.norm(
+                    np.asarray(candidates[col]["center"], dtype=float) - center))
+                if distance <= recovery_gate:
+                    recovery_pairs.append((distance, row, col))
+        used_rows, used_cols = set(), set()
+        for distance, row, col in sorted(recovery_pairs):
+            if row in used_rows or col in used_cols:
+                continue
+            matches[row] = col
+            used_rows.add(row)
+            used_cols.add(col)
+            old_id = provisional.byte_track_ids[row]
+            new_id = candidates[col].get("track_id")
+            if old_id is not None and new_id is not None and int(old_id) != int(new_id):
+                self._provisional_reidentification_events.append({
+                    "slot_index": int(row),
+                    "from_track_id": int(old_id),
+                    "to_track_id": int(new_id),
+                    "gap_seconds": round(float(now - missing_since.get(row, now)), 6),
+                    "distance_px": round(distance, 3),
+                    "at": float(now),
+                    "method": "provisional_last_real_center",
+                })
+            missing_since.pop(row, None)
+            self._provisional_quarantined_track_ids.discard(
+                None if new_id is None else int(new_id))
+
+        unmatched_cols -= used_cols
+        missing_rows = {row for row in range(row_count) if row not in matches}
+
+        # A replacement is allowed only after the old slot's recovery window
+        # has elapsed.  Before that, every unrelated ID is isolated for this
+        # provisional group and cannot affect geometry or slot state.
+        ignored_cols = set()
+        for col in sorted(unmatched_cols):
+            candidate = candidates[col]
+            center = np.asarray(candidate["center"], dtype=float)
+            replacement = []
+            for row in missing_rows:
+                if now - missing_since.get(row, now) < window:
+                    continue
+                revised = np.asarray(provisional.points, dtype=float).copy()
+                revised[row] = center
+                if valid_slot_geometry(revised):
+                    replacement.append((float(np.linalg.norm(center-last_real[row])), row))
+            if replacement:
+                _, row = min(replacement)
+                matches[row] = col
+                missing_rows.remove(row)
+                missing_since.pop(row, None)
+                self._provisional_quarantined_track_ids.discard(
+                    None if candidate.get("track_id") is None else int(candidate["track_id"]))
+                continue
+            ignored_cols.add(col)
+            track_id = candidate.get("track_id")
+            if track_id is not None:
+                self._provisional_quarantined_track_ids.add(int(track_id))
+
+        for col in matches.values():
+            track_id = candidates[col].get("track_id")
+            if track_id is not None:
+                self._provisional_quarantined_track_ids.discard(int(track_id))
+
+        # If three or more established slots remain matched, an ignored extra
+        # box is not a geometry discontinuity.  The caller may keep the
+        # provisional group alive and wait for the missing slot to recover.
+        reliable_rows = [row for row, col in matches.items()
+                         if not candidates[col].get("conflict")
+                         and not self._occluded(candidates[col], hands)]
+        protected = bool(missing_rows and reliable_rows and
+                         len(reliable_rows) >= max(3, row_count-1))
+        return matches, ignored_cols, missing_rows, protected, window
 
     def _initialize(self, candidates, hands, now, enabled, roi_contour, objects):
         """先建立候选轨迹并逐槽记录状态；身份确认后一次性发布缓存事件。"""
-        if enabled and len(candidates) > 4:
+        if enabled and len(candidates) > 4 and self._provisional is None:
             selected = self._select_track_geometry(candidates, hands, now)
             if selected is not None:
                 candidates = selected
@@ -1119,16 +1260,30 @@ class SlotGroupTracker:
                 objects = [o for o in objects if o['class_name'] not in SLOT_STATES
                            or o.get('track_id') in selected_ids]
         self.initialization["eligible_slot_count"] = len(candidates)
-        if len(candidates) > 4:
+        if len(candidates) > 4 and self._provisional is None:
             self._reset_initialization("too_many_slot_detections")
             return []
+        ignored_candidate_cols = set()
+        provisional_missing_rows = set()
+        provisional_recovery_window = None
+        provisional_matches_ready = False
         if self._provisional is not None:
             p = self._provisional
-            matches = p._associate(candidates, p._spacing()*p.match_distance_ratio)
-            unmatched_visible = any(col not in matches.values() and not self._occluded(obj,hands)
-                                    for col,obj in enumerate(candidates))
-            if now-p.last_geometry_time > self.lost_seconds or unmatched_visible:
+            matches, ignored_candidate_cols, provisional_missing_rows, protected, \
+                provisional_recovery_window = self._reconcile_provisional_candidates(
+                    p, candidates, now, hands)
+            stale = (p.last_geometry_time is not None
+                     and now-p.last_geometry_time > self.lost_seconds)
+            # A stable three-slot support protects the provisional group while
+            # the fourth point is inside its short ID-recovery window.  Extra
+            # unmatched IDs are isolated instead of resetting the group.
+            if stale and not protected:
                 self._reset_initialization("initialization_track_discontinuity")
+                ignored_candidate_cols = set()
+                provisional_missing_rows = set()
+                provisional_recovery_window = None
+            else:
+                provisional_matches_ready = True
         if self._provisional is None:
             inferred_missing = None
             if len(candidates) == 3 and self.allow_three_point_initialization:
@@ -1175,6 +1330,12 @@ class SlotGroupTracker:
             self._provisional._region_formal_numbering = False
             self._provisional.byte_track_ids = [raw_track_ids[int(i)] for i in order]
             self._provisional.track_store = self.track_store
+            self._provisional_missing_since.clear()
+            self._provisional_last_real_centers = {
+                int(i): np.asarray(point, dtype=float).copy()
+                for i, point in enumerate(points)}
+            self._provisional_quarantined_track_ids.clear()
+            self._provisional_reidentification_events.clear()
             self._provisional_inferred_slot_ids = set() if missing_index is None else {missing_index}
             if missing_index is not None:
                 self._predicted_indices.add(missing_index)
@@ -1192,13 +1353,32 @@ class SlotGroupTracker:
                 slot.confirmed, slot.evidence_time = "unknown", None
                 slot.confirmed_since, slot.confirmed_at = None, None
                 slot.confirmation_source = None
-        matches = p._associate(candidates, p._spacing()*p.match_distance_ratio)
+        if not provisional_matches_ready:
+            matches = p._associate(candidates, p._spacing()*p.match_distance_ratio)
+            ignored_candidate_cols = set()
+            provisional_missing_rows = {
+                row for row in range(len(p.points)) if row not in matches}
+        else:
+            # The reconciliation above already assigned recovered IDs and
+            # marked unrelated visible boxes for this provisional frame.
+            matches = dict(matches)
+        p._remember_track_ids(matches, candidates, p.byte_track_ids)
+        for row, col in matches.items():
+            self._provisional_last_real_centers[row] = np.asarray(
+                candidates[col]["center"], dtype=float).copy()
+            self._provisional_missing_since.pop(row, None)
         self._observe_machine_s4([candidates[col] for col in matches.values()], now, enabled)
         reliable = {i: candidates[col] for i,col in matches.items()
                     if not self._occluded(candidates[col], hands)}
         self._provisional_inferred_slot_ids.difference_update(reliable)
         self._predicted_indices.update(self._provisional_inferred_slot_ids)
-        p.update([o for o in objects if o["class_name"] in SLOT_STATES]+hands,
+        accepted_ids = {candidates[col].get("track_id") for col in matches.values()}
+        accepted_ids.discard(None)
+        provisional_objects = [o for o in objects
+                               if o["class_name"] not in SLOT_STATES
+                               or o.get("track_id") in accepted_ids
+                               or o.get("track_id") is None]
+        p.update(provisional_objects,
                  now, observations_enabled=enabled, roi_contour=roi_contour)
         # 空满冲突只影响该槽状态，不影响已匹配框的几何身份。
         if enabled:
@@ -1221,10 +1401,20 @@ class SlotGroupTracker:
             geometry_seen_slot_ids=[],
             geometry_seen_track_ids=[p.byte_track_ids[i] for i in sorted(self._initial_seen)
                                      if p.byte_track_ids[i] is not None],
-            buffered_event_count=len(p.events))
+            buffered_event_count=len(p.events),
+            provisional_quarantined_track_ids=sorted(self._provisional_quarantined_track_ids),
+            provisional_reidentification_events=list(self._provisional_reidentification_events))
         required_seen = 3 if self._provisional_inferred_slot_ids else 4
         self.initialization["required_slot_count"] = required_seen
         self.initialization["inferred_slot_ids"] = sorted(i+1 for i in self._provisional_inferred_slot_ids)
+        provisional_missing_rows = {row for row in range(len(p.points)) if row not in matches}
+        recovery_pending = bool(provisional_recovery_window is not None and any(
+            now-self._provisional_missing_since.get(row, now) < provisional_recovery_window
+            for row in provisional_missing_rows))
+        if recovery_pending:
+            self.initialization.update(reason="waiting_for_provisional_id_recovery",
+                                       stable_frames=self._initial_count)
+            return []
         if (len(self._initial_seen) < required_seen or self._initial_count < self.initialization_frames
                 or self._initial_since is None
                 or now-self._initial_since+1e-9 < self.geometry_initialization_seconds):
@@ -1280,7 +1470,9 @@ class SlotGroupTracker:
                                              else numbering_points.tolist()),
             geometry_seen_slot_ids=sorted(mapping[i+1] for i in self._initial_seen),
             geometry_seen_track_ids=[self.byte_track_ids[mapping[i+1]-1] for i in sorted(self._initial_seen)
-                                     if self.byte_track_ids[mapping[i+1]-1] is not None])
+                                     if self.byte_track_ids[mapping[i+1]-1] is not None],
+            provisional_quarantined_track_ids=sorted(self._provisional_quarantined_track_ids),
+            provisional_reidentification_events=list(self._provisional_reidentification_events))
         return list(self.events)
 
     def _spacing(self):
@@ -1509,7 +1701,15 @@ class SlotGroupTracker:
         self.transform_support_slot_ids = []
         self.transform_support_byte_track_ids = []
         self.transform_fit_error = None
-        candidates = self._candidates(objects)
+        candidate_objects = objects
+        if self.points is not None and self._provisional_quarantined_track_ids:
+            # IDs isolated while the provisional group was being established
+            # remain rejected for this group after formal numbering too.
+            candidate_objects = [o for o in objects if not (
+                o.get("class_name") in SLOT_STATES
+                and o.get("track_id") is not None
+                and int(o["track_id"]) in self._provisional_quarantined_track_ids)]
+        candidates = self._candidates(candidate_objects)
         hands = [o for o in objects if o["class_name"] == "hand"]
         if self.points is None:
             initial_objects = objects if initialization_objects is None else initialization_objects
@@ -1745,6 +1945,33 @@ class SlotGroupTracker:
             else:
                 state, reason = SLOT_STATES[obj["class_name"]], "detected"
         prior_confirmed = slot.confirmed
+        missing_since_before = slot.missing_since
+        # A missing detection is not itself an unload.  Keep the last
+        # confirmed baseline and remember the first empty observation so a
+        # later confirmed empty state can retain its earlier event time.
+        if state == "unknown":
+            if slot.confirmed in ("filled", "empty") and slot.missing_since is None:
+                slot.missing_since = float(now)
+            if (slot.empty_evidence_since is not None
+                    and slot.empty_evidence_last_seen is not None
+                    and now-slot.empty_evidence_last_seen > self.lost_seconds):
+                slot.empty_evidence_since = None
+                slot.empty_evidence_last_seen = None
+        elif state == "filled":
+            # The slot returned to its previous filled state; cancel any
+            # pending empty interpretation accumulated before the gap.
+            slot.missing_since = None
+            slot.empty_evidence_since = None
+            slot.empty_evidence_last_seen = None
+        elif state == "empty":
+            slot.missing_since = None
+            if self.phase == "unload" and prior_confirmed == "filled":
+                if slot.empty_evidence_since is None:
+                    slot.empty_evidence_since = float(now)
+                slot.empty_evidence_last_seen = float(now)
+            else:
+                slot.empty_evidence_since = None
+                slot.empty_evidence_last_seen = None
         if contact_evidence is not None:
             inferred_action = "load" if state == "filled" else "unload" if state == "empty" else None
             if inferred_action != self.phase:
@@ -1810,6 +2037,21 @@ class SlotGroupTracker:
             if pending_contact and not event.get("inferred", False):
                 event.update(reason="detected_after_hand_contact", inferred=False)
             self._clear_load_contact(slot)
+        if (event is not None and not event.get("inferred", False)
+                and event.get("action") == "unload"
+                and event.get("from") == "filled"
+                and slot.empty_evidence_since is not None):
+            # The first empty frame is the earliest visual evidence.  The
+            # later confirmation frame only validates it; using that later
+            # time would incorrectly place this unload after another slot.
+            evidence_since = float(slot.empty_evidence_since)
+            event["time_upper"] = min(float(event["time_upper"]), evidence_since)
+            event["empty_evidence_since"] = evidence_since
+            if missing_since_before is not None:
+                event["detection_gap_since"] = float(missing_since_before)
+            event["reason"] = "empty_after_detection_gap"
+            slot.empty_evidence_since = None
+            slot.empty_evidence_last_seen = None
         if event is not None:
             event.update(group_id=self.group_id, phase=self.phase,
                 byte_track_id=self._byte_track_id_at(slot.slot_id-1),
@@ -1895,7 +2137,10 @@ class SlotGroupTracker:
                 "load_contact_last_seen": s.load_contact_last_seen,
                 "load_contact_released_at": s.load_contact_released_at,
                 "load_contact_unknown_since": s.load_contact_unknown_since,
-                "load_contact_unknown_count": s.load_contact_unknown_count})
+                "load_contact_unknown_count": s.load_contact_unknown_count,
+                "missing_since": s.missing_since,
+                "empty_evidence_since": s.empty_evidence_since,
+                "empty_evidence_last_seen": s.empty_evidence_last_seen})
         return {"group_id": self.group_id, "group_assignment": "configured",
                 "slot_numbering_status": "provisional" if self.points is None else "final",
                 "phase": self.phase, "identity_status": "waiting_initialization" if self.points is None else ("lost" if self.identity_lost else "tracking"),

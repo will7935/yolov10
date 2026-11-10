@@ -75,6 +75,8 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频5", REGRESSION_DATASET_ROOT / "测试视频5" / "camera_B_20260924_022902.avi",
      base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频6", REGRESSION_DATASET_ROOT / "测试视频6" / "camera_B_20260924_024720.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
 )
 REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
 REGRESSION_WRITE_VIDEO = False  # 回归默认只保存流程数据；--with-video可显式打开

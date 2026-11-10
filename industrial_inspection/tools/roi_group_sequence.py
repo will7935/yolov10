@@ -287,7 +287,26 @@ class RoiGroupSequence:
             inside = self._distance(center) >= 0
             if not inside and track_id not in history:
                 continue
-            record = history.setdefault(track_id, {'first_inside': float(now), 'inside_frames': 0})
+            record = history.setdefault(track_id, {
+                'first_inside': float(now),
+                'inside_frames': 0,
+                'inside_since': float(now) if inside else None,
+                'outside_since': None,
+                'previous_center': None,
+                'previous_seen': None,
+            })
+            previous_center = record.get('center')
+            previous_seen = record.get('last_seen')
+            if previous_center is not None:
+                record['previous_center'] = list(previous_center)
+                record['previous_seen'] = previous_seen
+            if inside:
+                if not record.get('inside_roi', False):
+                    record['inside_since'] = float(now)
+                record.setdefault('inside_since', float(now))
+                record['outside_since'] = None
+            elif record.get('outside_since') is None:
+                record['outside_since'] = float(now)
             record.update(last_seen=float(now), center=center, inside_roi=inside)
             if inside:
                 record['inside_frames'] += 1
@@ -349,15 +368,95 @@ class RoiGroupSequence:
             return False
         identity = (self.tracker.phase, self.tracker.group_id)
         history = self._group_roi_tracks.get(identity, {})
-        outside = any(not record.get("inside_roi", True)
-                      and record.get("center") is not None
-                      and self._distance(record["center"]) < -self.margin
-                      for record in history.values())
+        provisional = getattr(self.tracker, "_provisional", None)
+        provisional_ids = {int(track_id) for track_id in
+                           getattr(provisional, "byte_track_ids", [])
+                           if track_id is not None}
+        # Protect the candidate only while all four real provisional tracks
+        # have continuous in-ROI support and stable relative geometry.  Three
+        # visible tracks are insufficient: the fourth may be the stale point
+        # that later produces a delayed or incorrect S-slot mapping.
+        current_inside_ids = set()
+        current_centers = {}
+        if objects is not None:
+            for obj in objects:
+                if (obj.get("class_name") not in SLOT_STATES
+                        or obj.get("track_id") is None):
+                    continue
+                box = obj.get("xyxy")
+                if box is None:
+                    continue
+                center = [(box[0]+box[2])/2, (box[1]+box[3])/2]
+                if self._distance(center) >= 0:
+                    track_id = int(obj["track_id"])
+                    if track_id in provisional_ids:
+                        current_inside_ids.add(track_id)
+                        current_centers[track_id] = np.asarray(center, dtype=float)
+
+        stable_seconds = max(.2, float(getattr(
+            provisional, 'geometry_initialization_seconds', .3))) if provisional is not None else .3
+        stable_frames = max(3, int(getattr(provisional, 'initialization_frames', 3))) \
+            if provisional is not None else 3
+        outside_seconds = max(.25, min(.6, stable_seconds))
+        all_four_ids = (provisional is not None and len(provisional_ids) == 4
+                        and len(current_inside_ids) == 4)
+        all_four_stable = all_four_ids
+        if all_four_stable:
+            for track_id in provisional_ids:
+                record = history.get(track_id, {})
+                inside_since = record.get('inside_since')
+                if (record.get('inside_frames', 0) < stable_frames
+                        or inside_since is None
+                        or now - float(inside_since) + 1e-9 < stable_seconds):
+                    all_four_stable = False
+                    break
+
+        # Compare one frame of motion after removing the common group motion.
+        # A rigid translation of all four slots is not a reason to reset G1;
+        # one slot deviating from the other three is.
+        position_outlier = False
+        if all_four_stable:
+            deltas = []
+            for track_id in provisional_ids:
+                previous = history.get(track_id, {}).get('previous_center')
+                if previous is None:
+                    all_four_stable = False
+                    break
+                deltas.append(current_centers[track_id] - np.asarray(previous, dtype=float))
+            if all_four_stable:
+                deltas = np.asarray(deltas, dtype=float)
+                common_delta = np.median(deltas, axis=0)
+                residuals = np.linalg.norm(deltas - common_delta, axis=1)
+                try:
+                    spacing = float(provisional._spacing())
+                except (AttributeError, ValueError, TypeError):
+                    spacing = 0.0
+                position_threshold = max(12.0, spacing * .25)
+                stable_motion_count = int(np.count_nonzero(residuals <= position_threshold))
+                position_outlier = (stable_motion_count >= 3
+                                    and bool(np.any(residuals > position_threshold)))
+                if position_outlier:
+                    all_four_stable = False
+
+        protect_stable_candidate = bool(all_four_stable and not position_outlier)
+        # A bound track must remain outside continuously for a short interval
+        # before the candidate is released.  A one-frame boundary excursion
+        # remains recoverable by the provisional ID logic.
+        outside = (False if protect_stable_candidate else any(
+            int(track_id) in provisional_ids
+            and not record.get("inside_roi", True)
+            and record.get("center") is not None
+            and self._distance(record["center"]) < -self.margin
+            and record.get('outside_since') is not None
+            and now - float(record['outside_since']) + 1e-9 >= outside_seconds
+            for track_id, record in history.items()))
+        if position_outlier:
+            outside = True
         # If ByteTrack changed the ID on the exit frame, the history key alone
         # is insufficient.  Accept only a frame that is both outside and close
         # to a known provisional/formal point, so an unrelated outside object
         # cannot discard G1.
-        if not outside and objects is not None:
+        if not outside and objects is not None and not protect_stable_candidate:
             provisional = getattr(self.tracker, "_provisional", None)
             known_ids = set(self.tracker.byte_track_ids)
             reference = self.tracker.reference_points
@@ -1093,9 +1192,10 @@ class RoiGroupSequence:
         result = self._release_initial_g1_event_gate(result)
         if (g1_waiting_before_release and not self._g1_waiting_event
                 and self.tracker.group_id == 1 and self.tracker.phase == 'unload'):
-            # G1的内部几何可能先于首个事件进入active；事件确认时重新起算隔离窗口。
+            # 首个下料事件可能早于正式编号；只有正式映射后才启动ROI外ID隔离。
+            # 若几何已提前进入active，则从事件确认时重新起算窗口。
             self._outside_mapping_quarantine_track_ids.clear()
-            self.mapping_time = float(now)
+            self.mapping_time = float(now) if self.tracker.points is not None else None
         if self._initial_g1_waiting_for_unload():
             self._g1_pending_events.extend(deepcopy(result.get("new_events", [])))
             result["new_events"] = []
