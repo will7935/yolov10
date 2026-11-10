@@ -133,6 +133,7 @@ class RoiGroupSequence:
         # is cleared when the next group is armed.
         self._outside_mapping_quarantine_track_ids = set()
         self._outside_mapping_quarantine_group = (tracker.phase, tracker.group_id)
+        self._reused_id_candidates = {}
 
     def _distance(self, point):
         return cv2.pointPolygonTest(self.contour,tuple(float(v) for v in point),True)
@@ -589,6 +590,100 @@ class RoiGroupSequence:
                             reid_method=description.get('reid_method'))
         for obj in tracker.geometry_rejected:
             self._reject_track(obj, obj['reason'])
+
+    def _split_reused_track_ids(self, objects, now):
+        """Split a stale BT ID only after its old and new slot are unambiguous."""
+        tracker = self.tracker
+        if (not self.track_store.reidentification_enabled or self.state != 'active'
+                or tracker.points is None or tracker.reference_points is None):
+            self._reused_id_candidates.clear()
+            return
+        identity = (tracker.phase, tracker.group_id)
+        gate = min(self.track_store.reidentification_max_distance_px,
+                   tracker._spacing() * tracker.match_distance_ratio)
+        seen = set()
+        for obj in objects:
+            track_id = obj.get('track_id')
+            if obj.get('class_name') not in SLOT_STATES or track_id is None:
+                continue
+            track_id = int(track_id)
+            if track_id in seen:
+                continue
+            seen.add(track_id)
+            box = obj.get('xyxy')
+            record = self.track_store.tracks.get(track_id)
+            if box is None or record is None:
+                self._reused_id_candidates.pop(track_id, None)
+                continue
+            center = np.array([(box[0]+box[2])/2, (box[1]+box[3])/2], dtype=float)
+            candidate = self._reused_id_candidates.get(track_id)
+            if candidate is None:
+                old_slot = record.get('slot_id')
+                old_center = record.get('center')
+                if (record.get('owner') != identity or old_slot is None
+                        or old_center is None
+                        or now-float(record['last_seen']) <= tracker.lost_seconds
+                        or now-float(record['last_seen']) >
+                           self.track_store.reidentification_max_gap_seconds
+                        or self._distance(center) < 0
+                        or track_id in self._outside_mapping_quarantine_track_ids
+                        or track_id in self._transition_quarantine_track_ids):
+                    continue
+                old_slot = int(old_slot)
+                if not 1 <= old_slot <= len(tracker.slots):
+                    continue
+                replacement_id = tracker.byte_track_ids[old_slot-1]
+                source_slot = tracker.slots[old_slot-1]
+                source_seen = source_slot.last_seen
+                expected_state = 'empty' if tracker.phase == 'unload' else 'filled'
+                if (replacement_id is None or replacement_id == track_id
+                        or source_seen is None or now-source_seen > .25
+                        or source_slot.confirmed != expected_state
+                        or np.linalg.norm(center-np.asarray(old_center)) <= gate):
+                    continue
+                distances = np.linalg.norm(tracker.reference_points-center, axis=1)
+                order = np.argsort(distances)
+                target = int(order[0])
+                if (target == old_slot-1 or distances[target] > gate
+                        or distances[int(order[1])]-distances[target] < max(5., gate*.15)):
+                    continue
+                target_slot = tracker.slots[target]
+                target_seen = target_slot.last_seen
+                if (target_seen is not None and now-target_seen < .2):
+                    continue
+                if (target_slot.confirmed != ('filled' if tracker.phase == 'unload' else 'empty')
+                        or SLOT_STATES[obj['class_name']] != expected_state):
+                    continue
+                candidate = {'old_record': deepcopy(record), 'old_slot': old_slot,
+                             'target_slot': target+1, 'last_seen': float(now),
+                             'first_seen': float(now), 'count': 0}
+                self._reused_id_candidates[track_id] = candidate
+
+            target = candidate['target_slot']-1
+            old_slot = candidate['old_slot']-1
+            source_seen = tracker.slots[old_slot].last_seen
+            target_seen = tracker.slots[target].last_seen
+            expected_state = 'empty' if tracker.phase == 'unload' else 'filled'
+            if (now-candidate['last_seen'] > .25
+                    or self._distance(center) < 0
+                    or np.linalg.norm(tracker.reference_points[target]-center) > gate
+                    or tracker.byte_track_ids[old_slot] in (None, track_id)
+                    or source_seen is None or now-source_seen > .25
+                    or tracker.slots[old_slot].confirmed != expected_state
+                    or target_seen is not None and now-target_seen < .2
+                    or SLOT_STATES[obj['class_name']] != expected_state):
+                self._reused_id_candidates.pop(track_id, None)
+                continue
+            candidate['count'] += 1
+            candidate['last_seen'] = float(now)
+            if candidate['count'] >= 3:
+                self.track_store.split_reused_id(
+                    track_id, candidate['old_record'], candidate['target_slot'],
+                    now, candidate['first_seen'])
+                self._reused_id_candidates.pop(track_id, None)
+        for track_id in list(self._reused_id_candidates):
+            if track_id not in seen or now-self._reused_id_candidates[track_id]['last_seen'] > .25:
+                self._reused_id_candidates.pop(track_id, None)
 
     def _track_metadata(self, objects, result):
         records = self.track_store.visible_records(objects)
@@ -1152,6 +1247,8 @@ class RoiGroupSequence:
             # G1 candidate.  The next frame starts a clean initialization.
             result = {**self.tracker.snapshot(), "new_events": []}
         else:
+            if observations_enabled:
+                self._split_reused_track_ids(objects, now)
             self.track_store.observe(objects, now, observations_enabled,
                 reentry_allowed=lambda center: self._distance(center) >= self.margin and (
                     self._entry_progress(center) is None

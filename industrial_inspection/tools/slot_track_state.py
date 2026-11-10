@@ -24,6 +24,9 @@ class SlotTrackStateStore:
         self.reidentification_max_distance_px = float(reidentification_max_distance_px)
         self.aliases = {}
         self.reidentification_events = []
+        # ByteTrack may reuse a numeric ID after a gap.  Keep the old owned
+        # segment for audit when the new, spatially distinct segment is opened.
+        self.archived_segments = {}
         self._seen_this_frame = set()
 
     def __deepcopy__(self, memo):
@@ -55,7 +58,8 @@ class SlotTrackStateStore:
                               first_seen=float(now), last_seen=float(now),
                               last_inside=float(now), reliable_since=None, reliable_count=0,
                               logical_track_id=track_id, reidentified_from_track_id=None,
-                              reid_gap_seconds=None, reid_method=None)
+                              reid_gap_seconds=None, reid_method=None,
+                              segment_index=len(self.archived_segments.get(track_id, ())))
                 self.tracks[track_id] = record
             if now-record['last_seen'] > self.rules.lost_seconds and record['owner'] is None:
                 record['state'] = SlotState(0)
@@ -98,6 +102,28 @@ class SlotTrackStateStore:
     def owner(self, track_id):
         record = self.tracks.get(track_id)
         return None if record is None else record['owner']
+
+    def split_reused_id(self, track_id, old_record, target_slot, now, first_seen):
+        """Open a new segment for an ID reused at another physical slot."""
+        track_id = int(track_id)
+        archived = self.archived_segments.setdefault(track_id, [])
+        archived.append(deepcopy(old_record))
+        old_owner = old_record['owner']
+        self.aliases.pop(track_id, None)
+        self.tracks[track_id] = dict(
+            state=SlotState(0), previous=SlotState(0), events=[], imported=set(),
+            owner=None, slot_id=None, first_seen=float(now), last_seen=float(now),
+            last_inside=float(now), reliable_since=None, reliable_count=0,
+            logical_track_id=track_id, reidentified_from_track_id=None,
+            reid_gap_seconds=None, reid_method=None,
+            segment_index=len(archived))
+        self.reidentification_events.append({
+            'track_id': track_id, 'segment_index': len(archived),
+            'previous_group_id': old_owner[1], 'previous_phase': old_owner[0],
+            'previous_slot_id': old_record['slot_id'], 'slot_id': int(target_slot),
+            'gap_seconds': round(float(first_seen-old_record['last_seen']), 6),
+            'first_seen': float(first_seen),
+            'method': 'bytetrack_id_reused_after_gap', 'at': float(now)})
 
     def bind(self, track_id, identity, slot_id=None, *, center=None, now=None):
         record = self.tracks.get(track_id)
@@ -206,6 +232,7 @@ class SlotTrackStateStore:
             return None
         state, owner = record['state'], record['owner']
         return dict(byte_track_id=track_id,
+                    track_segment_index=record.get('segment_index', 0),
                     logical_track_id=record.get('logical_track_id', track_id),
                     reidentified_from_track_id=record.get('reidentified_from_track_id'),
                     reid_gap_seconds=record.get('reid_gap_seconds'),
