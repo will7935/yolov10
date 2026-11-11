@@ -327,6 +327,13 @@ class SlotGroupTracker:
         self._entry_geometry_at_seen = []
         self._entry_inferred_indices = set()
         self._entry_reference_points = None
+        # Once a provisional slot has accumulated enough valid S4 contact
+        # evidence, keep that *slot object* as S4 until the evidence is
+        # resolved.  The temporary point order can move while a new group is
+        # settling; locking by list index would therefore lose the evidence
+        # when the geometry is rebuilt.
+        self._entry_locked_s4_slot = None
+        self._entry_locked_s4_since = None
         # 三个真实点在创建虚拟S4前必须先连续停稳。
         self._three_point_stable_points = None
         self._three_point_stable_since = None
@@ -367,6 +374,8 @@ class SlotGroupTracker:
             raise ValueError("逐点进入必须在新跟踪器首次更新前启动，匹配距离须为正")
         self._entry_points, self._entry_gate = [], float(match_distance)
         self._entry_track_ids = []
+        self._entry_locked_s4_slot = None
+        self._entry_locked_s4_since = None
         self._point_tracking_gate = float(match_distance)
         self._three_point_stable_points = None
         self._three_point_stable_since = None
@@ -390,6 +399,19 @@ class SlotGroupTracker:
         """Return the temporary index that currently represents formal S4."""
         if self._entry_points is None or len(self._entry_points) < 4:
             return None
+        if self._entry_locked_s4_slot is not None:
+            # Use object identity rather than dataclass equality: two empty
+            # SlotState objects can otherwise compare equal during entry.
+            locked_index = next((index for index, slot in enumerate(self.slots)
+                                 if slot is self._entry_locked_s4_slot), None)
+            if locked_index is None or locked_index >= len(self._entry_points):
+                self._clear_entry_s4_lock("temporary_slot_removed")
+            elif not self._entry_locked_s4_slot.load_contact_pending:
+                # Visual confirmation or an explicit contact cancellation
+                # clears the pending evidence and releases the geometry lock.
+                self._clear_entry_s4_lock("contact_resolved")
+            else:
+                return locked_index
         if len(self._entry_inferred_indices) == 1:
             # 三点推算阶段明确把最右侧候选定义为S4；不要再次按环序把
             # 预测点改排到其它正式槽位。
@@ -397,6 +419,46 @@ class SlotGroupTracker:
         pose = (self._entry_reference_points if self._entry_reference_points is not None
                 and len(self._entry_reference_points) == 4 else np.asarray(self._entry_points))
         return int(self._numbering_order(pose)[3])
+
+    def _clear_entry_s4_lock(self, reason=None):
+        """Release the provisional S4 lock after evidence is resolved."""
+        self._entry_locked_s4_slot = None
+        self._entry_locked_s4_since = None
+
+    def _lock_entry_s4_slot(self, slot_index, now):
+        """Pin the SlotState that produced valid provisional S4 evidence."""
+        if self._entry_points is None or not 0 <= slot_index < len(self.slots):
+            return
+        slot = self.slots[slot_index]
+        if not slot.load_contact_pending:
+            return
+        if self._entry_locked_s4_slot is None:
+            self._entry_locked_s4_slot = slot
+            self._entry_locked_s4_since = float(now)
+
+    def _unlock_lost_entry_s4(self, slot, slot_index, obj, now):
+        """Release a lock only after the locked track is definitely gone."""
+        if self._entry_points is None or self._entry_locked_s4_slot is not slot or obj is not None:
+            return
+        if not 0 <= slot_index < len(self._entry_seen_at):
+            return
+        seen_at = self._entry_seen_at[slot_index]
+        if seen_at is not None and now-float(seen_at) > self.lost_seconds:
+            self._clear_entry_s4_lock("track_lost")
+
+    def _entry_s4_lock_snapshot(self):
+        """Return serializable diagnostics for the active provisional lock."""
+        if self._entry_points is None or self._entry_locked_s4_slot is None:
+            return None
+        index = next((index for index, slot in enumerate(self.slots)
+                      if slot is self._entry_locked_s4_slot), None)
+        if index is None or index >= len(self._entry_points):
+            return None
+        track_id = (self._entry_track_ids[index]
+                    if index < len(self._entry_track_ids) else None)
+        return {"active": True, "internal_slot_index": index+1,
+                "byte_track_id": track_id,
+                "locked_since": self._entry_locked_s4_since}
 
     def _numbering_order_with_predicted_s4(self, points, predicted_indices=None):
         """编号时保留三点推算点为正式S4。"""
@@ -510,6 +572,9 @@ class SlotGroupTracker:
         self.slots.extend(SlotState(i+1) for i in range(len(keep), 4))
         for i, slot in enumerate(self.slots):
             slot.slot_id = i+1
+        if (self._entry_locked_s4_slot is not None
+                and not any(slot is self._entry_locked_s4_slot for slot in self.slots)):
+            self._clear_entry_s4_lock("track_lost")
         self._entry_events = [e for e in self._entry_events if e["slot_id"] in mapping]
         for event in self._entry_events:
             event["slot_id"] = mapping[event["slot_id"]]
@@ -964,6 +1029,7 @@ class SlotGroupTracker:
             self._entry_events = []
             self._entry_inferred_indices = set()
             self._entry_canonical_points = None
+            self._clear_entry_s4_lock("formal_numbering")
             self.initialization.update(status="ready",
                 reason="four_slot_tracks_stable" if stable else "stable_reference_numbering",
                 initialized_at=float(now), initial_centers_xy=self.points.tolist(),
@@ -1030,6 +1096,14 @@ class SlotGroupTracker:
         if (len(self._entry_points) == 4 and not self._entry_inferred_indices
                 and old_ids == new_ids):
             return chosen
+        locked_slot = self._entry_locked_s4_slot
+        locked_old_index = next((index for index, slot in enumerate(self.slots)
+                                 if slot is locked_slot), None)
+        locked_track_id = (self._entry_track_ids[locked_old_index]
+                           if locked_old_index is not None
+                           and locked_old_index < len(self._entry_track_ids) else None)
+        locked_center = (None if locked_old_index is None
+                         else np.asarray(self._entry_points[locked_old_index], dtype=float))
         # Rebuild provisional geometry only. Retained tracks keep their state,
         # support and events; newly accepted IDs restore independent history.
         old = {track_id: i for i, track_id in enumerate(self._entry_track_ids)
@@ -1046,6 +1120,19 @@ class SlotGroupTracker:
         seen = self._initial_seen.copy()
         self._entry_points = [np.asarray(obj['center'], dtype=float) for obj in order]
         self._entry_track_ids = [obj['track_id'] for obj in order]
+        locked_replacement_index = None
+        if (locked_slot is not None and locked_old_index is not None
+                and locked_old_index < len(self._entry_points)
+                and (locked_track_id is None or locked_track_id not in new_ids)):
+            # If the locked ByteTrack ID was replaced, transfer the lock to the
+            # nearest selected candidate only within the normal entry gate.
+            # This preserves the physical temporary slot across an ID rollover
+            # without allowing a distant candidate to inherit its evidence.
+            distances = np.linalg.norm(np.asarray(self._entry_points)-locked_center, axis=1)
+            nearest = int(np.argmin(distances))
+            gate = max(float(self._entry_gate or 0.), 2.)
+            if distances[nearest] <= gate:
+                locked_replacement_index = nearest
         self.slots = []
         self._initial_seen = set()
         defaults = (now, None, 0, None)
@@ -1054,7 +1141,8 @@ class SlotGroupTracker:
                 if obj['track_id'] in old else default for obj in order])
         for i, obj in enumerate(order):
             index = old.get(obj['track_id'])
-            slot = slots[index] if index is not None else SlotState(i+1)
+            slot = (slots[index] if index is not None else
+                    locked_slot if i == locked_replacement_index else SlotState(i+1))
             slot.slot_id = i+1
             self.slots.append(slot)
             if index in seen:
@@ -1071,6 +1159,10 @@ class SlotGroupTracker:
         # Historical co-observations are in the old index order.
         self._entry_geometry_at_seen = [None]*4
         self._entry_revision += 1
+        if locked_slot is not None and any(slot is locked_slot for slot in self.slots):
+            self._entry_locked_s4_slot = locked_slot
+        else:
+            self._clear_entry_s4_lock("geometry_rebuild_removed_slot")
         return chosen
 
     def reset_group(self, group_id, phase=None, centers=None):
@@ -1121,6 +1213,7 @@ class SlotGroupTracker:
         self._provisional_last_real_centers.clear()
         self._provisional_quarantined_track_ids.clear()
         self._provisional_reidentification_events.clear()
+        self._clear_entry_s4_lock("initialization_reset")
         self.initialization.update(status="waiting", reason=reason, stable_frames=0,
             provisional_started_at=None, initial_centers_xy=None,
             numbering_reference_centers_xy=None,
@@ -1543,6 +1636,7 @@ class SlotGroupTracker:
         """Drop IDs when the ROI sequence starts a different process group."""
         self.byte_track_ids = [None] * 4
         self._entry_track_ids = [None] * len(self._entry_points or [])
+        self._clear_entry_s4_lock("byte_track_ids_cleared")
         if self._provisional is not None:
             self._provisional.byte_track_ids = [None] * 4
 
@@ -1606,6 +1700,11 @@ class SlotGroupTracker:
         self._advance_hand_contact(slot, now, contact, enabled, slot_index)
         if slot_index != self._s4_index():
             return
+        if slot.load_contact_pending and self._entry_points is not None:
+            # The evidence is now valid enough to infer an operation after the
+            # hand leaves.  Pin this SlotState before the next geometry frame
+            # can choose a different temporary S4 index.
+            self._lock_entry_s4_slot(slot_index, now)
         if not self.load_hand_contact_enabled:
             status = "disabled"
         elif not enabled and not slot.load_contact_pending:
@@ -1682,6 +1781,8 @@ class SlotGroupTracker:
         slot.load_contact_released_at = None
         slot.load_contact_unknown_since = None
         slot.load_contact_unknown_count = 0
+        if getattr(self, "_entry_locked_s4_slot", None) is slot:
+            self._clear_entry_s4_lock("contact_cleared")
 
     def update(self, objects, now, *, observations_enabled=True, initialization_objects=None,
                roi_contour=None, before_observe=None, translation_direction=None):
@@ -1894,6 +1995,8 @@ class SlotGroupTracker:
 
     def _observe_slot(self, slot, obj, hands, now, enabled, roi_contour, *, record_load_contact=True):
         """正式槽与进入中的临时点共用同一套空满确认规则。"""
+        slot_index = slot.slot_id-1
+        self._unlock_lost_entry_s4(slot, slot_index, obj, now)
         if enabled and obj is not None and self.track_store is not None:
             recovered = self.track_store.restore(slot, obj.get('track_id'),
                                                  (self.phase, self.group_id), now)
@@ -1906,9 +2009,9 @@ class SlotGroupTracker:
             slot.geometry_inferred = False
             box = obj["xyxy"]
             slot.box_size_wh = (max(1., box[2]-box[0]), max(1., box[3]-box[1]))
-        contact = self._hand_contact(slot.slot_id-1, hands)
-        point = self._slot_point(slot.slot_id-1)
-        if slot.slot_id-1 == self._s4_index() and slot.load_contact_pending and point is not None:
+        contact = self._hand_contact(slot_index, hands)
+        point = self._slot_point(slot_index)
+        if slot_index == self._s4_index() and slot.load_contact_pending and point is not None:
             # 多槽覆盖不能建立新证据，但已经有待核验操作时，手仍覆盖
             # 此槽就不算离手，避免宽手框被误当成接触结束。
             contact = contact or any(h["xyxy"][0] <= point[0] <= h["xyxy"][2]
@@ -1917,11 +2020,12 @@ class SlotGroupTracker:
             roi_contour, tuple(point), False) >= 0)
         self._record_hand_contact(slot, now, contact,
                                   enabled and record_load_contact and inside and not self.identity_lost,
-                                  slot.slot_id-1, disabled_reason=(
+                                  slot_index, disabled_reason=(
                                       "identity_lost" if self.identity_lost else
                                       "outside_roi" if not inside else
                                       "contact_recording_paused" if not record_load_contact else
                                       "observations_disabled"))
+        s4_slot_for_frame = slot_index == self._s4_index()
         pending_contact = slot.load_contact_pending
         contact_evidence = None
         if (pending_contact and slot.confirmed == "unknown"
@@ -2057,7 +2161,7 @@ class SlotGroupTracker:
                 byte_track_id=self._byte_track_id_at(slot.slot_id-1),
                 expected_action=event["action"] == self.phase,
                 reported_at=float(now), recovered_before_initialization=False)
-        if slot.slot_id-1 == self._s4_index() and self.s4_contact_diagnostic is not None:
+        if s4_slot_for_frame and self.s4_contact_diagnostic is not None:
             diagnostic = self.s4_contact_diagnostic
             if event is not None:
                 diagnostic.update(accumulation_status="event_confirmed", event_reason=slot.reason,
@@ -2154,6 +2258,7 @@ class SlotGroupTracker:
                 "slots": slots, "order_result": self.order_result(),
                 "event_ordering": "time_upper",
                 "s4_contact_diagnostic": self.s4_contact_diagnostic,
+                "s4_contact_lock": self._entry_s4_lock_snapshot(),
                 "s4_region_diagnostic": self.s4_region_diagnostic,
                 "s4_region_expected": self._s4_region_expected(),
                 "confirmed_event_sequence": [e["slot_id"] for e in sort_events_by_time_upper(self.events)

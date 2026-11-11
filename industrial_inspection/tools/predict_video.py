@@ -28,7 +28,7 @@ from industrial_inspection.tools.detection_display import draw_detection_legend,
 # 用户配置：在这里修改，然后在 PyCharm / VS Code 中直接运行此文件。
 # Windows 路径请保留 r 前缀，避免反斜杠被解释为转义字符。
 # =============================================================================
-SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频8\camera_B_20260924_054543.avi")
+SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频10\camera_B_20260924_062208.avi")
 # I:\youyan\test_dataset\测试视频1\camera_B_20260924_021033.avi
 # I:\youyan\test_dataset\测试视频2\camera_B_20260923_143845.avi
 # I:\youyan\test_dataset\测试视频3\camera_B_20260924_013432.avi
@@ -38,6 +38,11 @@ SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频8\camera_B_20260924_054
 # I:\youyan\test_dataset\测试视频7\camera_B_20260924_052446.avi
 # I:\youyan\test_dataset\测试视频8\camera_B_20260924_054543.avi
 # I:\youyan\test_dataset\测试视频9\camera_B_20260924_060103.avi
+# I:\youyan\test_dataset\测试视频10\camera_B_20260924_062208.avi
+# I:\youyan\test_dataset\测试视频11\camera_B_20260924_064032.avi
+# I:\youyan\test_dataset\测试视频12\camera_B_20260924_065915.avi
+# I:\youyan\test_dataset\测试视频13\camera_B_20260924_071629.avi
+# I:\youyan\test_dataset\测试视频14\camera_B_20260924_085126.avi
 MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp4.2\weights\best.pt")
 
 # 每次在此目录内新建“视频名_时间”文件夹，可重复运行而不覆盖结果。
