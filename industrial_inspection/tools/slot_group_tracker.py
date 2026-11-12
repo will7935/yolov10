@@ -68,6 +68,19 @@ def valid_slot_geometry(points):
     return bool(np.min(sine) >= .35)
 
 
+def slot_layout_error(points):
+    """Return the normalized diagonal-midpoint error of a plausible layout."""
+    if not valid_slot_geometry(points):
+        return None
+    hull = cv2.convexHull(np.asarray(points, dtype=np.float32)).reshape(-1, 2)
+    sides = np.linalg.norm(hull-np.roll(hull, -1, axis=0), axis=1)
+    spacing = float(sides.min())
+    if spacing < 2 or sides.max() > spacing*4:
+        return None
+    error = float(np.linalg.norm(hull[0]+hull[2]-hull[1]-hull[3])/spacing)
+    return error if error <= .55 else None
+
+
 def infer_fourth_parallelogram_candidates(three_points):
     """返回由三个中心点构造的三个平行四边形第四点候选。
 
@@ -1145,20 +1158,9 @@ class SlotGroupTracker:
         reliable = reliable[:10]
         layouts = []
         for subset in itertools.combinations(reliable, 4):
-            points = np.asarray([obj['center'] for obj in subset], dtype=np.float32)
-            if not valid_slot_geometry(points):
-                continue
-            hull = cv2.convexHull(points).reshape(-1, 2)
-            sides = np.linalg.norm(hull-np.roll(hull, -1, axis=0), axis=1)
-            spacing = float(sides.min())
-            if spacing < 2 or sides.max() > spacing*4:
-                continue
-            # Opposite-slot diagonals should have approximately the same
-            # midpoint. Allow perspective and detector box-centre displacement.
-            error = float(np.linalg.norm(hull[0]+hull[2]-hull[1]-hull[3])/spacing)
-            if error > .55:
-                continue
-            layouts.append((error, list(subset)))
+            error = slot_layout_error([obj['center'] for obj in subset])
+            if error is not None:
+                layouts.append((error, list(subset)))
         layouts.sort(key=lambda item: item[0])
         if not layouts or (len(layouts) > 1 and layouts[1][0]-layouts[0][0] < .08):
             if len(reliable) >= 4:
@@ -1430,7 +1432,31 @@ class SlotGroupTracker:
                          len(reliable_rows) >= max(3, row_count-1))
         return matches, ignored_cols, missing_rows, protected, window
 
-    def _initialize(self, candidates, hands, now, enabled, roi_contour, objects):
+    def _discard_reversed_initial_unload(self, provisional):
+        """Recheck the first G1 unload if vision confirms the same track refilled."""
+        events = provisional.events
+        first = next((event for event in events if event['action'] == 'unload'
+                      and event.get('expected_action')), None)
+        if first is None or first['from'] != 'filled' or first.get('byte_track_id') is None:
+            return False
+        track_id = first['byte_track_id']
+        reversal = next((event for event in events if event['action'] == 'load'
+                         and event['from'] == 'empty' and event['to'] == 'filled'
+                         and event.get('byte_track_id') == track_id
+                         and event['slot_id'] == first['slot_id'] and not event.get('inferred')
+                         and event['confirmed_at'] > first['confirmed_at']), None)
+        if reversal is None:
+            return False
+        provisional.events = [event for event in events if event is not first and event is not reversal]
+        if self.track_store is not None:
+            self.track_store.discard_candidate_events(track_id, (self.phase, self.group_id), (first, reversal))
+        if any(event['action'] == 'unload' and event.get('expected_action') for event in provisional.events):
+            return False
+        self._reset_initialization('provisional_first_unload_reversed')
+        return True
+
+    def _initialize(self, candidates, hands, now, enabled, roi_contour, objects, *,
+                    recheck_initial_unload=False):
         """先建立候选轨迹并逐槽记录状态；身份确认后一次性发布缓存事件。"""
         if enabled and len(candidates) > 4 and self._provisional is None:
             selected = self._select_track_geometry(candidates, hands, now)
@@ -1562,6 +1588,8 @@ class SlotGroupTracker:
                                or o.get("track_id") is None]
         p.update(provisional_objects,
                  now, observations_enabled=enabled, roi_contour=roi_contour)
+        if recheck_initial_unload and self._discard_reversed_initial_unload(p):
+            return []
         # 空满冲突只影响该槽状态，不影响已匹配框的几何身份。
         if enabled:
             self._initial_seen.update(reliable)
@@ -2139,7 +2167,7 @@ class SlotGroupTracker:
 
     def update(self, objects, now, *, observations_enabled=True, initialization_objects=None,
                roi_contour=None, before_observe=None, translation_direction=None,
-               s4_position_candidates=()):
+               s4_position_candidates=(), recheck_initial_unload=False):
         """先关联几何，再确认状态；回调可在转位开始的同一帧暂停取放事件。"""
         if self.last_time is not None and now <= self.last_time:
             raise ValueError("源视频时间必须严格递增")
@@ -2169,7 +2197,8 @@ class SlotGroupTracker:
         if self.points is None:
             initial_objects = objects if initialization_objects is None else initialization_objects
             initial = self._candidates(initial_objects)
-            recovered = self._initialize(initial,hands,now,observations_enabled,roi_contour,initial_objects)
+            recovered = self._initialize(initial, hands, now, observations_enabled, roi_contour,
+                initial_objects, recheck_initial_unload=recheck_initial_unload)
             if self.points is None:
                 self.unmatched = candidates
                 # 候选轨迹已经能给出暂定的槽位状态；身份尚未确认时不发布

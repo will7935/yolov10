@@ -9,7 +9,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from industrial_inspection.tools.slot_group_tracker import (
-    SLOT_STATES, box_containment, box_iou, valid_slot_geometry)
+    SLOT_STATES, box_containment, box_iou, slot_layout_error, valid_slot_geometry)
 from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
 
 
@@ -31,13 +31,15 @@ class RoiGroupSequence:
                  reject_transition_roi_detections=True, transition_quarantine_min_frames=4,
                  require_first_unload_event_for_g1=False,
                  outside_mapping_quarantine_seconds=3.0,
-                 use_previous_s4_layouts=False):
+                 use_previous_s4_layouts=False, edge_evidence_px=0.0):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
             raise ValueError("换组ROI必须为凸多边形像素坐标")
         if not 0 < boundary_margin_px < buffer_px or exit_seconds <= 0 or entry_seconds <= 0:
             raise ValueError("换组缓冲带必须大于边界容差；退出/进入确认时间须大于0")
+        if not np.isfinite(edge_evidence_px) or edge_evidence_px < 0:
+            raise ValueError("ROI边缘取证距离必须为非负有限像素值")
         if not 1 <= partial_exit_slots <= exit_min_slots <= 4:
             raise ValueError("完整/部分可见时的越界槽数应满足1<=部分<=完整<=4")
         if not 0 < motion_pause_ratio < minimum_motion_ratio or not 0 < entry_stability_ratio < .5:
@@ -111,6 +113,7 @@ class RoiGroupSequence:
         self._restored_load_groups = set()
         self.track_store = SlotTrackStateStore(
             tracker, self.contour,
+            edge_evidence_px=edge_evidence_px,
             reidentification_enabled=reidentification_enabled,
             reidentification_max_gap_seconds=reidentification_max_gap_seconds,
             reidentification_max_distance_px=reidentification_max_distance_px)
@@ -125,6 +128,8 @@ class RoiGroupSequence:
         self._transition_quarantine_track_ids = set()
         self._transition_quarantine_centers = []
         self._transition_quarantine_until = None
+        self._transition_recheck_ids = set()
+        self._transition_recheck = None
         self.mapping_time = None
         self._g1_waiting_event = bool(
             self.require_first_unload_event_for_g1
@@ -366,16 +371,13 @@ class RoiGroupSequence:
                                 for event in events))
 
     def _release_initial_g1_event_gate(self, result):
-        """Publish buffered evidence once the first unload event is confirmed."""
-        if not self._g1_waiting_event:
+        """Publish G1 evidence once the candidate has formal slot numbers."""
+        if not self._g1_waiting_event or self.tracker.points is None:
             return result
-        events = list(getattr(self.tracker, "events", []))
-        if self.tracker._provisional is not None:
-            events.extend(self.tracker._provisional.events)
         if not any(event.get("action") == "unload"
                    and event.get("expected_action", False)
                    and event.get("confirmed_at") is not None
-                   for event in events):
+                   for event in self.tracker.events):
             return result
         self._g1_waiting_event = False
         buffered = self._g1_pending_events
@@ -553,6 +555,8 @@ class RoiGroupSequence:
         """按旧组稳定证据隔离未绑定ID，并保留换组瞬间的短时空间隔离。"""
         self._transition_quarantine_centers = []
         self._transition_quarantine_until = None
+        self._transition_recheck_ids.clear()
+        self._transition_recheck = None
         if not self.reject_transition_roi_detections:
             return
         history = self._group_roi_tracks.get((self.tracker.phase, self.tracker.group_id), {})
@@ -561,6 +565,8 @@ class RoiGroupSequence:
                     and record['inside_frames'] >= self.transition_quarantine_min_frames
                     and record['inside_roi']
                     and now-record['last_seen'] <= self.tracker.lost_seconds):
+                if track_id not in self._transition_quarantine_track_ids:
+                    self._transition_recheck_ids.add(track_id)
                 self._transition_quarantine_track_ids.add(track_id)
         # 已绑定旧组的ID由_close登记为closed，再由旧组归属过滤排除；
         # 即使它们最后已经出ROI或漏检超过时限，也不会成为下一组的槽。
@@ -1033,14 +1039,66 @@ class RoiGroupSequence:
         if now >= self.departing_load_deadline:
             self._finish_departing_load(now)
 
-    def _entry_objects(self, objects, now):
+    def _recheck_quarantined_entry_track(self, objects, admitted, tracker, now):
+        """Review an unbound handoff track against three real incoming tracks."""
+        previous = self._transition_recheck
+        self._transition_recheck = None
+        if not self._transition_recheck_ids or self._transition_quarantine_until is not None:
+            return None
+        established_ids = {track_id for index, track_id in enumerate(tracker._entry_track_ids)
+                           if track_id is not None and index not in tracker._entry_inferred_indices}
+        support = tracker._candidates(admitted)
+        if (len(established_ids) != 3 or len(support) != 3
+                or {obj.get('track_id') for obj in support} != established_ids):
+            return None
+
+        def reliable(obj):
+            record = self.track_store.tracks.get(obj.get('track_id'))
+            return (record is not None and record['reliable_since'] is not None
+                    and record['reliable_count'] >= tracker.initialization_frames
+                    and now-record['reliable_since']+1e-9 >= tracker.initialization_seconds
+                    and self._distance(obj['center']) >= 0 and not obj['conflict']
+                    and not tracker._occluded(obj, self._hands))
+
+        if not all(reliable(obj) for obj in support):
+            return None
+        # The departing tracker has already checked ownership and changed IDs.
+        # A candidate still close to a live old slot is ambiguous.
+        old_points = [] if self.departing_points is None else [
+            point for index, (point, seen) in enumerate(zip(self.departing_points, self.departing_seen))
+            if index not in self.departing_untrackable_indices and now-seen <= tracker.lost_seconds]
+        centers = [obj['center'] for obj in support]
+        eligible = [obj for obj in tracker._candidates(objects)
+                    if obj.get('track_id') in self._transition_recheck_ids
+                    and self.track_store.owner(obj['track_id']) is None and reliable(obj)
+                    and all(np.linalg.norm(np.asarray(obj['center'])-point) > self.departing_gate*.35
+                            for point in old_points)
+                    and slot_layout_error([*centers, obj['center']]) is not None]
+        if len(eligible) != 1:
+            return None
+        candidate = eligible[0]
+        key = (candidate['track_id'], tuple(sorted(established_ids)))
+        count = 1
+        if previous is not None and previous[0] == key and now-previous[2] <= .25:
+            count = previous[1]+1
+        self._transition_recheck = (key, count, now)
+        return candidate if count >= max(3, tracker.initialization_frames) else None
+
+    def _entry_objects(self, objects, now, *, review_quarantined=False):
         # 旧组的局部补检不能在同帧换组后成为下一组的新轨迹。
         objects = [o for o in objects if o.get("detection_source") != "local_crop"]
         tracker = self.tracker if self.state == "entering" else self.pending_tracker
         # 即使空间隔离或退出几何已超时，旧组归属和被隔离的ID仍须过滤。
         objects = self._exclude_departing(objects, now)
-        objects = self._exclude_transition_quarantine(objects, now)
-        return self._admit_entry_objects(objects, tracker, now)
+        admitted = self._admit_entry_objects(self._exclude_transition_quarantine(objects, now), tracker, now)
+        recovered = None
+        if review_quarantined:
+            recovered = self._recheck_quarantined_entry_track(objects, admitted, tracker, now)
+        else:
+            self._transition_recheck = None
+        if recovered is not None:
+            admitted.append(recovered)
+        return admitted, recovered
 
     def _exclude_departing(self, objects, now):
         """旧组退出后继续沿用旧身份匹配，残留点不能成为下一组的初始槽。"""
@@ -1230,9 +1288,20 @@ class RoiGroupSequence:
             "phase": self.tracker.phase, "at": now, "reason": "single_slot_roi_exit"})
 
     def _update_immediate_entry(self, objects, now, enabled):
-        objects = self._entry_objects(objects, now)
+        objects, recovered = self._entry_objects(
+            objects, now, review_quarantined=enabled and self.tracker.phase == 'unload')
         self._entry_count = len(self.tracker._candidates(objects))
         result = self.tracker.update(objects, now, observations_enabled=enabled, roi_contour=self.contour)
+        if recovered is not None:
+            track_id = recovered['track_id']
+            if track_id in self.tracker._entry_track_ids or track_id in self.tracker.byte_track_ids:
+                self._transition_quarantine_track_ids.discard(track_id)
+                self._transition_recheck_ids.discard(track_id)
+                self._track_rejections.pop(track_id, None)
+                self._group_events.append({'type': 'transition_track_recovered', 'track_id': track_id,
+                    'group_id': self.tracker.group_id, 'phase': self.tracker.phase, 'at': now,
+                    'support_track_ids': list(self._transition_recheck[0][1])})
+                self._transition_recheck = None
         if self._entry_revision != self.tracker._entry_revision:
             self.inside_seen, self.crossed = {}, {}
             self._entry_revision = self.tracker._entry_revision
@@ -1247,7 +1316,7 @@ class RoiGroupSequence:
         return result
 
     def _update_entry(self, objects, now, enabled):
-        objects = self._entry_objects(objects,now)
+        objects, _ = self._entry_objects(objects,now)
         t = self.pending_tracker
         candidates = t._candidates(objects)
         self._entry_count = len(candidates)
@@ -1275,6 +1344,10 @@ class RoiGroupSequence:
         self._hands = [o for o in objects if o["class_name"] == "hand"]
         self._record_group_roi_tracks(objects, now)
         self._record_outside_mapping_quarantine(objects, now)
+        edge_tracker = self.pending_tracker or self.tracker
+        self.track_store.observe_roi_edge(objects, now, (edge_tracker.phase, edge_tracker.group_id),
+            observations_enabled and self.state not in ('exiting', 'identity_uncertain', 'sequence_complete'),
+            self._transition_quarantine_track_ids | self._outside_mapping_quarantine_track_ids)
         result = None
         discarded_initial_candidate = self._discard_unconfirmed_initial_g1(now, objects)
         if discarded_initial_candidate:
@@ -1311,7 +1384,8 @@ class RoiGroupSequence:
                 initialization_objects=initial,roi_contour=self.contour,
                 before_observe=self._observe_motion,
                 translation_direction=self.direction if self.state == "exiting" else None,
-                s4_position_candidates=position_candidates)
+                s4_position_candidates=position_candidates,
+                recheck_initial_unload=self._g1_waiting_event)
             if self.tracker.points is not None and self.state == "initializing":
                 self._arm(now)
             if self.state == "exiting" and (self.exit_min_slots == 1 or
@@ -1340,6 +1414,10 @@ class RoiGroupSequence:
             result["new_events"] = []
             result = self._mask_initial_g1_result(result)
         self._sync_track_bindings(result, now)
+        if observations_enabled and self.state == 'active' and result['slot_numbering_status'] == 'final':
+            edge_events = self.track_store.restore_roi_edge_events(self.tracker, now)
+            if edge_events:
+                result = {**result, **self.tracker.snapshot(), 'new_events': result['new_events'] + edge_events}
         if self.use_previous_s4_layouts:
             self._record_unload_layout(result, now)
         result["new_events"] = list(result.get("new_events", [])) + deepcopy(self._deferred_new_events)

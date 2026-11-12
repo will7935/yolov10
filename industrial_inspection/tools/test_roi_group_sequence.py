@@ -134,6 +134,29 @@ class GroupSequenceTests(unittest.TestCase):
                             for event in result['new_group_events']))
         self.assertIsNone(s.tracker.points)
 
+    def test_reversed_g1_unload_is_discarded_before_numbering_and_cannot_be_reimported(self):
+        tracker = SlotGroupTracker(confirm_seconds=0, minimum_frames=2, initialization_seconds=.1,
+            geometry_initialization_seconds=.5, initialization_frames=2)
+        sequence = RoiGroupSequence(tracker, ROI, require_first_unload_event_for_g1=True)
+        full = [{**obj, 'track_id': 500+i} for i, obj in enumerate(boxes(filled=range(4)))]
+        first_empty = [{**obj, 'track_id': 500+i} for i, obj in enumerate(boxes(filled=(1, 2, 3)))]
+        for frame in range(6):
+            result = sequence.update(first_empty if 2 <= frame < 4 else full, frame/10)
+            self.assertEqual(result['new_events'], [])
+        self.assertIsNone(tracker.points)
+        self.assertIsNone(tracker._provisional)
+        self.assertEqual(sequence.track_store.tracks[500]['events'], [])
+        self.assertEqual(sequence.track_store.tracks[500]['state'].confirmed, 'filled')
+
+        for frame in range(6, 12):
+            result = sequence.update(full, frame/10)
+            self.assertEqual(result['slot_numbering_status'], 'provisional')
+        for now in (1.2, 1.3, 1.4):
+            result = sequence.update(first_empty, now)
+        self.assertEqual(result['slot_numbering_status'], 'final')
+        self.assertEqual([(event['byte_track_id'], event['action'], event['time_upper'])
+                          for event in sequence.all_events], [(500, 'unload', 1.2)])
+
     def test_disappearance_does_not_count_as_exit(self):
         s=self.make()
         self.baseline(s)
@@ -440,6 +463,38 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(result['slots'][1]['reason'],'outside_roi')
         self.assertEqual(result['slots'][1]['state'],'unknown')
         self.assertEqual(s.tracker.events,[])
+
+    def test_roi_edge_history_requires_the_same_formally_mapped_group(self):
+        roi = np.array([[0, 100], [300, 100], [300, 300], [0, 300]], dtype=np.float32)
+        initial_ids = (1, 2, 3, 4)
+        cases = ((6, initial_ids, True), (6, (5, 2, 3, 4), False),
+                 (6, (1, 5, 6, 4), False), (12, initial_ids, False))
+        for offset, final_ids, expected in cases:
+            with self.subTest(offset=offset, final_ids=final_ids):
+                tracker = SlotGroupTracker(confirm_seconds=.1, minimum_frames=2,
+                                           initialization_seconds=.1, initialization_frames=2,
+                                           allow_three_point_initialization=False)
+                sequence = RoiGroupSequence(tracker, roi, edge_evidence_px=8)
+                outside = POINTS.copy()
+                outside[0, 1] -= offset
+                for frame in range(10):
+                    objects = boxes(outside if frame < 4 else POINTS,
+                                    filled=range(4) if frame < 2 else (1, 2, 3))
+                    for obj, track_id in zip(objects, initial_ids if frame < 4 else final_ids):
+                        obj['track_id'] = track_id
+                    result = sequence.update(objects, frame/10)
+                    if frame < 4:
+                        self.assertEqual(result['slot_numbering_status'], 'provisional')
+                        self.assertEqual(result['new_events'], [])
+                self.assertEqual(result['slot_numbering_status'], 'final')
+                self.assertEqual(len(sequence.all_events), int(expected))
+                if expected:
+                    event = sequence.all_events[0]
+                    self.assertEqual(event['byte_track_id'], 1)
+                    self.assertEqual(event['reason'], 'roi_edge_visual_confirmation')
+                    self.assertEqual(event['time_upper'], .2)
+                    self.assertGreater(event['reported_at'], event['confirmed_at'])
+                    self.assertEqual(result['slots'][event['slot_id']-1]['last_confirmed_state'], 'empty')
 
     def test_non_monotonic_time_is_rejected(self):
         s=self.make()

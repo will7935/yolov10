@@ -2,10 +2,56 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass, field
+from math import dist
 
 import cv2
 
 from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, SlotState
+
+
+@dataclass
+class RoiEdgeTrack:
+    """Visual evidence held until the track and its neighbours have slot numbers."""
+
+    last_seen: float
+    center: tuple
+    state: SlotState = field(default_factory=lambda: SlotState(0))
+    candidate_peers: set = field(default_factory=set)
+    confirmed_peers: set = field(default_factory=set)
+    candidate_used_edge: bool = False
+    confirmed_used_edge: bool = False
+    first_change: tuple | None = None
+    events: list = field(default_factory=list)
+
+    def observe(self, state, confidence, now, peers, outside, rules):
+        previous = self.state.confirmed
+        if state == previous:
+            self.first_change = None
+        elif previous != 'unknown' and self.first_change is None:
+            self.first_change = (now, peers)
+        common_peers = self.candidate_peers & peers
+        if state == self.state.candidate and len(common_peers) >= 2:
+            self.candidate_peers = common_peers
+            self.candidate_used_edge |= outside
+        else:
+            if state == self.state.candidate:
+                self.miss(now)
+            self.candidate_peers = set(peers)
+            self.candidate_used_edge = outside
+        baseline_peers = self.confirmed_peers
+        event = self.state.observe(state, now, confidence, 'detected',
+                                   rules.confirm_seconds, rules.minimum_frames)
+        if event is not None:
+            if self.confirmed_used_edge or self.candidate_used_edge:
+                self.events.append((event, baseline_peers, self.candidate_peers.copy(), self.first_change))
+            self.first_change = None
+        if self.state.state != 'unknown':
+            self.confirmed_peers = self.candidate_peers.copy()
+            self.confirmed_used_edge = self.candidate_used_edge
+
+    def miss(self, now):
+        self.state.observe('unknown', now, None, 'not_detected', 0, 1)
 
 
 class SlotTrackStateStore:
@@ -13,7 +59,7 @@ class SlotTrackStateStore:
 
     def __init__(self, tracker, contour, *, reidentification_enabled=False,
                  reidentification_max_gap_seconds=15.0,
-                 reidentification_max_distance_px=40.0):
+                 reidentification_max_distance_px=40.0, edge_evidence_px=0.0):
         self.rules = tracker
         self.contour = contour
         self.tracks = {}
@@ -28,6 +74,11 @@ class SlotTrackStateStore:
         # segment for audit when the new, spatially distinct segment is opened.
         self.archived_segments = {}
         self._seen_this_frame = set()
+        self.edge_evidence_px = edge_evidence_px
+        self._edge_identity = None
+        self._edge_tracks = {}
+        self._edge_inside_ids = set()
+        self._edge_frame_at = None
 
     def __deepcopy__(self, memo):
         return self
@@ -98,6 +149,99 @@ class SlotTrackStateStore:
                                         self.rules.confirm_seconds, self.rules.minimum_frames)
                 record['reliable_since'], record['reliable_count'] = None, 0
         self._seen_this_frame = seen
+
+    def observe_roi_edge(self, objects, now, identity, enabled, blocked_ids):
+        """Keep edge evidence separate from the normal track state and geometry."""
+        if not self.edge_evidence_px:
+            return
+        if identity != self._edge_identity:
+            self._edge_tracks.clear()
+            self._edge_inside_ids.clear()
+            self._edge_frame_at = None
+            self._edge_identity = identity
+        candidates, peers = {}, set()
+        if enabled:
+            hands = [obj for obj in objects if obj['class_name'] == 'hand']
+            for obj in self.rules._candidates(objects):
+                track_id = obj.get('track_id')
+                if (track_id is None or track_id in blocked_ids or self.owner(track_id) not in (None, identity)
+                        or obj['conflict'] or obj.get('detection_source') == 'local_crop'
+                        or self.rules._occluded(obj, hands)):
+                    continue
+                distance = cv2.pointPolygonTest(self.contour, tuple(obj['center']), True)
+                if distance >= 0:
+                    peers.add(track_id)
+                if distance >= -self.edge_evidence_px:
+                    candidates[track_id] = (obj, distance < 0)
+        for track_id, (obj, outside) in candidates.items():
+            support = peers - {track_id}
+            if len(support) < 2:
+                continue
+            history = self._edge_tracks.get(track_id)
+            if history is None and not outside:
+                continue
+            center = tuple(obj['center'])
+            x1, y1, x2, y2 = obj['xyxy']
+            max_jump = max(2*self.edge_evidence_px, max(x2-x1, y2-y1)/2)
+            if (history is None or now-history.last_seen > self.rules.lost_seconds
+                    or dist(center, history.center) > max_jump):
+                history = self._edge_tracks[track_id] = RoiEdgeTrack(now, center)
+                prior = self.tracks.get(track_id)
+                prior_peers = self._edge_inside_ids - {track_id}
+                if (prior is not None and track_id in self._edge_inside_ids and len(prior_peers) >= 2
+                        and prior['state'].state != 'unknown' and prior['last_seen'] == self._edge_frame_at
+                        and now-prior['last_seen'] <= self.rules.lost_seconds
+                        and dist(center, prior['center']) <= max_jump):
+                    history.state.confirmed = prior['state'].state
+                    history.state.evidence_time = prior['state'].evidence_time
+                    history.confirmed_peers = prior_peers
+            history.last_seen, history.center = now, center
+            history.observe(SLOT_STATES[obj['class_name']], obj['confidence'], now, support, outside, self.rules)
+        for track_id, history in list(self._edge_tracks.items()):
+            if now-history.last_seen > self.rules.lost_seconds:
+                del self._edge_tracks[track_id]
+            elif history.last_seen != now:
+                history.miss(now)
+        self._edge_inside_ids, self._edge_frame_at = peers, now
+
+    def restore_roi_edge_events(self, tracker, now):
+        """Publish an edge event only after its track and peers belong to this group."""
+        identity = (tracker.phase, tracker.group_id)
+        if tracker.identity_lost or identity != self._edge_identity:
+            return []
+        group_ids = {track_id for track_id in tracker.byte_track_ids if self.owner(track_id) == identity}
+        events = []
+        for slot, track_id in zip(tracker.slots, tracker.byte_track_ids):
+            history = self._edge_tracks.get(track_id)
+            if history is None or self.owner(track_id) != identity:
+                continue
+            peers = group_ids - {track_id}
+            for event, baseline_support, target_support, first_change in history.events:
+                if (event['action'] != tracker.phase or len(baseline_support & peers) < 2
+                        or len(target_support & peers) < 2 or any(
+                            old['slot_id'] == slot.slot_id and old['action'] == tracker.phase
+                            for old in tracker.events)):
+                    continue
+                confirmed_at = event['confirmed_at']
+                if (slot.confirmed_at is not None and slot.confirmed_at > confirmed_at
+                        and slot.confirmed != event['to']):
+                    continue
+                accepted = {**event, 'slot_id': slot.slot_id, 'byte_track_id': track_id,
+                            'group_id': tracker.group_id, 'phase': tracker.phase,
+                            'expected_action': True, 'reported_at': float(now),
+                            'recovered_before_initialization': confirmed_at < tracker.initialization.get(
+                                'initialized_at', now),
+                            'reason': 'roi_edge_visual_confirmation'}
+                if first_change is not None and len(first_change[1] & peers) >= 2:
+                    accepted['time_upper'] = min(event['time_upper'], first_change[0])
+                if slot.confirmed_at is None or slot.confirmed_at <= confirmed_at:
+                    slot.confirmed = event['to']
+                    slot.confirmed_at = slot.evidence_time = confirmed_at
+                    slot.confirmed_since = event['time_upper']
+                    slot.confirmation_source = 'yolo'
+                tracker.events.append(accepted)
+                events.append(accepted)
+        return events
 
     def owner(self, track_id):
         record = self.tracks.get(track_id)
@@ -196,6 +340,18 @@ class SlotTrackStateStore:
         if record and record['owner'] == identity and record['slot_id'] is None:
             record['owner'] = None
             record['imported'].clear()
+
+    def discard_candidate_events(self, track_id, identity, events):
+        """Prevent cancelled provisional events from being imported again."""
+        record = self.tracks.get(track_id)
+        if record is None or record['owner'] not in (None, identity) or record['slot_id'] is not None:
+            return
+        cancelled = {(event['action'], event['confirmed_at']) for event in events}
+        retained = [(index, event) for index, event in enumerate(record['events'])
+                    if (event['action'], event['confirmed_at']) not in cancelled]
+        record['events'] = [event for _, event in retained]
+        record['imported'] = {new_index for new_index, (index, _) in enumerate(retained)
+                              if index in record['imported']}
 
     def restore(self, slot, track_id, identity, now):
         record = self.tracks.get(track_id)

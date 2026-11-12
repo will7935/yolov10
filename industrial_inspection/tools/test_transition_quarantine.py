@@ -28,8 +28,8 @@ def group(points=POINTS, visible=(0, 1, 2, 3)):
 
 
 class TransitionQuarantineTests(unittest.TestCase):
-    def make(self, *, enabled=True, single_exit=True, min_frames=4):
-        tracker = SlotGroupTracker(POINTS, confirm_seconds=0, minimum_frames=2,
+    def make(self, *, enabled=True, single_exit=True, min_frames=4, phase='unload'):
+        tracker = SlotGroupTracker(POINTS, phase=phase, confirm_seconds=0, minimum_frames=2,
             lost_seconds=1.2, initialization_seconds=.1, initialization_frames=2)
         sequence = RoiGroupSequence(tracker, ROI, exit_min_slots=1 if single_exit else 3,
             partial_exit_slots=1 if single_exit else 2, exit_direction=(0, -1),
@@ -94,6 +94,44 @@ class TransitionQuarantineTests(unittest.TestCase):
         self.assertGreaterEqual(len(sequence.tracker._entry_points), 2)
         self.assertIsNone(sequence.track_store.owner(283))
         self.assertIsNone(result['transition_quarantine_until'])
+
+    def test_missing_slot_rechecks_quarantine_and_recovers_track_history(self):
+        cases = (('unload', False, True), ('unload', True, False), ('load', False, False))
+        for phase, ambiguous, should_recover in cases:
+            with self.subTest(phase=phase, ambiguous=ambiguous):
+                sequence = self.make(phase=phase)
+                sequence.tracker.allow_three_point_initialization = False
+                candidate = {**slot(283, [290, 180]), 'class_name': 'wafer_slot_filled'}
+                alternative = slot(284, [310, 164])
+                candidates = [candidate, alternative] if ambiguous else [candidate]
+                for now in (.3, .35, .4, .45):
+                    sequence.update(group()+candidates, now)
+                self.close(sequence)
+                self.assertTrue(sequence.is_transition_quarantined_track(283))
+
+                incoming = [slot(309, [380, 180]), slot(310, [290, 270]), slot(311, [380, 270])]
+                group_events = []
+                for frame in range(6, 25):
+                    now = frame/10
+                    if frame >= 11:
+                        candidate = slot(283, [290, 180])
+                    candidates = [candidate, alternative] if ambiguous else [candidate]
+                    result = sequence.update(incoming+candidates, now)
+                    group_events.extend(result['new_group_events'])
+                    if frame < 19:
+                        self.assertTrue(sequence.is_transition_quarantined_track(283))
+                events = [event for event in sequence.all_events if event['byte_track_id'] == 283]
+                if not should_recover:
+                    self.assertTrue(sequence.is_transition_quarantined_track(283))
+                    self.assertEqual(events, [])
+                    continue
+                self.assertFalse(sequence.is_transition_quarantined_track(283))
+                self.assertIn(283, sequence.tracker.byte_track_ids)
+                self.assertEqual(len(events), 1)
+                self.assertEqual((events[0]['group_id'], events[0]['action'], events[0]['time_upper']),
+                                 (2, 'unload', 1.1))
+                recovered = [event for event in group_events if event['type'] == 'transition_track_recovered']
+                self.assertEqual([event['track_id'] for event in recovered], [283])
 
     def test_long_missing_unassigned_id_is_recorded_without_being_quarantined(self):
         sequence = self.make()

@@ -25,8 +25,8 @@ HATCH_CLOSED_POLYGON = ((.495,.18),(.72,.18),(.72,.49),(.495,.49))
 HATCH_CONFIRM_SECONDS = .3
 HATCH_MIN_CONFIRM_FRAMES = 3
 HATCH_MAX_GAP_SECONDS = .25
-# 把手位置会因视频机位和门体姿态改变。先用稳定关门位置建立基准，
-# 再按归一化中心距离判断；长时间完全漏检表示把手已离开画面。
+# 先用关门位置建立基准，再按归一化中心距离判断。
+# 已确认关门后，漏检开门的等待时间从最后一次关门位置观测起算。
 HATCH_DISTANCE_MODE = True
 HATCH_CLOSED_DISTANCE_MAX = .08
 HATCH_OPEN_DISTANCE_MIN = .14
@@ -91,7 +91,8 @@ S4_PREDICTION_CONTACT_OVERLAP_RATIO = .15         # 仅靠预测框建立待视�
 S4_HAND_REGION_ENABLED = True  # 手框进入手动选定的区域时，作为S4接触线索
 S4_HAND_REGION_RESELECT = False  # True：每次启动重新选择；False：优先读取已保存区域
 S4_HAND_REGION_FILE = ROOT / "industrial_inspection" / "configs" / "s4_hand_region.json"
-ROI_TRACKING_MARGIN_PX = 40   # ROI外只跟踪当前已编号槽；区域外框不确认空满、不初始化
+ROI_TRACKING_MARGIN_PX = 40   # 已编号槽的ROI外跟踪距离
+ROI_EDGE_EVIDENCE_PX = 8.0   # 640×480下的ROI外视觉取证距离，0表示关闭
 
 # 局部补检：只补观测，不修改身份和工艺结论
 LOCAL_REDETECT_ENABLED = False # 已编号槽被整图漏检时，用同一模型局部补检

@@ -83,6 +83,8 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频9", REGRESSION_DATASET_ROOT / "测试视频9" / "camera_B_20260924_060103.avi",
      base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
 )
 REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
 REGRESSION_WRITE_VIDEO = False  # 回归默认只保存流程数据；--with-video可显式打开
@@ -113,7 +115,7 @@ from industrial_inspection.tools.slot_process_config import (
     LOAD_HAND_CONTACT_COMPETING_SLOT_ID, LOAD_HAND_CONTACT_COMPETING_MARGIN, LOAD_HAND_CONTACT_COMPETING_RATIO,
     S4_CONTACT_PREDICTION_SECONDS, S4_PREDICTION_CONTACT_OVERLAP_RATIO,
     S4_HAND_REGION_ENABLED, S4_HAND_REGION_RESELECT, S4_HAND_REGION_FILE,
-    ROI_TRACKING_MARGIN_PX, LOCAL_REDETECT_ENABLED, LOCAL_REDETECT_CROP_SIZE,
+    ROI_TRACKING_MARGIN_PX, ROI_EDGE_EVIDENCE_PX, LOCAL_REDETECT_ENABLED, LOCAL_REDETECT_CROP_SIZE,
     LOCAL_REDETECT_IMAGE_SIZE, ROTATION_INTERVALS,
     SHOW_SLOT_TEXT, SHOW_ALL_DETECTION_BOXES, SHOW_NON_SLOT_DETECTION_BOXES,
     STATUS_PANEL_POSITION,
@@ -258,6 +260,7 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
                            machine_center=machine_center)
     return RoiGroupSequence(tracker,pixel_polygon(polygon,size),enabled=AUTO_GROUP_SWITCH,
         buffer_px=ROI_TRACKING_MARGIN_PX,boundary_margin_px=EXIT_BOUNDARY_MARGIN_PX,
+        edge_evidence_px=ROI_EDGE_EVIDENCE_PX*min(size[0]/640, size[1]/480),
         exit_seconds=EXIT_CONFIRM_SECONDS,exit_min_slots=EXIT_MIN_SLOTS,
         partial_exit_slots=PARTIAL_EXIT_MIN_SLOTS,minimum_motion_ratio=EXIT_MIN_MOTION_RATIO,
         motion_pause_ratio=MOTION_PAUSE_RATIO,entry_seconds=NEXT_GROUP_STABLE_SECONDS,

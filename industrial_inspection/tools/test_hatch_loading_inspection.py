@@ -55,6 +55,24 @@ class HatchHandleTests(unittest.TestCase):
         self.assertEqual([e['type'] for e in events], ['hatch_opened'])
         self.assertEqual(detector.state, 'open')
 
+    def test_only_closed_observations_restart_the_missing_open_timer(self):
+        detector = monitor()
+        for now in (0., .1, .2):
+            detector.update([handle('closed')], now, (640, 480))
+        for now in (.55, .65):
+            self.assertEqual(detector.update([handle('open')], now, (640, 480)), [])
+        self.assertEqual(detector.update([handle('closed')], .9, (640, 480)), [])
+
+        self.assertEqual(detector.update([], 1.3, (640, 480)), [])
+        self.assertEqual(detector.observation, 'unknown')
+        for now in (1.45, 1.55):
+            self.assertEqual(detector.update([handle('open')], now, (640, 480)), [])
+        for now in (1.9, 2.):
+            self.assertEqual(detector.update([], now, (640, 480)), [])
+        events = detector.update([], 2.1, (640, 480))
+        self.assertEqual([event['type'] for event in events], ['hatch_opened'])
+        self.assertEqual(events[0]['observed_since'], 1.9)
+
     def test_distance_hysteresis_works_without_open_polygon(self):
         detector = monitor()
         for now in (0., .1, .2):

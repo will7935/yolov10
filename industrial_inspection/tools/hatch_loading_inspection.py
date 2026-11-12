@@ -41,6 +41,7 @@ class HatchHandleMonitor:
         self.current_center = None
         self.distance_from_closed = None
         self.last_handle_seen = None
+        self.last_closed_handle_seen = None
 
     @staticmethod
     def _polygon(value):
@@ -99,11 +100,12 @@ class HatchHandleMonitor:
                 self.observation = 'unknown'
         else:
             self.observation = next(iter(support)) if len(support) == 1 else 'unknown'
+        if self.observation == 'closed':
+            self.last_closed_handle_seen = now
         if (not centers and self.distance_mode and self.state == 'closed'
-                and self.last_handle_seen is not None
-                and now-self.last_handle_seen+1e-9 >= self.missing_open_seconds):
-            # 已确认关门后，把手持续消失是开门时离开检测区域的证据；
-            # 初始未知状态不会因漏检直接启动整段流程。
+                and self.last_closed_handle_seen is not None
+                and now-self.last_closed_handle_seen+1e-9 >= self.missing_open_seconds):
+            # 开门侧零星出现的把手框不刷新关门位置的最后观测时间。
             self.observation = 'open'
         if (self.candidate_last_seen is not None
                 and now-self.candidate_last_seen > self.maximum_gap_seconds+1e-9):
