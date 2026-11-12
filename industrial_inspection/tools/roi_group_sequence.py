@@ -8,7 +8,8 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, box_iou
+from industrial_inspection.tools.slot_group_tracker import (
+    SLOT_STATES, box_containment, box_iou, valid_slot_geometry)
 from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
 
 
@@ -29,7 +30,8 @@ class RoiGroupSequence:
                  reidentification_max_distance_px=40.0,
                  reject_transition_roi_detections=True, transition_quarantine_min_frames=4,
                  require_first_unload_event_for_g1=False,
-                 outside_mapping_quarantine_seconds=3.0):
+                 outside_mapping_quarantine_seconds=3.0,
+                 use_previous_s4_layouts=False):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
@@ -134,6 +136,10 @@ class RoiGroupSequence:
         self._outside_mapping_quarantine_track_ids = set()
         self._outside_mapping_quarantine_group = (tracker.phase, tracker.group_id)
         self._reused_id_candidates = {}
+        self.use_previous_s4_layouts = bool(use_previous_s4_layouts)
+        self._unload_layouts = {}
+        self._layout_samples = deque(maxlen=3)
+        self._layout_sample_key = None
 
     def _distance(self, point):
         return cv2.pointPolygonTest(self.contour,tuple(float(v) for v in point),True)
@@ -217,11 +223,40 @@ class RoiGroupSequence:
         result = deepcopy(self.tracker)
         result.reset_group(group_id,phase=phase)
         result.track_store = self.track_store
+        if self.use_previous_s4_layouts and result.phase == "unload":
+            references = [(old_group, np.median(samples, axis=0))
+                          for old_group, samples in self._unload_layouts.items() if old_group < group_id]
+            result._s4_reference_layouts = tuple((old_group, layout)
+                for old_group, layout in references if valid_slot_geometry(layout))
         if entry:
             result.initialization_seconds = self.entry_seconds
             result.geometry_initialization_seconds = self.entry_seconds
             result.initialization_stability_ratio = self.entry_stability_ratio
         return result
+
+    def _record_unload_layout(self, result, now):
+        """Keep a bounded set of stable measured quartets per unloading group."""
+        tracker = self.tracker
+        if (self.state != "active" or result["slot_numbering_status"] != "final"
+                or tracker.phase != "unload" or tracker.last_time != now
+                or not self._observations_enabled or tracker.identity_lost
+                or any(not slot.geometry_observed or slot.geometry_inferred
+                       or slot.observation not in ("empty", "filled") for slot in tracker.slots)
+                or None in tracker.byte_track_ids or len(set(tracker.byte_track_ids)) != 4
+                or not valid_slot_geometry(tracker.points)):
+            self._layout_samples.clear()
+            return
+        points = tracker.points
+        key = (tracker.group_id, tuple(tracker.byte_track_ids))
+        if key != self._layout_sample_key or (self._layout_samples and np.max(
+                np.linalg.norm(points-self._layout_samples[0], axis=1))
+                > tracker._spacing()*self.entry_stability_ratio):
+            self._layout_samples.clear()
+        self._layout_sample_key = key
+        self._layout_samples.append(points.copy())
+        if len(self._layout_samples) == self._layout_samples.maxlen:
+            samples = self._unload_layouts.setdefault(tracker.group_id, deque(maxlen=128))
+            samples.append(points.copy())
 
     def _reject_track(self, obj, reason):
         if obj.get('track_id') is not None:
@@ -1228,7 +1263,7 @@ class RoiGroupSequence:
             return result
         return None
 
-    def update(self, objects, now, *, observations_enabled=True):
+    def update(self, objects, now, *, observations_enabled=True, s4_position_candidates=()):
         if self.last_time is not None and now <= self.last_time:
             raise ValueError("分组时间必须严格递增")
         self.last_time = float(now)
@@ -1266,10 +1301,17 @@ class RoiGroupSequence:
                 self._exclude_departing(objects, now), now), now)
             initial = [o for o in active if o["class_name"] not in SLOT_STATES or self._distance(
                 ((o["xyxy"][0]+o["xyxy"][2])/2,(o["xyxy"][1]+o["xyxy"][3])/2)) >= 0]
+            position_candidates = ()
+            if s4_position_candidates and observations_enabled and self.state == "active":
+                # 无ID框与已有轨迹重复时采用已有轨迹。objects 也包含被排除的旧组轨迹。
+                tracked_boxes = [obj["xyxy"] for obj in objects if obj["class_name"] in SLOT_STATES]
+                position_candidates = [obj for obj in s4_position_candidates
+                    if not any(box_containment(obj["xyxy"], box) >= .9 for box in tracked_boxes)]
             result = self.tracker.update(active,now,observations_enabled=observations_enabled,
                 initialization_objects=initial,roi_contour=self.contour,
                 before_observe=self._observe_motion,
-                translation_direction=self.direction if self.state == "exiting" else None)
+                translation_direction=self.direction if self.state == "exiting" else None,
+                s4_position_candidates=position_candidates)
             if self.tracker.points is not None and self.state == "initializing":
                 self._arm(now)
             if self.state == "exiting" and (self.exit_min_slots == 1 or
@@ -1298,6 +1340,8 @@ class RoiGroupSequence:
             result["new_events"] = []
             result = self._mask_initial_g1_result(result)
         self._sync_track_bindings(result, now)
+        if self.use_previous_s4_layouts:
+            self._record_unload_layout(result, now)
         result["new_events"] = list(result.get("new_events", [])) + deepcopy(self._deferred_new_events)
         self.all_events.extend(deepcopy(result["new_events"]))
         if self.state in ("waiting_next","stabilizing_next","sequence_complete"):

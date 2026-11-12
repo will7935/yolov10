@@ -23,6 +23,7 @@ class HandContactEvidence:
     source: str | None
     region_hits: list
     candidates: list
+    overlap_ratio: float = 0.0
 
     def diagnostic(self):
         return {"contact_detected": self.accepted, "decision_reason": self.reason,
@@ -36,7 +37,7 @@ def _centered_box(point, size):
     return [point[0]-width/2, point[1]-height/2, point[0]+width/2, point[1]+height/2]
 
 
-def _overlap_ratio(box, hand_box):
+def box_overlap_ratio(box, hand_box):
     if box is None:
         return 0.0
     overlap = max(0., min(box[2], hand_box[2])-max(box[0], hand_box[0])) * \
@@ -87,8 +88,8 @@ def evaluate_s4_contact(points, box_sizes, slot_index, hands, policy, *, region=
                 region_hit = overlap > 0
         covered = [i+1 for i, point in enumerate(points)
                    if hand_box[0] <= point[0] <= hand_box[2] and hand_box[1] <= point[1] <= hand_box[3]]
-        s4_ratio = _overlap_ratio(target_box, hand_box)
-        competing_ratio = _overlap_ratio(competing_box, hand_box)
+        s4_ratio = box_overlap_ratio(target_box, hand_box)
+        competing_ratio = box_overlap_ratio(competing_box, hand_box)
         relevant = (slot_index+1 in covered or competing_index+1 in covered
                     or s4_ratio >= policy.overlap_ratio or competing_ratio >= policy.competing_margin)
         try:
@@ -111,12 +112,16 @@ def evaluate_s4_contact(points, box_sizes, slot_index, hands, policy, *, region=
             regional.append(candidate)
 
     outcome = (False, "no_contact_evidence", None)
+    selected = None
     if direct:
-        outcome = decision(max(direct, key=lambda item: item["confidence"]), False)
+        selected = max(direct, key=lambda item: item["confidence"])
+        outcome = decision(selected, False)
         if outcome[0]:
-            return HandContactEvidence(*outcome, hits, diagnostics)
+            return HandContactEvidence(*outcome, hits, diagnostics, selected["s4_overlap_ratio"])
     if region_expected and regional:
-        outcome = decision(max(regional, key=lambda item: item["confidence"]), True)
+        selected = max(regional, key=lambda item: item["confidence"])
+        outcome = decision(selected, True)
     elif hits and not region_expected:
         outcome = (False, "region_order_not_expected", None)
-    return HandContactEvidence(*outcome, hits, diagnostics)
+    return HandContactEvidence(*outcome, hits, diagnostics,
+                               0.0 if selected is None else selected["s4_overlap_ratio"])

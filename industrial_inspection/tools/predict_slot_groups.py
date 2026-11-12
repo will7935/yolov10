@@ -105,12 +105,13 @@ from industrial_inspection.tools.slot_process_config import (
     MACHINE_CENTER_NORMALIZED,
     START_FRAME, END_FRAME, INITIALIZATION_SECONDS,
     MIN_INITIALIZATION_FRAMES, INITIAL_GROUP_STABLE_SECONDS, INITIALIZATION_HISTORY_SECONDS,
-    THREE_POINT_GROUP_INITIALIZATION, REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1,
+    THREE_POINT_GROUP_INITIALIZATION, REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1, S4_USE_PREVIOUS_GROUP_LAYOUTS,
     MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
     MIN_CONFIRM_FRAMES, IDENTITY_LOST_SECONDS, CONFLICT_CONF_MARGIN,
     HAND_OVERLAP_RATIO, LOAD_HAND_CONTACT_ENABLED, LOAD_HAND_CONTACT_SECONDS,
     LOAD_HAND_CONTACT_MIN_FRAMES, LOAD_HAND_CONTACT_OVERLAP_RATIO, LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
     LOAD_HAND_CONTACT_COMPETING_SLOT_ID, LOAD_HAND_CONTACT_COMPETING_MARGIN, LOAD_HAND_CONTACT_COMPETING_RATIO,
+    S4_CONTACT_PREDICTION_SECONDS, S4_PREDICTION_CONTACT_OVERLAP_RATIO,
     S4_HAND_REGION_ENABLED, S4_HAND_REGION_RESELECT, S4_HAND_REGION_FILE,
     ROI_TRACKING_MARGIN_PX, LOCAL_REDETECT_ENABLED, LOCAL_REDETECT_CROP_SIZE,
     LOCAL_REDETECT_IMAGE_SIZE, ROTATION_INTERVALS,
@@ -238,6 +239,8 @@ def make_tracker(hand_region=None, *, unload_entry_numbering_seconds=None, machi
         load_hand_contact_competing_slot_id=LOAD_HAND_CONTACT_COMPETING_SLOT_ID,
         load_hand_contact_competing_margin=LOAD_HAND_CONTACT_COMPETING_MARGIN,
         load_hand_contact_competing_ratio=LOAD_HAND_CONTACT_COMPETING_RATIO,
+        s4_contact_prediction_seconds=S4_CONTACT_PREDICTION_SECONDS,
+        s4_prediction_contact_overlap_ratio=S4_PREDICTION_CONTACT_OVERLAP_RATIO,
         s4_hand_region=hand_region,
         slot2_below_slot3=SLOT2_BELOW_SLOT3,
         allow_three_point_initialization=THREE_POINT_GROUP_INITIALIZATION)
@@ -264,6 +267,7 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
         reject_transition_roi_detections=REJECT_TRANSITION_ROI_DETECTIONS,
         transition_quarantine_min_frames=TRANSITION_QUARANTINE_MIN_FRAMES,
         outside_mapping_quarantine_seconds=OUTSIDE_MAPPING_QUARANTINE_SECONDS,
+        use_previous_s4_layouts=S4_USE_PREVIOUS_GROUP_LAYOUTS,
         require_first_unload_event_for_g1=REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1,
         reidentification_enabled=REIDENTIFICATION_ENABLED,
         reidentification_max_gap_seconds=REIDENTIFICATION_MAX_GAP_SECONDS,
@@ -923,7 +927,12 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     # gate. Retired boxes remain available for that gate but
                     # never enter the local crop detector.
                     objects.extend(retired_raw)
-                    snapshot = sequence.update(objects,timestamp,observations_enabled=enabled)
+                    s4_position_candidates = [dict(item, confidence=item["tracking_confidence"])
+                        for item in tracked_raw if item["class_name"] in SLOT_STATES
+                        and item.get("track_id") is None
+                        and item["tracking_confidence"] >= thresholds.tracking_low]
+                    snapshot = sequence.update(objects,timestamp,observations_enabled=enabled,
+                                               s4_position_candidates=s4_position_candidates)
                     inspection_processed += 1
                 else:
                     local_attempts = []

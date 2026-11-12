@@ -61,6 +61,7 @@ MIN_INITIALIZATION_FRAMES = 2 # 同时满足最少帧数；编号后不再按x�
 INITIAL_GROUP_STABLE_SECONDS = .3  # G1正式建立S号前的独立几何稳定时间
 INITIALIZATION_HISTORY_SECONDS = 5.0 # 基线及可靠临时轨迹有效期；未获多帧支持的点按IDENTITY_LOST_SECONDS清理
 THREE_POINT_GROUP_INITIALIZATION = True  # 三个真实槽位可推算缺失S4后建立组几何
+S4_USE_PREVIOUS_GROUP_LAYOUTS = True  # 下料逐点换组时，优先采用一致的前组实测四槽布局推算S4
 # G1下料在首个可信下料事件前只作为候选；若候选先离开ROI则自动释放，不占用G1。
 REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1 = True
 
@@ -85,6 +86,8 @@ LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED = False  # 启用竞争槽位抑制：�
 LOAD_HAND_CONTACT_COMPETING_SLOT_ID = 2          # 竞争槽位编号；当前使用S2作为与S4比较的槽位
 LOAD_HAND_CONTACT_COMPETING_MARGIN = .10         # 竞争槽位的最低重叠率；S2重叠率低于此值不抑制S4
 LOAD_HAND_CONTACT_COMPETING_RATIO = 1.0          # 竞争倍数；S2重叠率至少是S4的该倍数才抑制S4
+S4_CONTACT_PREDICTION_SECONDS = .8               # S4漏检时临时接触框的最长有效时长
+S4_PREDICTION_CONTACT_OVERLAP_RATIO = .15         # 仅靠预测框建立待视觉核验时的最小覆盖比例
 S4_HAND_REGION_ENABLED = True  # 手框进入手动选定的区域时，作为S4接触线索
 S4_HAND_REGION_RESELECT = False  # True：每次启动重新选择；False：优先读取已保存区域
 S4_HAND_REGION_FILE = ROOT / "industrial_inspection" / "configs" / "s4_hand_region.json"
