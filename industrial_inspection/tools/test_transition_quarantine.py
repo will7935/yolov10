@@ -66,6 +66,30 @@ class TransitionQuarantineTests(unittest.TestCase):
         self.assertEqual(result['roi_observed_track_ids'], [309])
         self.assertIn(283, sequence.closed_groups[0]['roi_observed_track_ids'])
 
+    def test_upper_right_band_only_defers_new_unload_entry_tracks(self):
+        sequence = self.make()
+        sequence.unload_entry_upper_right_band = (300, 12)
+        self.close(sequence)
+        tracker = sequence.tracker
+        tracker._entry_points = [np.array([320, 115]), np.array([380, 115])]
+        tracker._entry_seen_at = [.5, .5]
+        tracker._entry_track_ids = [309, 310]
+        candidates = [slot(311, [350, 87]), slot(309, [320, 87]),
+                      slot(312, [375, 108]), slot(313, [285, 87]), slot(314, [406, 175])]
+        sequence.track_store.observe(candidates, .6)
+        result = sequence._admit_entry_objects(candidates, tracker, .6)
+        self.assertEqual({obj['track_id'] for obj in result}, {309, 312, 313, 314})
+        self.assertEqual(sequence._track_rejections[311], 'unload_entry_upper_right_band')
+        self.assertIsNone(sequence.track_store.owner(311))
+        self.assertEqual(sequence.track_store.describe(311)['observation'], 'empty')
+        self.assertIn(slot(311, [350, 103]), sequence._admit_entry_objects([slot(311, [350, 103])], tracker, .7))
+
+        tracker.phase = 'load'
+        self.assertEqual(sequence._admit_entry_objects(candidates, tracker, .7), candidates)
+        tracker.phase = 'unload'
+        sequence.state = 'active'
+        self.assertEqual(sequence._admit_entry_objects(candidates, tracker, .7), candidates)
+
     def test_same_group_missing_track_restores_original_slot_without_quarantine(self):
         sequence = self.make()
         before = sequence.tracker.byte_track_ids.index(101)

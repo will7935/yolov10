@@ -45,15 +45,27 @@ class LocalRedetectionTests(unittest.TestCase):
         self.assertEqual(attempts,[])
         model.predict.assert_not_called()
 
+    def test_missing_s1_to_s3_never_trigger_crops(self):
+        result, attempts, model = self.recover(boxes(visible=(3,)), [])
+        self.assertEqual(result, boxes(visible=(3,)))
+        self.assertEqual(attempts, [])
+        model.predict.assert_not_called()
+
+    def test_only_s4_is_cropped_when_multiple_slots_are_missing(self):
+        local = [{'class_name':'wafer_slot_empty','confidence':.9,'xyxy':[80,60,100,80]}]
+        result, attempts, model = self.recover(boxes(visible=(0,)), local)
+        self.assertEqual([attempt['slot_id'] for attempt in attempts], [4])
+        self.assertEqual(result[-1]['xyxy'], [190,190,210,210])
+        model.predict.assert_called_once()
+
     def test_local_hand_threshold_does_not_lower_slot_evidence_threshold(self):
-        self.sequence.tracker.phase='load'
         local=[{'class_name':'hand','confidence':.025,'xyxy':[80,60,100,80]},
                {'class_name':'wafer_slot_filled','confidence':.25,'xyxy':[80,60,100,80]}]
         with patch.object(predict,'HAND_DETECTION_CONFIDENCE',.02):
             result,_,model=self.recover(boxes(visible=(0,1,2)),local)
         self.assertEqual(model.predict.call_args.kwargs['conf'],.02)
         additions=result[3:]
-        self.assertEqual([item['class_name'] for item in additions],['hand'])
+        self.assertEqual(additions, [])
 
     def test_crop_coordinates_return_to_source_and_wrong_slot_is_rejected(self):
         # 槽4中心(200,200)，裁剪原点(110,130)；第二个框属于邻槽3，不能用于槽4。
@@ -93,12 +105,14 @@ class LocalRedetectionTests(unittest.TestCase):
         self.assertEqual(snapshot['slots'][3]['last_confirmed_state'],'filled')
         self.assertEqual(snapshot['new_events'],[])
 
-    def test_hand_in_crop_is_kept_even_when_slot_frame_is_missing(self):
+    def test_loading_does_not_run_local_redetection(self):
         self.sequence.tracker.phase='load'
-        hand={'class_name':'hand','confidence':.95,'xyxy':[75,55,105,85]}
-        result,attempts,_=self.recover(boxes(visible=(0,1,2)),[hand])
-        self.assertEqual(attempts[0]['accepted_detections'],[])
-        self.assertEqual([o['class_name'] for o in result[-1:]],['hand'])
+        visible = boxes(visible=(0, 1, 2))
+        local = [{'class_name': 'wafer_slot_filled', 'confidence': .95, 'xyxy': [80, 60, 100, 80]}]
+        result, attempts, model = self.recover(visible, local)
+        self.assertEqual(result, visible)
+        self.assertEqual(attempts, [])
+        model.predict.assert_not_called()
 
     def test_other_group_stages_and_lost_identity_never_run_crops(self):
         for state in ('initializing','entering','exiting','waiting_next','sequence_complete','identity_uncertain'):
@@ -123,20 +137,39 @@ class LocalRedetectionTests(unittest.TestCase):
             snapshot=self.sequence.update(result,now)
         np.testing.assert_allclose(self.sequence.tracker.reference_points,original)
         self.assertEqual(snapshot['slots'][3]['center_xy'],[200.,200.])
-        self.assertTrue(snapshot['slots'][3]['position_is_prediction'])
         self.assertEqual(snapshot['slots'][3]['state'],'empty')
         self.assertEqual(snapshot['group_id'],2)
         self.assertEqual(snapshot['group_status'],'active')
+        self.assertTrue(snapshot['s4_unload_review_pending'])
+        self.sequence.finish()
         self.assertEqual([(e['slot_id'],e['action']) for e in self.sequence.all_events],[(4,'unload')])
 
     def test_outside_roi_and_distant_boxes_do_not_fill_missing_slot(self):
-        self.sequence.contour=np.array([[80,80],[300,80],[300,300],[80,300]],dtype=np.float32)
-        # 槽1裁剪原点(10,30)；第一个框出ROI，第二个距槽1中心超过40px。
-        local=[{'class_name':'wafer_slot_empty','confidence':.99,'xyxy':[55,60,75,80]},
-               {'class_name':'wafer_slot_empty','confidence':.99,'xyxy':[125,60,145,80]}]
-        result,attempts,_=self.recover(boxes(visible=(1,2,3)),local)
+        self.sequence.contour=np.array([[80,80],[225,80],[225,300],[80,300]],dtype=np.float32)
+        # S4 裁剪原点为 (110,130)。首个框中心距 S4 30px 但越出 ROI，第二个距 S4 45px。
+        local=[{'class_name':'wafer_slot_empty','confidence':.99,'xyxy':[110,60,130,80]},
+               {'class_name':'wafer_slot_empty','confidence':.99,'xyxy':[80,105,100,125]}]
+        result,attempts,_=self.recover(boxes(visible=(0,1,2)),local)
         self.assertEqual(len(result),3)
         self.assertEqual(attempts[0]['accepted_detections'],[])
+
+    def test_fallback_uses_alternate_gate_but_keeps_geometric_center(self):
+        tracker = self.sequence.tracker
+        tracker._s4_before_recalculation = np.array([175., 200.])
+        local = {'class_name': 'wafer_slot_filled', 'confidence': .9, 'xyxy': [60, 60, 80, 80]}
+        visible = boxes(visible=(0, 1, 2), filled=(0, 1, 2))
+        model = SyntheticModel([[], [local]])
+        observations, attempts = predict.recover_missing_slots(
+            model, self.frame, visible, self.sequence, self.args)
+        self.assertEqual([a['crop_xyxy'] for a in attempts], [[110, 130, 290, 270], [85, 130, 265, 270]])
+        self.assertEqual(attempts[1]['accepted_detections'][0]['xyxy'], [145, 190, 165, 210])
+        result = self.sequence.update(observations, .1)
+        self.assertEqual(result['slots'][3]['observation'], 'filled')
+        result = self.sequence.update(visible, .2)
+        self.assertEqual(result['slots'][3]['temporary_contact_box_xyxy'], [145., 190., 165., 210.])
+        self.assertEqual(result['slots'][3]['center_xy'], [200., 200.])
+        np.testing.assert_allclose(tracker.reference_points[3], [200., 200.])
+        self.assertIsNone(result['slots'][3]['byte_track_id'])
 
     def test_old_group_crop_is_not_used_to_initialize_next_group(self):
         roi=np.array([[80,80],[410,80],[410,310],[80,310]],dtype=np.float32)

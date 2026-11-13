@@ -8,6 +8,57 @@ from industrial_inspection.tools.slot_group_tracker import SlotGroupTracker
 from industrial_inspection.tools.test_slot_group_tracker import CENTERS, detection
 
 
+class S4UnloadReviewTests(unittest.TestCase):
+    def test_quick_visual_reversal_cancels_unload_and_refill(self):
+        tracker = SlotGroupTracker(CENTERS, confirm_seconds=0., minimum_frames=2,
+                                   load_hand_contact_seconds=0.)
+        support = [detection(i, 'filled') for i in (1, 2, 3)]
+        for now, state in ((0., 'filled'), (.1, 'filled'), (.2, 'empty'), (.3, 'empty')):
+            result = tracker.update(support + [detection(4, state)], now)
+        self.assertEqual(result['new_events'], [])
+        self.assertTrue(result['s4_unload_review_pending'])
+
+        tracker.update(support + [detection(4, 'filled')], .4)
+        result = tracker.update(support + [detection(4, 'filled')], .5)
+        self.assertEqual(result['new_events'], [])
+        self.assertEqual(tracker.events, [])
+        self.assertFalse(result['s4_unload_review_pending'])
+        self.assertEqual(result['s4_contact_diagnostic']['unload_review'], 'visual_reversal_cancelled')
+
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [188, 188, 212, 212]}
+        for now in (.6, .7):
+            tracker.update(support + [hand], now)
+        for now in (.8, .9):
+            result = tracker.update(support + [detection(4, 'empty')], now)
+        event, = result['new_events']
+        self.assertEqual(event['time_upper'], .8)
+        self.assertEqual(event['reported_at'], .9)
+        self.assertEqual(tracker.events, [event])
+
+    def test_finishing_publishes_pending_unload_with_original_times(self):
+        tracker = SlotGroupTracker(CENTERS, confirm_seconds=0., minimum_frames=2)
+        roi = np.float32([[40, 40], [300, 40], [300, 300], [40, 300]])
+        sequence = RoiGroupSequence(tracker, roi)
+        for now, state in ((0., 'filled'), (.1, 'filled'), (.2, 'empty'), (.3, 'empty')):
+            result = sequence.update([detection(4, state)], now)
+        self.assertTrue(result['s4_unload_review_pending'])
+        result = sequence.finish()
+        event, = result['new_events']
+        self.assertEqual((event['time_upper'], event['confirmed_at']), (.2, .3))
+        self.assertEqual(sequence.all_events, [event])
+        self.assertEqual(sequence.finish()['new_events'], [])
+
+    def test_review_timeout_publishes_visual_unload_once(self):
+        tracker = SlotGroupTracker(CENTERS, confirm_seconds=0., minimum_frames=2)
+        for now, state in ((0., 'filled'), (.1, 'filled'), (.2, 'empty'), (.3, 'empty'), (1., 'empty')):
+            result = tracker.update([detection(4, state)], now)
+            self.assertEqual(result['new_events'], [])
+        result = tracker.update([detection(4, 'empty')], 1.15)
+        event, = result['new_events']
+        self.assertEqual((event['time_upper'], event['confirmed_at'], event['reported_at']), (.2, .3, 1.15))
+        self.assertEqual(tracker.update([detection(4, 'empty')], 1.2)['new_events'], [])
+
+
 class S4PredictionCacheTests(unittest.TestCase):
     def tracker(self):
         tracker = SlotGroupTracker(CENTERS, confirm_seconds=0., minimum_frames=2,
@@ -281,6 +332,29 @@ class S4MeasuredLayoutTests(unittest.TestCase):
         result = self.enter_with_three_slots()
         self.assertEqual(result['initialization']['s4_reference_group_ids'], [])
         self.assertEqual(result['slots'][3]['center_xy'], [225., 212.])
+
+    def test_recalculates_once_after_three_real_slots_stabilize_again(self):
+        tracker = SlotGroupTracker(initialization_seconds=.05, initialization_frames=2,
+            unload_entry_numbering_seconds=10.)
+        tracker.start_incremental_entry(40.)
+        layout = np.array([[100, 100], [100, 200], [200, 100], [200, 200]], dtype=float)
+        visible = [detection(i, 'filled', centers=layout, track_id=i) for i in (1, 2, 3)]
+        tracker.update(visible, 0.)
+        initial = tracker.update(visible, .05)
+        self.assertEqual(initial['slots'][3]['center_xy'], [200., 200.])
+        tracker.update([visible[0], visible[2]], .10)
+
+        layout[1, 1] = 230.
+        visible[1] = detection(2, 'filled', centers=layout, track_id=20)
+        recovered = tracker.update(visible, .15)
+        self.assertNotIn('s4_last_recalculated_at', recovered['initialization'])
+        stable = tracker.update(visible, .20)
+        self.assertEqual(stable['initialization']['s4_last_recalculated_at'], .20)
+        self.assertEqual(stable['slots'][3]['center_xy'], [200., 230.])
+        self.assertTrue(stable['slots'][3]['position_is_prediction'])
+        self.assertIsNone(stable['slots'][3]['byte_track_id'])
+        follow = tracker.update(visible, .25)
+        self.assertEqual(follow['initialization']['s4_last_recalculated_at'], .20)
 
     def enter_with_three_slots(self):
         entry = self.sequence._new_tracker(3, entry=True)

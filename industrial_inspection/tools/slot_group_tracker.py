@@ -13,6 +13,7 @@ from industrial_inspection.tools.s4_hand_contact import (
     HandContactPolicy, box_overlap_ratio, evaluate_s4_contact)
 
 SLOT_STATES = {"wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}
+S4_UNLOAD_REVIEW_SECONDS = .8
 
 
 def sort_events_by_time_upper(events):
@@ -332,12 +333,14 @@ class SlotGroupTracker:
         self.s4_region_diagnostic = None
         self.s4_contact_diagnostic = None
         self._region_formal_numbering = True
+        self._pending_s4_unload = None
         self.last_time = None
         self.last_geometry_time = None
         self.identity_lost = False
         self.unmatched = []
         self._predicted_indices = set()
         self._s4_position_candidate = None
+        self._s4_before_recalculation = None
         self._s4_reference_layouts = ()
         self.initialization_seconds, self.initialization_frames = initialization_seconds, initialization_frames
         self.geometry_initialization_seconds = (initialization_seconds if
@@ -383,7 +386,6 @@ class SlotGroupTracker:
         self._entry_seen_at = []
         self._entry_support_since = []
         self._entry_support_count = []
-        self._entry_geometry_at_seen = []
         self._entry_inferred_indices = set()
         self._entry_reference_points = None
         # Once a provisional slot has accumulated enough valid S4 contact
@@ -393,10 +395,7 @@ class SlotGroupTracker:
         # when the geometry is rebuilt.
         self._entry_locked_s4_slot = None
         self._entry_locked_s4_since = None
-        # 三个真实点在创建虚拟S4前必须先连续停稳。
-        self._three_point_stable_points = None
-        self._three_point_stable_since = None
-        self._three_point_stable_count = 0
+        self._reset_three_point_stability()
         self._entry_canonical_points = None
         self._entry_revision = 0
         self._initial_seen = set()
@@ -436,10 +435,14 @@ class SlotGroupTracker:
         self._entry_locked_s4_slot = None
         self._entry_locked_s4_since = None
         self._point_tracking_gate = float(match_distance)
+        self.initialization.update(method="incremental_yolo_box_centers", reason="waiting_for_new_points")
+
+    def _reset_three_point_stability(self):
         self._three_point_stable_points = None
         self._three_point_stable_since = None
         self._three_point_stable_count = 0
-        self.initialization.update(method="incremental_yolo_box_centers", reason="waiting_for_new_points")
+        self._three_point_support = None
+        self._three_point_prediction_applied = False
 
     def _numbering_order(self, points):
         """只在建立身份时编号；相机已知的上下关系辅助区分中间两槽。"""
@@ -652,16 +655,6 @@ class SlotGroupTracker:
         self._entry_seen_at = [self._entry_seen_at[i] for i in keep]
         self._entry_support_since = [self._entry_support_since[i] for i in keep]
         self._entry_support_count = [self._entry_support_count[i] for i in keep]
-        anchors = []
-        for i in keep:
-            anchor = np.full((len(keep), 2), np.nan)
-            previous = self._entry_geometry_at_seen[i]
-            if previous is not None:
-                for j, old in enumerate(keep):
-                    if old < len(previous):
-                        anchor[j] = previous[old]
-            anchors.append(anchor)
-        self._entry_geometry_at_seen = anchors
         self._initial_seen = {mapping[i+1]-1 for i in self._initial_seen if i+1 in mapping}
         self.slots = [self.slots[i] for i in keep]
         self.slots.extend(SlotState(i+1) for i in range(len(keep), 4))
@@ -675,6 +668,8 @@ class SlotGroupTracker:
             event["slot_id"] = mapping[event["slot_id"]]
         self._initial_points, self._initial_since, self._initial_count = None, None, 0
         self._entry_reference_points = None
+        self._s4_before_recalculation = None
+        self._reset_three_point_stability()
         self._entry_revision += 1
 
     def _associate_with_track_ids(self, candidates, distances, track_ids, gate):
@@ -794,30 +789,6 @@ class SlotGroupTracker:
             distances = np.linalg.norm(np.asarray(self._entry_points)[:, None]
                 -np.asarray([c["center"] for c in candidates])[None, :], axis=2)
             matches = self._associate_entry_distances(distances, candidates)
-        # 遮挡后的旧中心可能更靠近刚出现的邻槽。两个近期真实匹配只用于
-        # 否决反向跳点，不外推隐藏槽的位置，也不据此建立新的槽位。
-        recent_seconds = max(self.confirm_seconds, self.initialization_seconds)
-        support = [i for i, col in matches.items()
-                   if now-self._entry_seen_at[i] <= recent_seconds
-                   and not candidates[col]["conflict"] and not self._occluded(candidates[col], hands)]
-        if len(support) >= 2:
-            for i, anchor in enumerate(self._entry_geometry_at_seen):
-                if anchor is None or now-self._entry_seen_at[i] <= recent_seconds:
-                    continue
-                indices = [j for j in support if j < len(anchor) and np.isfinite(anchor[j]).all()]
-                if len(indices) < 2:
-                    continue
-                # 从该槽最后真实出现时累计运动，避免下一帧运动变小就又接到邻槽。
-                deltas = np.asarray([np.asarray(candidates[matches[j]]["center"])-anchor[j] for j in indices])
-                shift = deltas.mean(axis=0)
-                distance = np.linalg.norm(shift)
-                if (distance > self._entry_gate*.1
-                        and np.max(np.linalg.norm(deltas-shift, axis=1)) <= self._entry_gate*.6):
-                    for col, obj in enumerate(candidates):
-                        delta = np.asarray(obj["center"])-self._entry_points[i]
-                        if np.dot(delta, shift)/distance < -self._entry_gate*.2:
-                            distances[i, col] = 1e6
-            matches = self._associate_entry_distances(distances, candidates)
         new_indices = [j for j in range(len(candidates)) if j not in matches.values()]
         # 一个已知点附近的重复/歧义框不能另开一个点号；多于四槽时也不选高分四框。
         new_indices = [j for j in new_indices if not self._entry_points or
@@ -852,46 +823,45 @@ class SlotGroupTracker:
                 self._entry_seen_at.append(float(now))
                 self._entry_support_since.append(None)
                 self._entry_support_count.append(0)
-                self._entry_geometry_at_seen.append(None)
                 matches[i] = j
         reliable = [i for i, col in matches.items() if not candidates[col]["conflict"]
                     and not self._occluded(candidates[col], hands)]
+        inferred_s4 = next(iter(self._entry_inferred_indices)) if len(self._entry_inferred_indices) == 1 else None
+        can_refresh_s4 = (enabled and len(self._entry_points) == 4
+                          and inferred_s4 is not None and inferred_s4 not in matches
+                          and len(candidates) <= 4 and all(
+                              candidates[matches[i]].get("detection_source") != "local_crop" for i in reliable))
         three_point_ready = False
-        inference_points = np.asarray(self._entry_points, dtype=float)
-        if len(self._entry_points) == 3 and self.allow_three_point_initialization:
-            # 用当前帧的三个真实匹配点计算停稳证据；预测S4之前不能
-            # 把两个点、零稳定帧的临时几何当作完整四槽布局。
-            observed = inference_points.copy()
-            for i in reliable:
-                observed[i] = np.asarray(candidates[matches[i]]["center"], dtype=float)
-            if len(reliable) >= 3 and np.isfinite(observed).all():
+        if (self.allow_three_point_initialization and len(reliable) == 3
+                and (len(self._entry_points) == 3 or can_refresh_s4)):
+            support = tuple((i, candidates[matches[i]].get("track_id")) for i in sorted(reliable))
+            observed = np.asarray([candidates[matches[i]]["center"] for i, _ in support], dtype=float)
+            if np.isfinite(observed).all():
                 spacing = np.min(np.linalg.norm(observed[:, None]-observed[None, :], axis=2)
                     [np.triu_indices(3, 1)])
                 stable_delta = (float("inf") if self._three_point_stable_points is None else
                     np.max(np.linalg.norm(observed-self._three_point_stable_points, axis=1)))
-                if (self._three_point_stable_points is None
+                if (self._three_point_support != support
                         or stable_delta > spacing*self.initialization_stability_ratio):
-                    self._three_point_stable_points = observed.copy()
+                    self._three_point_support = support
                     self._three_point_stable_since = float(now)
-                    self._three_point_stable_count = 1
-                else:
-                    self._three_point_stable_points = observed.copy()
-                    self._three_point_stable_count += 1
-                three_point_ready = (self._three_point_stable_count >= self.initialization_frames
-                    and self._three_point_stable_since is not None
+                    self._three_point_stable_count = 0
+                    self._three_point_prediction_applied = False
+                # 重算时用本轮起点判断停稳，避免连续小幅移动累计成明显位移。
+                if not can_refresh_s4 or self._three_point_stable_count == 0:
+                    self._three_point_stable_points = observed
+                self._three_point_stable_count += 1
+                three_point_ready = (not self._three_point_prediction_applied
+                    and self._three_point_stable_count >= self.initialization_frames
                     and now-self._three_point_stable_since+1e-9 >= self.geometry_initialization_seconds)
-                inference_points = observed
             else:
-                self._three_point_stable_points = None
-                self._three_point_stable_since = None
-                self._three_point_stable_count = 0
+                self._reset_three_point_stability()
         else:
-            self._three_point_stable_points = None
-            self._three_point_stable_since = None
-            self._three_point_stable_count = 0
+            self._reset_three_point_stability()
         inferred_now = False
-        if len(self._entry_points) == 3 and self.allow_three_point_initialization and three_point_ready:
-            inferred, reference_groups = self._infer_entry_s4(inference_points, roi_contour)
+        refreshed_s4 = False
+        if len(self._entry_points) == 3 and three_point_ready:
+            inferred, reference_groups = self._infer_entry_s4(observed, roi_contour)
             if inferred is not None:
                 index = len(self._entry_points)
                 self.initialization.update(
@@ -902,11 +872,23 @@ class SlotGroupTracker:
                 self._entry_seen_at.append(float(now))
                 self._entry_support_since.append(None)
                 self._entry_support_count.append(0)
-                self._entry_geometry_at_seen.append(None)
                 self._entry_inferred_indices.add(index)
                 self._predicted_indices.add(index)
                 self.slots[index].geometry_inferred = True
+                self._three_point_prediction_applied = True
                 inferred_now = True
+        elif three_point_ready and not (self._entry_locked_s4_slot is not None
+                                       and self._entry_locked_s4_slot.load_contact_pending):
+            # 重新停稳后用当前三点重算一次，避免把遮挡前的定位偏差继续传递。
+            refreshed, _ = self._infer_entry_s4(observed, roi_contour)
+            if refreshed is not None and (roi_contour is None or cv2.pointPolygonTest(
+                    roi_contour, tuple(refreshed), False) >= 0):
+                if self._s4_before_recalculation is None:
+                    self._s4_before_recalculation = self._entry_points[inferred_s4].copy()
+                self._entry_points[inferred_s4] = refreshed
+                self._three_point_prediction_applied = True
+                self.initialization["s4_last_recalculated_at"] = float(now)
+                refreshed_s4 = True
         if inferred_now:
             # 三个真实点已经完成停稳确认；加入虚拟S4后沿用这段稳定证据，
             # 避免因为数组从3点变4点而无意义地重新等待一轮稳定帧。
@@ -932,8 +914,14 @@ class SlotGroupTracker:
                 if .85 <= scale <= 1.15 and np.max(np.linalg.norm(predicted[reliable]-new, axis=1)) <= self._entry_gate*.2:
                     s4_index = self._entry_s4_index()
                     if s4_index is not None and s4_index not in reliable:
-                        self._entry_points[s4_index] = predicted[s4_index]
+                        if self._s4_before_recalculation is not None:
+                            self._s4_before_recalculation = (
+                                self._s4_before_recalculation @ matrix[:, :2].T + matrix[:, 2])
+                        if not refreshed_s4:
+                            self._entry_points[s4_index] = predicted[s4_index]
                         self._predicted_indices.add(s4_index)
+        if inferred_s4 in reliable:
+            self._s4_before_recalculation = None
         for i, col in matches.items():
             if not candidates[col]["conflict"] and not self._occluded(candidates[col], hands):
                 self._entry_points[i] = np.asarray(candidates[col]["center"], dtype=float)
@@ -957,12 +945,6 @@ class SlotGroupTracker:
                 if not enabled:
                     self._entry_support_since[i] = None
                     self._entry_support_count[i] = 0
-        geometry = np.asarray(self._entry_points).copy()
-        for i in range(len(geometry)):
-            if i not in reliable:
-                geometry[i] = np.nan
-        for i in reliable:
-            self._entry_geometry_at_seen[i] = geometry.copy()
         cutoff = now-self.initialization_history_seconds
         for i, slot in enumerate(self.slots):
             if slot.evidence_time is not None and slot.evidence_time < cutoff:
@@ -1200,8 +1182,7 @@ class SlotGroupTracker:
         order = sorted(chosen, key=lambda obj: tuple(obj['center']))
         mapping = {old[obj['track_id']]+1: i+1 for i, obj in enumerate(order)
                    if obj['track_id'] in old}
-        fields = ('_entry_seen_at', '_entry_support_since', '_entry_support_count',
-                  '_entry_geometry_at_seen')
+        fields = ('_entry_seen_at', '_entry_support_since', '_entry_support_count')
         saved = {name: list(getattr(self, name)) for name in fields}
         slots = self.slots
         seen = self._initial_seen.copy()
@@ -1222,7 +1203,7 @@ class SlotGroupTracker:
                 locked_replacement_index = nearest
         self.slots = []
         self._initial_seen = set()
-        defaults = (now, None, 0, None)
+        defaults = (now, None, 0)
         for name, default in zip(fields, defaults):
             setattr(self, name, [saved[name][old[obj['track_id']]]
                 if obj['track_id'] in old else default for obj in order])
@@ -1243,8 +1224,8 @@ class SlotGroupTracker:
         self._predicted_indices.clear()
         self._initial_points, self._initial_since, self._initial_count = None, None, 0
         self._entry_reference_points = self._entry_canonical_points = None
-        # Historical co-observations are in the old index order.
-        self._entry_geometry_at_seen = [None]*4
+        self._s4_before_recalculation = None
+        self._reset_three_point_stability()
         self._entry_revision += 1
         if locked_slot is not None and any(slot is locked_slot for slot in self.slots):
             self._entry_locked_s4_slot = locked_slot
@@ -1292,9 +1273,7 @@ class SlotGroupTracker:
         self._provisional = None
         self._machine_center_votes.clear()
         self._provisional_inferred_slot_ids = set()
-        self._three_point_stable_points = None
-        self._three_point_stable_since = None
-        self._three_point_stable_count = 0
+        self._reset_three_point_stability()
         self._initial_seen.clear()
         self._initial_points, self._initial_since, self._initial_count = None, None, 0
         self._pending_numbering_points = self._pending_numbering_order = None
@@ -1900,7 +1879,7 @@ class SlotGroupTracker:
         # Reusing a cached box must never extend its lifetime.
         if 3 not in self._predicted_indices or self.identity_lost or slot.geometry_observed:
             return
-        if (slot.last_valid_box_source == "unassigned_detection"
+        if (slot.last_valid_box_source in ("unassigned_detection", "local_crop")
                 and now-slot.last_valid_box_at <= self.s4_contact_prediction_seconds):
             return
         sizes = [s.box_size_wh for s in self.slots[:3] if s.box_size_wh is not None]
@@ -1945,7 +1924,8 @@ class SlotGroupTracker:
         center = np.asarray(slot.last_valid_center_xy, dtype=float)
         predicted = self._slot_point(slot_index)
         if (slot_index in self._predicted_indices and predicted is not None
-                and np.isfinite(predicted).all() and slot.last_valid_box_source != "unassigned_detection"):
+                and np.isfinite(predicted).all()
+                and slot.last_valid_box_source not in ("unassigned_detection", "local_crop")):
             center = predicted
         box = np.asarray(slot.last_valid_box_xyxy, dtype=float)
         width, height = max(1., box[2] - box[0]), max(1., box[3] - box[1])
@@ -2192,7 +2172,9 @@ class SlotGroupTracker:
                 o.get("class_name") in SLOT_STATES
                 and o.get("track_id") is not None
                 and int(o["track_id"]) in self._provisional_quarantined_track_ids)]
-        candidates = self._candidates(candidate_objects)
+        fallback_objects = [obj for obj in candidate_objects if obj.get("local_s4_fallback")]
+        candidates = self._candidates([obj for obj in candidate_objects if not obj.get("local_s4_fallback")]
+                                      if fallback_objects else candidate_objects)
         hands = [o for o in objects if o["class_name"] == "hand"]
         if self.points is None:
             initial_objects = objects if initialization_objects is None else initialization_objects
@@ -2232,6 +2214,9 @@ class SlotGroupTracker:
             self.identity_lost = True
         gate = self._point_tracking_gate or self._spacing()*self.match_distance_ratio
         matches = {} if self.identity_lost else self._associate(candidates, gate)
+        if observations_enabled and not self.identity_lost and 3 not in matches and len(fallback_objects) == 1:
+            matches[3] = len(candidates)
+            candidates.extend(self._candidates(fallback_objects))
         self._remember_track_ids(matches, candidates, self.byte_track_ids)
         # 局部补检只补空满观测；裁剪框的偏移不改变几何轨迹，也不作为越界证据。
         geometry_matches = {i: col for i,col in matches.items()
@@ -2243,6 +2228,8 @@ class SlotGroupTracker:
             # 两个检测框中心的抖动会被相似变换完全拟合，逐帧外推会把其余槽推离真实位置。
             indices = [i for i in geometry_matches
                        if not candidates[matches[i]]["conflict"] and not self._occluded(candidates[matches[i]],hands)]
+            if 3 in indices:
+                self._s4_before_recalculation = None
             old = self.reference_points[indices].astype(np.float32)
             new = np.asarray([candidates[matches[i]]["center"] for i in indices], dtype=np.float32)
             self.transform_valid_this_frame = False
@@ -2288,6 +2275,9 @@ class SlotGroupTracker:
                         if (np.linalg.det(affine[:, :2]) > 0 and singular.min() >= .8
                                 and singular.max() <= 1.2 and np.max(residual) <= gate*.4):
                             predicted_s4 = self.reference_points[s4_index] @ affine[:, :2].T+affine[:, 2]
+                            if self._s4_before_recalculation is not None:
+                                self._s4_before_recalculation = (
+                                    self._s4_before_recalculation @ affine[:, :2].T + affine[:, 2])
                 if len(indices) >= 2:
                     self.reference_points[indices] = new
                 if predicted_s4 is not None:
@@ -2324,6 +2314,9 @@ class SlotGroupTracker:
                         self.reference_points = predicted
                         if can_predict_s4:
                             self._predicted_indices.add(3)
+                            if self._s4_before_recalculation is not None:
+                                self._s4_before_recalculation = (
+                                    self._s4_before_recalculation @ matrix[:, :2].T + matrix[:, 2])
             elif len(indices) == 2 and translation_direction is not None and all(
                     not candidates[matches[i]]["conflict"] and not self._occluded(candidates[matches[i]],hands)
                     for i in indices):
@@ -2334,6 +2327,8 @@ class SlotGroupTracker:
                 direction = np.asarray(translation_direction,dtype=float)
                 if np.max(np.linalg.norm(delta-shift,axis=1)) <= gate*.2 and np.dot(shift,direction) >= 0:
                     self.reference_points += shift
+                    if self._s4_before_recalculation is not None:
+                        self._s4_before_recalculation += shift
         # 点仍显示YOLO框中心；漏检槽显示几何参考位置，关联门限不被单框抖动越缩越小。
         self.points = self.reference_points.copy()
         for i,col in geometry_matches.items():
@@ -2351,14 +2346,60 @@ class SlotGroupTracker:
             # 转位时继续核验已有基线的槽位；无需先检测到手才能确认空满变化。
             verify_only = self.phase == "load" and not observations_enabled
             enabled = source_enabled and slot.confirmed in ("empty", "filled") if verify_only else observations_enabled
+            review_s4 = self.phase == "unload" and i == 3 and self._region_formal_numbering
+            contact_supported = review_s4 and self._has_pending_s4_contact(slot)
             event = self._observe_slot(slot, obj, hands, now, enabled, roi_contour,
                                        record_load_contact=not verify_only)
-            if event is not None:
-                self.events.append(event)
-                new_events.append(event)
+            if review_s4:
+                events = self._review_s4_unload(event, now,
+                    contact_supported or self._has_pending_s4_contact(slot))
+            else:
+                events = [] if event is None else [event]
+            self.events.extend(events)
+            new_events.extend(events)
         result = self.snapshot()
         result["new_events"] = self._history_events_this_frame + new_events
         return result
+
+    @staticmethod
+    def _has_pending_s4_contact(slot):
+        return slot.load_contact_pending or bool(slot.prediction_contact and slot.prediction_contact.pending)
+
+    def _review_s4_unload(self, event, now, contact_supported):
+        """Hold visual-only S4 unloads long enough to reject a quick visual reversal."""
+        pending = self._pending_s4_unload
+        ready = []
+        if pending is not None:
+            within_window = now-pending["confirmed_at"] <= S4_UNLOAD_REVIEW_SECONDS+1e-9
+            if (within_window and not contact_supported and event is not None
+                    and event["action"] == "load" and not event.get("inferred")):
+                self._pending_s4_unload = None
+                if self.s4_contact_diagnostic is not None:
+                    self.s4_contact_diagnostic["unload_review"] = "visual_reversal_cancelled"
+                return []
+            if contact_supported or event is not None or not within_window:
+                ready = self._release_s4_unload(now)
+        if event is None:
+            return ready
+        if (event["action"] == "unload" and event["from"] == "filled"
+                and not contact_supported and not event.get("inferred")):
+            self._pending_s4_unload = event
+            if self.s4_contact_diagnostic is not None:
+                self.s4_contact_diagnostic["unload_review"] = "pending"
+        else:
+            ready.append(event)
+        return ready
+
+    def _release_s4_unload(self, now):
+        event = self._pending_s4_unload
+        self._pending_s4_unload = None
+        return [] if event is None else [dict(event, reported_at=float(now))]
+
+    def finish_s4_unload_review(self, now):
+        """Publish a remaining visual unload before archiving its group."""
+        events = self._release_s4_unload(now)
+        self.events.extend(events)
+        return events
 
     def verify_departing_load(self, matches, hands, now, *, enabled=True):
         """退出点已由分组器独立关联，按实际空满核验旧组，不依赖手接触。"""
@@ -2391,13 +2432,16 @@ class SlotGroupTracker:
             target.extend(recovered)
             if self.points is not None:
                 self._history_events_this_frame.extend(recovered)
-        slot.geometry_observed = obj is not None and obj.get("detection_source") != "local_crop"
+        local_crop = obj is not None and obj.get("detection_source") == "local_crop"
+        slot.geometry_observed = obj is not None and not local_crop
         if obj is not None:
-            slot.geometry_inferred = False
+            if slot.geometry_observed or self.phase == "load":
+                slot.geometry_inferred = False
+                box = obj["xyxy"]
+                slot.box_size_wh = (max(1., box[2]-box[0]), max(1., box[3]-box[1]))
             slot.temporary_contact_box_xyxy = None
-            box = obj["xyxy"]
-            slot.box_size_wh = (max(1., box[2]-box[0]), max(1., box[3]-box[1]))
-            self._remember_formal_s4_detection(slot, slot_index, obj, now)
+            self._remember_formal_s4_detection(slot, slot_index, obj, now,
+                source="local_crop" if local_crop and self.phase == "unload" else "detection")
         elif slot_index == 3 and self.points is not None:
             self._seed_formal_s4_detection_cache(now)
         temporary_contact_box = (None if obj is not None else
@@ -2651,11 +2695,13 @@ class SlotGroupTracker:
                 round(float(point[0]+size[0]/2), 2), round(float(point[1]+size[1]/2), 2)]
             is_prediction = point is not None and i in self._predicted_indices and not s.geometry_observed
             if s.temporary_contact_box_xyxy is not None:
-                tracking_box = [round(float(value), 2)
-                                for value in s.temporary_contact_box_xyxy]
                 is_prediction = True
-                point = np.asarray(s.temporary_contact_box_xyxy).reshape(2, 2).mean(axis=0)
-            elif i == 3 and self.points is not None and s.last_valid_box_at is not None:
+                if s.last_valid_box_source != "local_crop":
+                    tracking_box = [round(float(value), 2)
+                                    for value in s.temporary_contact_box_xyxy]
+                    point = np.asarray(s.temporary_contact_box_xyxy).reshape(2, 2).mean(axis=0)
+            elif (i == 3 and self.points is not None and s.last_valid_box_at is not None
+                  and s.last_valid_box_source != "local_crop"):
                 is_prediction = False
             if not s.geometry_observed and not is_prediction:
                 tracking_box = None
@@ -2714,6 +2760,7 @@ class SlotGroupTracker:
                 "slots": slots, "order_result": self.order_result(),
                 "event_ordering": "time_upper",
                 "s4_contact_diagnostic": self.s4_contact_diagnostic,
+                "s4_unload_review_pending": self._pending_s4_unload is not None,
                 "s4_contact_prediction_seconds": self.s4_contact_prediction_seconds,
                 "s4_contact_lock": self._entry_s4_lock_snapshot(),
                 "s4_region_diagnostic": self.s4_region_diagnostic,

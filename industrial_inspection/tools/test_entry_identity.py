@@ -160,25 +160,19 @@ class EntryIdentityTests(unittest.TestCase):
             self.assertNotIn(3, tracker._initial_seen)
         self.assertEqual(len(tracker._entry_points), 3)
 
-    def test_stale_entry_track_rejects_neighbor_moving_against_group(self):
+    def test_stale_entry_track_can_recover_against_earlier_group_motion(self):
         tracker = self.tracker()
         for tick in range(5):
             tracker.update(boxes(PHYSICAL, visible=(0, 1, 2)), tick*.1)
         for tick in range(5, 10):
             moved = PHYSICAL-(tick-4)*5
             objects = boxes(moved, visible=(0, 1))
-            if tick == 9:
-                neighbor = PHYSICAL.copy()
-                neighbor[2] = [215, 115]
-                objects += boxes(neighbor, visible=(2,))
             tracker.update(objects, tick*.1)
-        # 两点仅能否决反向跳点，隐藏点仍保持最后真实位置。
         np.testing.assert_allclose(tracker._entry_points[2], [200, 100])
-        moved = PHYSICAL-25
-        neighbor = PHYSICAL.copy()
-        neighbor[2] = [215, 115]
-        tracker.update(boxes(moved, visible=(0, 1, 2))+boxes(neighbor, visible=(2,)), 1.)
-        np.testing.assert_allclose(tracker._entry_points[2], moved[2])
+        recovered = moved.copy()
+        recovered[2] = [215, 115]
+        tracker.update(boxes(recovered, visible=(0, 1, 2)), 1.)
+        np.testing.assert_allclose(tracker._entry_points[2], recovered[2])
 
     def test_recorded_g5_rejects_transient_fourth_and_preserves_late_slot_identity(self):
         fixture = Path(__file__).with_name('fixtures')/'g5_loading_entry.json'

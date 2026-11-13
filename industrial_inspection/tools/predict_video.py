@@ -28,7 +28,7 @@ from industrial_inspection.tools.detection_display import draw_detection_legend,
 # 用户配置：在这里修改，然后在 PyCharm / VS Code 中直接运行此文件。
 # Windows 路径请保留 r 前缀，避免反斜杠被解释为转义字符。
 # =============================================================================
-SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频11\camera_B_20260924_064032.avi")
+SOURCE_VIDEO = Path(r"I:\youyan\test_dataset\测试视频12\camera_B_20260924_065915.avi")
 # I:\youyan\test_dataset\测试视频1\camera_B_20260924_021033.avi
 # I:\youyan\test_dataset\测试视频2\camera_B_20260923_143845.avi
 # I:\youyan\test_dataset\测试视频3\camera_B_20260924_013432.avi

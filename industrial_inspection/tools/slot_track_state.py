@@ -212,6 +212,8 @@ class SlotTrackStateStore:
         group_ids = {track_id for track_id in tracker.byte_track_ids if self.owner(track_id) == identity}
         events = []
         for slot, track_id in zip(tracker.slots, tracker.byte_track_ids):
+            if slot.slot_id == 4 and tracker._pending_s4_unload is not None:
+                continue
             history = self._edge_tracks.get(track_id)
             if history is None or self.owner(track_id) != identity:
                 continue

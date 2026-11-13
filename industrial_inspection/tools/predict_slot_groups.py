@@ -85,6 +85,8 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
      base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
 )
 REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
 REGRESSION_WRITE_VIDEO = False  # 回归默认只保存流程数据；--with-video可显式打开
@@ -102,6 +104,7 @@ from industrial_inspection.tools.slot_process_config import (
     EXIT_BOUNDARY_MARGIN_PX, EXIT_MIN_SLOTS, PARTIAL_EXIT_MIN_SLOTS,
     EXIT_MIN_MOTION_RATIO, MOTION_PAUSE_RATIO, NEXT_GROUP_STABLE_SECONDS,
     NEXT_GROUP_STABILITY_RATIO, NEXT_GROUP_MATCH_DISTANCE_PX, NEXT_GROUP_ENTRY_FRACTION,
+    UNLOAD_ENTRY_UPPER_RIGHT_MIN_X_RATIO, UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX,
     REJECT_TRANSITION_ROI_DETECTIONS, TRANSITION_QUARANTINE_MIN_FRAMES,
     OUTSIDE_MAPPING_QUARANTINE_SECONDS, SLOT2_BELOW_SLOT3, EXIT_DIRECTION,
     MACHINE_CENTER_NORMALIZED,
@@ -267,6 +270,8 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
         entry_stability_ratio=NEXT_GROUP_STABILITY_RATIO,entry_match_distance_px=NEXT_GROUP_MATCH_DISTANCE_PX,
         exit_direction=EXIT_DIRECTION,auto_load_after_unload=AUTO_LOAD_AFTER_UNLOAD,
         entry_birth_fraction=NEXT_GROUP_ENTRY_FRACTION,
+        unload_entry_upper_right_band=(UNLOAD_ENTRY_UPPER_RIGHT_MIN_X_RATIO*size[0],
+            UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX*min(size[0]/640, size[1]/480)),
         reject_transition_roi_detections=REJECT_TRANSITION_ROI_DETECTIONS,
         transition_quarantine_min_frames=TRANSITION_QUARANTINE_MIN_FRAMES,
         outside_mapping_quarantine_seconds=OUTSIDE_MAPPING_QUARANTINE_SECONDS,
@@ -285,6 +290,8 @@ def recover_missing_slots(model, frame, objects, sequence, args):
 
 
 def process_completed(snapshot):
+    if snapshot.get("s4_unload_review_pending"):
+        return False
     target = "empty" if snapshot.get("phase") == "unload" else "filled"
     slots = snapshot.get("slots", [])
     return len(slots) >= 4 and all(
@@ -759,7 +766,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                                       "load": ["unknown->filled", "empty->unknown"]},
             "yolo_state_has_priority": True,"infer_after_unknown_grace": True},
         "match_distance_ratio": MATCH_DISTANCE_RATIO,"identity_lost_seconds": IDENTITY_LOST_SECONDS,
-        "local_redetection_config": {"enabled": LOCAL_REDETECT_ENABLED,
+        "local_redetection_config": {"enabled": LOCAL_REDETECT_ENABLED, "slot_ids": [4],
             "crop_size_wh": list(LOCAL_REDETECT_CROP_SIZE),"imgsz": LOCAL_REDETECT_IMAGE_SIZE,
             "conf": thresholds.slot_state,"hand_conf": thresholds.hand,"match_distance": "same_as_slot_tracker"},
         "rotation_intervals": ROTATION_INTERVALS,"start_frame": index,"end_frame_exclusive": END_FRAME,

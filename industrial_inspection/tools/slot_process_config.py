@@ -46,6 +46,8 @@ NEXT_GROUP_STABLE_SECONDS = .1 # 收齐可靠轨迹且几何停稳后一次性�
 NEXT_GROUP_STABILITY_RATIO = .1 # 停稳期间各槽偏离起始位置不得超过最小槽间距×此比例
 NEXT_GROUP_MATCH_DISTANCE_PX = 40 # 新点/旧组残留点逐帧匹配的最大距离（像素）
 NEXT_GROUP_ENTRY_FRACTION = .6 # 沿EXIT_DIRECTION从入口到出口的前60%允许建立新轨迹
+UNLOAD_ENTRY_UPPER_RIGHT_MIN_X_RATIO = 500 / 640  # 右上窄带的起始横坐标占画面宽度的比例
+UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX = 12.0  # 640×480下沿ROI上边沿向内的距离，0关闭
 REJECT_TRANSITION_ROI_DETECTIONS = True # 换组时隔离有稳定旧组证据的未绑定ID，并启用短时空间隔离
 TRANSITION_QUARANTINE_MIN_FRAMES = 5 # 未绑定ID在旧组ROI内累计真实出现至少此帧数，才持续隔离
 OUTSIDE_MAPPING_QUARANTINE_SECONDS = 3.0 # 新组映射后短时间内，ROI外新ID不参与当前组判断
@@ -95,7 +97,7 @@ ROI_TRACKING_MARGIN_PX = 40   # 已编号槽的ROI外跟踪距离
 ROI_EDGE_EVIDENCE_PX = 8.0   # 640×480下的ROI外视觉取证距离，0表示关闭
 
 # 局部补检：只补观测，不修改身份和工艺结论
-LOCAL_REDETECT_ENABLED = False # 已编号槽被整图漏检时，用同一模型局部补检
+LOCAL_REDETECT_ENABLED = True # 下料阶段正式 S4 被整图漏检时，用同一模型局部补检
 LOCAL_REDETECT_CROP_SIZE = (180, 140) # 原图裁剪宽、高（像素），保留槽周围背景
 LOCAL_REDETECT_IMAGE_SIZE = 320 # 局部图送入YOLO时的尺寸；分别沿用槽位/手部证据门槛
 ROTATION_INTERVALS = []       # 可选源视频秒数[(开始,结束),...]；期间跟踪位置、暂停空满确认

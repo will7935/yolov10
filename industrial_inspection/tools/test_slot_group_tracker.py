@@ -261,6 +261,7 @@ class TrackingTests(unittest.TestCase):
             for _ in range(2):
                 t.update([detection(i,states[i-1]) for i in range(1,5)],now)
                 now+=.1
+        t.finish_s4_unload_review(now)
         return t
 
     def test_loading_and_unloading_use_same_clockwise_cycle(self):

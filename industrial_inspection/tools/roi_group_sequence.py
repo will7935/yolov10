@@ -31,7 +31,8 @@ class RoiGroupSequence:
                  reject_transition_roi_detections=True, transition_quarantine_min_frames=4,
                  require_first_unload_event_for_g1=False,
                  outside_mapping_quarantine_seconds=3.0,
-                 use_previous_s4_layouts=False, edge_evidence_px=0.0):
+                 use_previous_s4_layouts=False, edge_evidence_px=0.0,
+                 unload_entry_upper_right_band=(0., 0.)):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
@@ -60,6 +61,14 @@ class RoiGroupSequence:
         self.entry_stability_ratio = entry_stability_ratio
         self.entry_match_distance_px = float(entry_match_distance_px)
         self.entry_birth_fraction = float(entry_birth_fraction)
+        band_start, band_width = map(float, unload_entry_upper_right_band)
+        if not np.isfinite([band_start, band_width]).all() or min(band_start, band_width) < 0:
+            raise ValueError("下料入组右上窄带的起点和宽度必须为非负有限像素值")
+        self.unload_entry_upper_right_band = band_start, band_width
+        orientation = 1 if cv2.contourArea(self.contour, oriented=True) > 0 else -1
+        self._upper_roi_edges = [(start, end) for start, end in
+            zip(self.contour, np.roll(self.contour, -1, axis=0))
+            if orientation*(end[0]-start[0]) > abs(end[1]-start[1])]
         self.reject_transition_roi_detections = bool(reject_transition_roi_detections)
         self.transition_quarantine_min_frames = int(transition_quarantine_min_frames)
         self.require_first_unload_event_for_g1 = bool(require_first_unload_event_for_g1)
@@ -176,6 +185,19 @@ class RoiGroupSequence:
         exit_distance = np.min(signed[leaving]/-flow[leaving])
         return float(entry_distance/max(entry_distance+exit_distance, 1e-9))
 
+    def _in_unload_entry_upper_right_band(self, center):
+        start_x, width = self.unload_entry_upper_right_band
+        if width == 0 or center[0] < start_x:
+            return False
+        for start, end in self._upper_roi_edges:
+            left, right = sorted((start, end), key=lambda point: point[0])
+            if left[0] <= center[0] <= right[0]:
+                dx, dy = right-left
+                distance = (dx*(center[1]-left[1])-dy*(center[0]-left[0])) / np.hypot(dx, dy)
+                if -1e-6 <= distance <= width+1e-6:
+                    return True
+        return False
+
     def _admit_entry_objects(self, objects, tracker, now):
         """已建立轨迹可走完整个ROI；新身份只能在入口侧建立。"""
         # 多点模式本身等四槽整体停稳，保留原有完整组初始化路径。
@@ -192,6 +214,7 @@ class RoiGroupSequence:
         # 至少两条入口轨迹已建立后，可接收入口处曾被遮挡的其他槽。
         # 旧组的所有可见中心（含未编号框）由独立退出轨迹持续排除。
         established_group = points is not None and len(points) >= 2
+        entry_ids = set(tracker._entry_track_ids) - {None}
         for obj in objects:
             if obj["class_name"] not in SLOT_STATES:
                 result.append(obj)
@@ -215,9 +238,15 @@ class RoiGroupSequence:
                     self._reject_track(obj, 'outside_roi')
                 continue
             progress = self._entry_progress(center)
-            late_visible = established_group and self._distance(center) >= self.margin
+            late_visible = established_group and distance >= self.margin
             if established or progress is None or progress <= self.entry_birth_fraction or late_visible:
-                result.append(obj)
+                if (tracker.phase == 'unload' and owner is None and track_id not in entry_ids
+                        and self._in_unload_entry_upper_right_band(center)):
+                    self._reject_track(obj, 'unload_entry_upper_right_band')
+                    self._entry_rejected.append({**obj, 'center': center.tolist(),
+                        'reason': 'unload_entry_upper_right_band', 'entry_progress': progress})
+                else:
+                    result.append(obj)
             else:
                 self._reject_track(obj, 'new_track_outside_entry_region')
                 self._entry_rejected.append({**obj, "center": center.tolist(),
@@ -1071,6 +1100,7 @@ class RoiGroupSequence:
         eligible = [obj for obj in tracker._candidates(objects)
                     if obj.get('track_id') in self._transition_recheck_ids
                     and self.track_store.owner(obj['track_id']) is None and reliable(obj)
+                    and not self._in_unload_entry_upper_right_band(obj['center'])
                     and all(np.linalg.norm(np.asarray(obj['center'])-point) > self.departing_gate*.35
                             for point in old_points)
                     and slot_layout_error([*centers, obj['center']]) is not None]
@@ -1393,6 +1423,9 @@ class RoiGroupSequence:
                 # 未绑定ID仅在旧组真实出现帧数足够且仍在ROI/短暂漏检时隔离；
                 # 已绑定ID继续由旧组归属排除，空间隔离保持不变。
                 self._arm_transition_quarantine(objects, now)
+                reviewed = self.tracker.finish_s4_unload_review(now)
+                if reviewed:
+                    result = {**result, **self.tracker.snapshot(), "new_events": result["new_events"] + reviewed}
                 self._close(now)
                 if self.exit_min_slots == 1 and self.state != "sequence_complete":
                     closing_events = result["new_events"]
@@ -1440,6 +1473,7 @@ class RoiGroupSequence:
         if self.last_time is None:
             return {**self.snapshot(), "new_events": [], "new_group_events": []}
         now = self.last_time
+        self._deferred_new_events.extend(self.tracker.finish_s4_unload_review(now))
         self._finish_departing_load(now)
         self.all_events.extend(deepcopy(self._deferred_new_events))
         return {**self.snapshot(), "new_events": deepcopy(self._deferred_new_events),
