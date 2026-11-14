@@ -1221,6 +1221,15 @@ class RoiGroupSequence:
             shift = deltas.mean(axis=0)
             if np.max(np.linalg.norm(deltas-shift, axis=1)) <= self.departing_gate*.25:
                 used_ids = {c.get('track_id') for c in old_boxes}
+                empty_old_slots = set()
+                if self.departing_phase == 'unload':
+                    old_group = next((group for group in reversed(self.closed_groups)
+                                      if group['phase'] == 'unload'
+                                      and group['group_id'] == self.departing_group_id), None)
+                    if old_group is not None:
+                        empty_old_slots = {slot['slot_id']-1 for slot in old_group['snapshot']['slots']
+                                           if slot['slot_id'] is not None
+                                           and slot['last_confirmed_state'] == 'empty'}
                 for i in live:
                     if i in old_matches:
                         continue
@@ -1230,6 +1239,8 @@ class RoiGroupSequence:
                     options = [c for c in candidates if c.get('track_id') is not None
                         and c['track_id'] not in used_ids
                         and self.track_store.owner(c['track_id']) is None
+                        # A newly detected filled slot cannot recover a confirmed empty unload tail.
+                        and not (i in empty_old_slots and SLOT_STATES[c['class_name']] == 'filled')
                         and not belongs_to_current(c['center'])
                         and np.linalg.norm(np.asarray(c['center'])-expected) <= self.departing_gate*.35
                         and (len(support) >= 3 or self._entry_progress(c['center']) is None

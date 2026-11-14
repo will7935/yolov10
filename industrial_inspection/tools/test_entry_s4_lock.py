@@ -90,6 +90,44 @@ class ProvisionalS4LockTests(unittest.TestCase):
         tracker._clear_load_contact(locked_slot)
         self.assertIsNone(tracker._entry_locked_s4_slot)
 
+    def start_unload_contact(self):
+        tracker = self.make_tracker()
+        full = [detection(index, track_id=100 + index) for index in range(1, 5)]
+        for now in (0., .1):
+            tracker.update(full, now)
+        for now in (.2, .3):
+            tracker.update(full[:3] + [self.hand()], now)
+        return tracker, full
+
+    def test_two_consecutive_filled_observations_cancel_contact(self):
+        tracker, full = self.start_unload_contact()
+        first = tracker.update(full, .4)
+        self.assertIsNotNone(first["s4_contact_lock"])
+        result = tracker.update(full, .5)
+        self.assertIsNone(result["s4_contact_lock"])
+        self.assertIsNone(tracker._entry_s4_contact)
+
+    def test_missing_frame_interrupts_filled_streak_and_single_fill_blocks_inference(self):
+        tracker, full = self.start_unload_contact()
+        for now, objects in ((.4, full), (.5, full[:3]), (.6, full), (1.1, full[:3])):
+            result = tracker.update(objects, now)
+            self.assertIsNotNone(result["s4_contact_lock"])
+        self.assertEqual(result["slots"][3]["last_confirmed_state"], "filled")
+        self.assertEqual(tracker._entry_events, [])
+
+    def test_displaced_filled_box_does_not_cancel_or_block_missing_box_inference(self):
+        tracker, full = self.start_unload_contact()
+        displaced = {**full[3], "xyxy": [180., 150., 220., 190.]}
+        for now in (.4, .5):
+            result = tracker.update(full[:3] + [displaced], now)
+            self.assertIsNotNone(result["s4_contact_lock"])
+            self.assertEqual(result["slots"][3]["observation"], "unknown")
+        tracker.update(full[:3], .7)
+        tracker.update(full[:3], 1.)
+        event, = tracker._entry_events
+        self.assertEqual(event["reason"], "hand_contact_inferred_unload")
+        self.assertEqual(event["hand_contact_released_at"], .4)
+
     def test_track_loss_releases_the_lock_after_the_loss_window(self):
         tracker = self.make_tracker()
         full = [detection(index, track_id=100 + index) for index in range(1, 5)]

@@ -5,10 +5,94 @@ import numpy as np
 
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
 from industrial_inspection.tools.slot_group_tracker import SlotGroupTracker
+from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
 from industrial_inspection.tools.test_slot_group_tracker import CENTERS, detection
 
 
+class EntryS4ContactTests(unittest.TestCase):
+    centers = CENTERS[[0, 2, 1, 3]]
+    roi = np.float32([[0, 0], [300, 0], [300, 300], [0, 300]])
+
+    def setUp(self):
+        self.tracker = SlotGroupTracker(None, group_id=3, slot2_below_slot3=True,
+            confirm_seconds=.08, minimum_frames=2, initialization_frames=2,
+            initialization_seconds=.05, geometry_initialization_seconds=.05,
+            unload_entry_numbering_seconds=.6, load_hand_contact_seconds=0.)
+        self.tracker.start_incremental_entry(40)
+        self.tracker.track_store = SlotTrackStateStore(self.tracker, self.roi)
+        filled = [self.box(i, 'filled', i) for i in range(1, 5)]
+        for now in (0., .1):
+            self.frame(filled, now)
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [188, 188, 212, 212]}
+        for now in (.2, .25):
+            self.frame(filled[:3] + [hand], now)
+        self.frame(filled, .3)
+        # The old S4 ID now tracks S3. The new S4 ID has no filled history.
+        self.switched = filled[:2] + [self.box(3, 'filled', 4), self.box(4, 'empty', 40)]
+
+    def box(self, slot, state, track_id):
+        return detection(slot, state, self.centers, track_id=track_id)
+
+    def frame(self, objects, now):
+        self.tracker.track_store.observe(objects, now)
+        return self.tracker.update(objects, now, roi_contour=self.roi)
+
+    def test_recovers_early_unload_when_new_track_is_formally_numbered_s4(self):
+        for now in (.4, .5, .6, .7, .8, .9, 1.):
+            self.assertEqual(self.frame(self.switched, now)['new_events'], [])
+        result = self.frame(self.switched, 1.1)
+        event, = result['new_events']
+        self.assertEqual(self.tracker.byte_track_ids, [1, 2, 4, 40])
+        self.assertEqual((event['slot_id'], event['contact_byte_track_id'], event['byte_track_id']), (4, 4, 40))
+        self.assertEqual((event['time_upper'], event['confirmed_at'], event['reported_at']), (.5, .6, 1.1))
+        self.assertEqual(self.frame(self.switched, 1.2)['new_events'], [])
+
+    def test_ambiguous_frames_interrupt_empty_confirmation_across_numbering(self):
+        distractor = {**self.box(4, 'empty', 41), 'xyxy': [195, 180, 235, 220]}
+        for tick in range(4, 12):
+            objects = self.switched + ([distractor] if tick % 2 else [])
+            self.assertEqual(self.frame(objects, tick / 10)['new_events'], [])
+        self.assertEqual(self.tracker.byte_track_ids, [1, 2, 4, 40])
+        self.assertEqual(self.frame(self.switched, 1.2)['new_events'], [])
+        event, = self.frame(self.switched, 1.3)['new_events']
+        self.assertEqual((event['slot_id'], event['byte_track_id']), (4, 40))
+        self.assertEqual((event['time_upper'], event['confirmed_at'], event['reported_at']), (1.2, 1.3, 1.3))
+
+    def test_expired_contact_does_not_recover_a_late_empty_track(self):
+        for now in (1.5, 1.6, 1.7, 1.8, 1.9, 2., 2.1, 2.2, 2.3):
+            self.assertEqual(self.frame(self.switched, now)['new_events'], [])
+        self.assertEqual(self.tracker.byte_track_ids, [1, 2, 4, 40])
+        self.assertEqual(self.tracker.slots[3].confirmed, 'empty')
+
+
 class S4UnloadReviewTests(unittest.TestCase):
+    def test_second_contact_cannot_reverse_unload_inferred_before_numbering(self):
+        tracker = SlotGroupTracker(CENTERS, confirm_seconds=0., minimum_frames=2,
+                                   load_hand_contact_seconds=0.)
+        support = [detection(i, 'filled') for i in (1, 2, 3)]
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [188, 188, 212, 212]}
+        for now in (0., .1):
+            tracker.update(support + [detection(4, 'filled')], now)
+        for now in (.2, .3):
+            tracker.update(support + [hand], now)
+        for now in (.4, .7, .95):
+            tracker.update(support, now)
+        event, = tracker.events
+        event['recovered_before_initialization'] = True
+
+        for now in (1., 1.1):
+            tracker.update(support + [hand], now)
+        for now in (1.2, 1.5, 1.75):
+            result = tracker.update(support, now)
+        self.assertEqual(result['new_events'], [])
+        self.assertEqual(tracker.events, [event])
+        self.assertEqual(result['slots'][3]['last_confirmed_state'], 'empty')
+
+        tracker.update(support + [detection(4, 'filled')], 1.8)
+        result = tracker.update(support + [detection(4, 'filled')], 1.9)
+        refill, = result['new_events']
+        self.assertEqual((refill['slot_id'], refill['action']), (4, 'load'))
+
     def test_quick_visual_reversal_cancels_unload_and_refill(self):
         tracker = SlotGroupTracker(CENTERS, confirm_seconds=0., minimum_frames=2,
                                    load_hand_contact_seconds=0.)

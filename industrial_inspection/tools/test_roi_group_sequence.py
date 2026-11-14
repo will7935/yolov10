@@ -340,6 +340,32 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual([obj['track_id'] for obj in admitted],[204])
         self.assertIsNone(s.track_store.owner(204))
 
+    def test_filled_new_id_does_not_recover_empty_unload_tail(self):
+        for new_is_filled in (True, False):
+            with self.subTest(new_is_filled=new_is_filled):
+                sequence = self.make(exit_min_slots=1, partial_exit_slots=1)
+                old_ids = [101, 102, 103, 104]
+                old = [dict(obj, track_id=track_id) for obj, track_id in zip(boxes(), old_ids)]
+                sequence.update(old, 0.)
+                sequence.update(old, .1)
+                exiting = POINTS.copy()
+                exiting[0, 1] = -10
+                remaining = (0, 1, 2)
+                old = [dict(obj, track_id=old_ids[i])
+                       for i, obj in zip(remaining, boxes(exiting, visible=remaining))]
+                result = sequence.update(old, .2)
+                self.assertEqual((result['group_id'], result['group_status']), (2, 'entering'))
+
+                candidate = boxes(visible=(3,), filled=(3,) if new_is_filled else ())[0]
+                result = sequence.update(old + [dict(candidate, track_id=204)], .3)
+                if new_is_filled:
+                    self.assertIn(204, [slot['byte_track_id'] for slot in result['slots']])
+                    self.assertEqual(sequence.track_store.owner(204), ('unload', 2))
+                    self.assertEqual(sequence.departing_track_ids[3], 104)
+                else:
+                    self.assertEqual(sequence.track_store.owner(204), ('unload', 1))
+                    self.assertEqual(sequence.departing_track_ids[3], 204)
+
     def test_missing_old_tail_cannot_take_an_established_incoming_track(self):
         """旧点漏检后，新点仍应归属新组，临时号和正式号阶段都不能被旧点吞掉。"""
         roi=np.array([[80,80],[410,80],[410,310],[80,310]],dtype=np.float32)

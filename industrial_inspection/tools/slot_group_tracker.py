@@ -161,6 +161,23 @@ class PredictionContact:
 
 
 @dataclass
+class EntryS4Contact:
+    """Unloading evidence tied to a position while the provisional ID can change."""
+
+    track_id: int
+    center: np.ndarray
+    filled_at: float
+    contact_since: float
+    last_contact_at: float
+    released_at: float | None = None
+    candidate_id: int | None = None
+    empty_since: float | None = None
+    empty_frames: int = 0
+    confirmed_at: float | None = None
+    formal_track_id: int | None = None
+
+
+@dataclass
 class SlotState:
     slot_id: int
     confirmed: str = "unknown"
@@ -197,6 +214,9 @@ class SlotState:
     load_contact_unknown_since: float | None = None
     load_contact_unknown_count: int = 0
     load_contact_prediction_seen_at: float | None = None
+    entry_contact_center: np.ndarray | None = None
+    entry_contact_filled_frames: int = 0
+    entry_contact_saw_filled: bool = False
     prediction_contact: PredictionContact | None = None
     # 空满检测短时中断的审计状态。消失本身不构成操作证据；只有后续
     # 重新看到目标状态并完成确认时，才使用保存的最早状态证据修正事件时间。
@@ -395,6 +415,7 @@ class SlotGroupTracker:
         # when the geometry is rebuilt.
         self._entry_locked_s4_slot = None
         self._entry_locked_s4_since = None
+        self._entry_s4_contact = None
         self._reset_three_point_stability()
         self._entry_canonical_points = None
         self._entry_revision = 0
@@ -497,6 +518,15 @@ class SlotGroupTracker:
         if self._entry_locked_s4_slot is None:
             self._entry_locked_s4_slot = slot
             self._entry_locked_s4_since = float(now)
+            if self.phase == "unload":
+                slot.entry_contact_center = self._entry_points[slot_index].copy()
+            track_id = self._byte_track_id_at(slot_index)
+            if (self.phase == "unload" and track_id is not None and slot.confirmed == "filled"
+                    and slot.confirmation_source == "yolo" and slot.evidence_time is not None
+                    and self._entry_s4_contact is None):
+                self._entry_s4_contact = EntryS4Contact(
+                    track_id, self._entry_points[slot_index].copy(), slot.evidence_time,
+                    slot.load_contact_since, float(now))
 
     def _unlock_lost_entry_s4(self, slot, slot_index, obj, now):
         """Release a lock only after the locked track is definitely gone."""
@@ -521,6 +551,99 @@ class SlotGroupTracker:
         return {"active": True, "internal_slot_index": index+1,
                 "byte_track_id": track_id,
                 "locked_since": self._entry_locked_s4_since}
+
+    def _observe_entry_s4_contact(self, candidates, matches, now, enabled, *, all_candidates=None):
+        evidence = self._entry_s4_contact
+        if evidence is None:
+            return
+        if evidence.confirmed_at is None and now-evidence.last_contact_at > self.lost_seconds+1e-9:
+            self._entry_s4_contact = None
+            return
+        if evidence.released_at is None:
+            return
+
+        gate = self._entry_gate if self._entry_points is not None else self._point_tracking_gate
+        provisional = self._entry_points is not None
+        layout = np.asarray(self._entry_points) if provisional else self.points
+        s4_index = None
+        if layout is not None and len(layout) == 4 and valid_slot_geometry(layout):
+            s4_index = int(self._numbering_order(layout)[3]) if provisional else 3
+        col = matches.get(s4_index)
+        candidate = candidates[col] if col is not None else None
+
+        identity = (self.phase, self.group_id)
+        other_slots = {id(candidates[index]) for slot_index, index in matches.items()
+                       if slot_index != s4_index}
+        nearby_count = 0
+        track_id = None
+        candidate_record = None
+        if candidate is not None:
+            for obj in candidates if all_candidates is None else all_candidates:
+                obj_id = obj.get('track_id')
+                if (obj_id is None or id(obj) in other_slots or obj.get('detection_source') == 'local_crop'
+                        or np.linalg.norm(np.asarray(obj['center'])-evidence.center) > gate*.5):
+                    continue
+                record = self.track_store.tracks.get(obj_id) if self.track_store is not None else None
+                if record is not None and (record['owner'] not in (None, identity)
+                                           or record['slot_id'] not in (None, 4)):
+                    continue
+                revised = layout.copy()
+                revised[s4_index] = obj['center']
+                if (not valid_slot_geometry(revised)
+                        or (provisional and self._numbering_order(revised)[3] != s4_index)):
+                    continue
+                nearby_count += 1
+                if obj is candidate:
+                    track_id, candidate_record = obj_id, record
+        slot = self.slots[s4_index] if track_id is not None else None
+        if evidence.confirmed_at is not None:
+            if (track_id == evidence.candidate_id and slot.state == 'filled'
+                    and slot.confirmation_source == 'yolo'):
+                self._entry_s4_contact = None
+            return
+        # Slot observation already rejects conflicts, ROI violations and hand occlusion.
+        if (not enabled or nearby_count != 1 or track_id is None or track_id == evidence.track_id
+                or (candidate_record is not None and candidate_record['first_seen'] <= evidence.contact_since)
+                or evidence.formal_track_id not in (None, track_id) or slot.observation != 'empty'):
+            evidence.candidate_id = evidence.empty_since = None
+            evidence.empty_frames = 0
+            return
+        if evidence.candidate_id != track_id:
+            evidence.candidate_id = track_id
+            evidence.empty_since = float(now)
+            evidence.empty_frames = 0
+        evidence.empty_frames += 1
+        if (evidence.empty_frames >= self.minimum_frames
+                and now-evidence.empty_since+1e-9 >= self.confirm_seconds):
+            evidence.confirmed_at = float(now)
+
+    def _recover_entry_s4_unload(self, now):
+        evidence = self._entry_s4_contact
+        if evidence is None:
+            return None
+        if (evidence.released_at is None or evidence.formal_track_id is None
+                or self.byte_track_ids[3] != evidence.formal_track_id
+                or evidence.formal_track_id == evidence.track_id
+                or evidence.candidate_id not in (None, evidence.formal_track_id)
+                or any(event['slot_id'] == 4 and event['action'] == 'unload' for event in self.events)):
+            self._entry_s4_contact = None
+            return None
+        if evidence.confirmed_at is None:
+            return None
+        self._entry_s4_contact = None
+        if self.slots[3].confirmed != 'empty':
+            return None
+        self._pending_s4_unload = None
+        event = {"slot_id": 4, "group_id": self.group_id, "phase": self.phase,
+            "byte_track_id": evidence.candidate_id, "contact_byte_track_id": evidence.track_id,
+            "from": "filled", "to": "empty", "action": "unload", "expected_action": True,
+            "time_lower": evidence.filled_at, "time_upper": evidence.empty_since,
+            "confirmed_at": evidence.confirmed_at, "reported_at": float(now),
+            "recovered_before_initialization": evidence.confirmed_at < now, "inferred": True,
+            "hand_contact_since": evidence.contact_since, "hand_contact_released_at": evidence.released_at,
+            "reason": "empty_after_provisional_s4_contact_reassociation"}
+        self.events.append(event)
+        return event
 
     def _numbering_order_with_predicted_s4(self, points, predicted_indices=None):
         """编号时保留三点推算点为正式S4。"""
@@ -779,6 +902,7 @@ class SlotGroupTracker:
         self._expire_entry_tracks(now)
         self._predicted_indices.update(self._entry_inferred_indices)
         candidates = self._candidates(objects)
+        all_candidates = candidates
         hands = [o for o in objects if o["class_name"] == "hand"]
         if enabled:
             candidates = self._reconcile_entry_geometry(candidates, hands, now)
@@ -955,6 +1079,8 @@ class SlotGroupTracker:
             event = self._observe_slot(slot, obj, hands, now, enabled and not overflow, roi_contour)
             if event is not None:
                 self._entry_events.append(event)
+        self._observe_entry_s4_contact(
+            candidates, matches, now, enabled and not overflow, all_candidates=all_candidates)
         # 已完成的状态变化随有效轨迹保留到正式编号；不能按旧状态证据的
         # 年龄清掉已确认事件。轨迹失效时由_expire_entry_tracks连同身份清理。
         self.unmatched = [c for j, c in enumerate(candidates) if j not in matches.values()]
@@ -1103,6 +1229,9 @@ class SlotGroupTracker:
             for event in self.events:
                 event.update(slot_id=mapping[event["slot_id"]], reported_at=float(now),
                     recovered_before_initialization=event["confirmed_at"] < now)
+            if self._entry_s4_contact is not None:
+                self._entry_s4_contact.formal_track_id = self.byte_track_ids[3]
+            self._recover_entry_s4_unload(now)
             recovered = list(self.events)
             self._entry_points = None
             self._entry_track_ids = []
@@ -1990,6 +2119,12 @@ class SlotGroupTracker:
             # hand leaves.  Pin this SlotState before the next geometry frame
             # can choose a different temporary S4 index.
             self._lock_entry_s4_slot(slot_index, now)
+            evidence = self._entry_s4_contact
+            if (evidence is not None and self._entry_locked_s4_slot is slot
+                    and self._byte_track_id_at(slot_index) == evidence.track_id
+                    and slot.load_contact_since == evidence.contact_since):
+                evidence.last_contact_at = slot.load_contact_last_seen
+                evidence.released_at = slot.load_contact_released_at
         if not self.load_hand_contact_enabled:
             status = "disabled"
         elif not enabled and not slot.load_contact_pending:
@@ -2070,6 +2205,9 @@ class SlotGroupTracker:
         slot.load_contact_unknown_since = None
         slot.load_contact_unknown_count = 0
         slot.load_contact_prediction_seen_at = None
+        slot.entry_contact_center = None
+        slot.entry_contact_filled_frames = 0
+        slot.entry_contact_saw_filled = False
         if getattr(self, "_entry_locked_s4_slot", None) is slot:
             self._clear_entry_s4_lock("contact_cleared")
 
@@ -2357,6 +2495,11 @@ class SlotGroupTracker:
                 events = [] if event is None else [event]
             self.events.extend(events)
             new_events.extend(events)
+        if self._entry_s4_contact is not None:
+            self._observe_entry_s4_contact(candidates, geometry_matches, now, observations_enabled)
+            recovered_s4 = self._recover_entry_s4_unload(now)
+            if recovered_s4 is not None:
+                new_events.append(recovered_s4)
         result = self.snapshot()
         result["new_events"] = self._history_events_this_frame + new_events
         return result
@@ -2516,6 +2659,23 @@ class SlotGroupTracker:
                 reason = "hand_occlusion"
             else:
                 state, reason = SLOT_STATES[obj["class_name"]], "detected"
+        verify_entry_full = (self._entry_points is not None and pending_contact
+                             and slot.confirmed == "filled" and slot.entry_contact_center is not None)
+        if verify_entry_full:
+            if contact:
+                slot.entry_contact_saw_filled = False
+            if state == "filled":
+                layout = np.asarray(self._entry_points).copy()
+                layout[slot_index] = obj["center"]
+                if (obj.get("detection_source") == "local_crop"
+                        or np.linalg.norm(layout[slot_index]-slot.entry_contact_center) > self._entry_gate*.5
+                        or not valid_slot_geometry(layout)
+                        or self._numbering_order_with_predicted_s4(layout)[3] != slot_index):
+                    state, reason = "unknown", "entry_s4_filled_position_mismatch"
+                else:
+                    slot.entry_contact_saw_filled = True
+            slot.entry_contact_filled_frames = (slot.entry_contact_filled_frames+1
+                                                if state == "filled" else 0)
         prior_confirmed = slot.confirmed
         prior_confirmed_since = slot.confirmed_since
         missing_since_before = slot.missing_since
@@ -2555,10 +2715,13 @@ class SlotGroupTracker:
         if pending_contact and state == "unknown" and slot.state == "unknown":
             slot.reason = "hand_contact_pending"
         target = "empty" if self.phase == "unload" else "filled"
-        if (pending_contact and not contact and state in ("empty", "filled")
-                and state != target):
-            # YOLO 直接显示与当前工序目标相反的状态时，以视觉结果为准，
-            # 取消接触推断，避免把整理动作/短暂触碰记成取放。
+        if (pending_contact and not contact and state in ("empty", "filled") and state != target
+                and (not verify_entry_full or slot.entry_contact_filled_frames >= 2)):
+            # 临时 S4 必须连续两帧在同一槽位观测到满槽，才能取消下料待核验。
+            if verify_entry_full:
+                evidence = self._entry_s4_contact
+                if evidence is not None and slot.load_contact_since == evidence.contact_since:
+                    self._entry_s4_contact = None
             self._clear_load_contact(slot)
             pending_contact = False
         if pending_contact and slot.load_contact_released_at is not None and not contact:
@@ -2572,7 +2735,7 @@ class SlotGroupTracker:
                 slot.load_contact_unknown_since = None
                 slot.load_contact_unknown_count = 0
         # 若视觉稳定确认仍是接触前状态，说明这次接触没有改变槽位状态。
-        if (pending_contact and not contact and prior_confirmed in ("empty", "filled")
+        if (pending_contact and not verify_entry_full and not contact and prior_confirmed in ("empty", "filled")
                 and slot.state == prior_confirmed and slot.confirmed == prior_confirmed):
             self._clear_load_contact(slot)
         elif event is not None:
@@ -2581,31 +2744,23 @@ class SlotGroupTracker:
             if pending_contact or event.get("inferred"):
                 self._clear_load_contact(slot)
         elif (pending_contact and not contact and slot.load_contact_released_at is not None
+              and not slot.entry_contact_saw_filled
               and prior_confirmed in ("empty", "filled") and state == "unknown"
               and reason == "not_detected" and slot.load_contact_unknown_since is not None
               and slot.load_contact_unknown_count >= 1
               and now-slot.load_contact_released_at+1e-9 >= min(
                   self.lost_seconds * .75,
                   max(.5, self.confirm_seconds * 2, self.load_hand_contact_seconds))):
-            # 手接触前后YOLO都无法确认时，短暂等待视觉恢复后按已确认基线
-            # 翻转状态：empty→filled、filled→empty；手接触本身不直接定状态。
-            released_at = slot.load_contact_released_at
-            since, count = slot.load_contact_since, slot.load_contact_count
-            inferred_state = "filled" if prior_confirmed == "empty" else "empty"
-            action = "load" if inferred_state == "filled" else "unload"
-            slot.confirmed = slot.state = inferred_state
-            slot.confirmed_since = since
-            slot.confirmed_at = float(now)
-            slot.evidence_time = float(now)
-            slot.confirmation_source = "hand_contact"
-            slot.reason = (f"hand_contact_inferred_{action}" if action == self.phase
-                           else "hand_contact_unknown_state_toggle")
-            event = {"slot_id": slot.slot_id, "from": prior_confirmed, "to": inferred_state,
-                "action": action, "time_lower": since, "time_upper": released_at,
-                "confirmed_at": float(now), "reason": slot.reason,
-                "inferred": True, "hand_contact_since": since,
-                "hand_contact_released_at": released_at, "hand_contact_frames": count}
-            self._clear_load_contact(slot)
+            # A second hand contact without vision cannot reverse an early
+            # S4 unload whose empty state was itself inferred from occlusion.
+            if (self.phase == "unload" and self._entry_points is None and slot_index == 3
+                    and prior_confirmed == "empty" and slot.confirmation_source == "hand_contact"
+                    and any(old["slot_id"] == 4 and old.get("recovered_before_initialization")
+                            and old.get("reason") == "hand_contact_inferred_unload"
+                            for old in self.events)):
+                self._clear_load_contact(slot)
+            else:
+                event = self._infer_hand_contact_toggle(slot, prior_confirmed, now)
         if event is not None and slot.load_contact_pending:
             if pending_contact and not event.get("inferred", False):
                 event.update(reason="detected_after_hand_contact", inferred=False)
@@ -2635,6 +2790,9 @@ class SlotGroupTracker:
         if s4_slot_for_frame and self.s4_contact_diagnostic is not None:
             diagnostic = self.s4_contact_diagnostic
             diagnostic["prediction_contact"] = prediction_diagnostic
+            if verify_entry_full:
+                diagnostic["entry_s4_filled_confirmation"] = reason if reason == "entry_s4_filled_position_mismatch" \
+                    else slot.entry_contact_filled_frames
             if temporary_contact_box is not None:
                 diagnostic.update(temporary_contact_box_active=slot.temporary_contact_box_xyxy is not None,
                                  temporary_contact_box_reason=slot.temporary_contact_box_reason,
@@ -2655,6 +2813,26 @@ class SlotGroupTracker:
             if self.s4_region_diagnostic is not None:
                 self.s4_region_diagnostic.update(accumulation_status=diagnostic["accumulation_status"],
                     contact_count=slot.load_contact_count, evidence_ready=slot.load_contact_pending)
+        return event
+
+    def _infer_hand_contact_toggle(self, slot, prior_confirmed, now):
+        released_at = slot.load_contact_released_at
+        since, count = slot.load_contact_since, slot.load_contact_count
+        inferred_state = "filled" if prior_confirmed == "empty" else "empty"
+        action = "load" if inferred_state == "filled" else "unload"
+        slot.confirmed = slot.state = inferred_state
+        slot.confirmed_since = since
+        slot.confirmed_at = float(now)
+        slot.evidence_time = float(now)
+        slot.confirmation_source = "hand_contact"
+        slot.reason = (f"hand_contact_inferred_{action}" if action == self.phase
+                       else "hand_contact_unknown_state_toggle")
+        event = {"slot_id": slot.slot_id, "from": prior_confirmed, "to": inferred_state,
+            "action": action, "time_lower": since, "time_upper": released_at,
+            "confirmed_at": float(now), "reason": slot.reason,
+            "inferred": True, "hand_contact_since": since,
+            "hand_contact_released_at": released_at, "hand_contact_frames": count}
+        self._clear_load_contact(slot)
         return event
 
     def order_result(self):
