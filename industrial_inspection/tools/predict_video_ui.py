@@ -181,6 +181,8 @@ class VideoMainWindow(MainWindow):
             self.update_image(image)
             if self.thread is not None and not self.thread.stop_event.is_set():
                 self.update_status(info)
+                for alarm in info.get("new_alarms", ()):
+                    self.err_text.append(f"{alarm['at']:.2f}s {alarm['message']}")
         finally:
             if self.thread is not None:
                 self.thread.frame_displayed.set()

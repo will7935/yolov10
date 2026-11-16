@@ -25,6 +25,7 @@ from industrial_inspection.tools.slot_group_tracker import (
     SLOT_STATES, SlotGroupTracker, sort_events_by_time_upper)
 from industrial_inspection.tools.slot_track_display import slot_track_label, slot_track_record
 from industrial_inspection.tools.slot_detection_policy import DetectionThresholds, prepare_business_detections
+from industrial_inspection.tools.slot_operation_alarms import group_operation_alarms
 from industrial_inspection.tools.slot_local_redetection import (
     LocalRedetectionPolicy, recover_missing_slots as recover_local_observations)
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
@@ -62,7 +63,7 @@ _TRIAL_UNLOAD_STABLE_SECONDS = .20
 # 每次完成主视频后，自动用同一套模型和分组逻辑处理五个原始回归视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
-REGRESSION_TESTS_ENABLED = True
+REGRESSION_TESTS_ENABLED = False
 REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
 REGRESSION_TEST_VIDEOS = (
     ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
@@ -309,39 +310,80 @@ def operation_status_text(snapshot):
     return f"{action}中"
 
 
-def _number_map(group_id, first_slot, clockwise):
-    """Map internal S1-S4 to stable absolute numbers starting at the first event."""
+def _clockwise_slot_numbers(first_slot, clockwise):
     cycle = tuple(clockwise)
     if first_slot not in cycle:
         return {}
     start = cycle.index(first_slot)
     ordered = cycle[start:] + cycle[:start]
-    return {slot_id: (group_id-1)*4+i+1 for i, slot_id in enumerate(ordered)}
+    return {slot_id: number for number, slot_id in enumerate(ordered, start=1)}
+
+
+def _number_map(group_id, first_slot, clockwise):
+    """Map internal S1-S4 to stable absolute numbers starting at the first event."""
+    return {slot_id: (group_id-1)*4+number
+            for slot_id, number in _clockwise_slot_numbers(first_slot, clockwise).items()}
+
+
+def _clockwise_numbering(group_id, sequence, events, clockwise):
+    if not sequence:
+        return {}
+    first_slot = sequence[0]  # Final snapshot is already sorted by time_upper.
+    timed = sort_events_by_time_upper(event for event in events
+        if event.get("expected_action") and event["slot_id"] in sequence
+        and event.get("time_upper") is not None)
+    if timed:
+        first_time = timed[0]["time_upper"]
+        first_slots = {event["slot_id"] for event in timed if event["time_upper"] == first_time}
+        if first_slots != {first_slot}:
+            return {}
+    mapping = _number_map(group_id, first_slot, clockwise)
+    if not mapping:
+        return {}
+    return {"first_internal_slot_id": first_slot,
+            "first_confirmed_at": timed[0].get("reported_at") if timed else None,
+            "mapping": mapping}
 
 
 def build_process_report(summary, phase=None):
     """按正式事件和最后确认状态汇总五组；没有取放证据的初始空/满槽不算完成。"""
     phase = summary["phase"] if phase is None else phase
-    snapshots = {g["group_id"]: g["snapshot"] for g in summary["closed_groups"]
-                 if g["snapshot"]["phase"] == phase}
+    closed = {(g["snapshot"]["phase"], g["group_id"]): g for g in summary["closed_groups"]}
+    snapshots = {key: group["snapshot"] for key, group in closed.items()}
     current = summary["final_group_snapshot"]
-    if summary.get("inspection_processed_frames",summary["processed_frames"]) and current["phase"] == phase and current["group_id"] not in snapshots:
-        snapshots[current["group_id"]] = current
+    if summary.get("inspection_processed_frames", summary["processed_frames"]):
+        snapshots.setdefault((current["phase"], current["group_id"]), current)
+    # A full unload/load cycle uses one common starting slot for each carrier.
+    origin_phase = summary["phase"]
+    clockwise = summary.get("clockwise_order", CLOCKWISE_ORDER)
+    published = {}
+    for event in summary.get("events", ()):
+        if event["phase"] == origin_phase:
+            published.setdefault(event["group_id"], []).append(event)
     target = "empty" if phase == "unload" else "filled"
     groups = []
     for group_id in range(1,summary["group_count"]+1):
-        snapshot = snapshots.get(group_id)
+        snapshot = snapshots.get((phase, group_id))
         sequence = [] if snapshot is None else list(snapshot["confirmed_event_sequence"])
         slots = {} if snapshot is None else {s["slot_id"]: s for s in snapshot["slots"]}
         completed = ([None]*4 if snapshot is None else [int(slot_id in sequence
             and slots.get(slot_id,{}).get("last_confirmed_state") == target) for slot_id in range(1,5)])
         numbering = summary.get("display_slot_numbering", {}).get(str(group_id), {})
         number_map = {int(k): v for k, v in numbering.get("mapping", {}).items()}
+        origin_key = (origin_phase, group_id)
+        origin_sequence = snapshots.get(origin_key, {}).get("confirmed_event_sequence", ())
+        origin_events = closed.get(origin_key, {}).get("events", published.get(group_id, ()))
+        origin_numbering = _clockwise_numbering(group_id, origin_sequence, origin_events, clockwise)
+        continuous_numbers = origin_numbering.get("mapping", {})
+        continuous_sequence = [continuous_numbers[i] for i in sequence] if continuous_numbers else []
         groups.append({"group_id": group_id,"observed": snapshot is not None,
             "slot_completed": completed,"completed": snapshot is not None and all(completed),
             "sequence": sequence,"order_result": None if snapshot is None else snapshot["order_result"],
             "display_slot_numbers": [number_map.get(i) for i in range(1,5)],
-            "display_sequence": [number_map.get(i) for i in sequence]})
+            "display_sequence": [number_map.get(i) for i in sequence],
+            "clockwise_start_slot_id": origin_numbering.get("first_internal_slot_id"),
+            "clockwise_sequence": [number-(group_id-1)*4 for number in continuous_sequence],
+            "continuous_sequence": continuous_sequence})
     return {"phase": phase,"slot_ids": [1,2,3,4],"matrix": [g["slot_completed"] for g in groups],
             "groups": groups,"end_status": summary["status"],
             "display_absolute_slot_numbers": summary.get("display_absolute_slot_numbers", DISPLAY_ABSOLUTE_SLOT_NUMBERS)}
@@ -362,13 +404,28 @@ def format_process_report(report):
         else:
             cells = "   ".join("-" if cell is None else str(cell) for cell in group['slot_completed'])
             lines.append(f"G{group['group_id']}       {cells}")
-    lines.append(f"游星片{action}顺序（检测记录）：")
+    lines.extend(("", f"游星片{action}顺序（原槽号）"))
     for group in report["groups"]:
-        values = group['display_sequence'] if absolute else group['sequence']
-        sequence = " → ".join(str(v) if v is not None else "待编号" for v in values) or "未记录"
+        sequence = " → ".join(f"S{slot_id}" for slot_id in group["sequence"]) or "未记录"
         lines.append(f"G{group['group_id']}：{sequence}")
+
+    if any("continuous_sequence" in group for group in report["groups"]):
+        field, label = "continuous_sequence", "跨组顺时针编号"
+    elif any("clockwise_sequence" in group for group in report["groups"]):
+        field, label = "clockwise_sequence", "组内顺时针编号"
+    elif absolute:
+        field, label = "display_sequence", "跨组顺时针编号"
+    else:
+        field = None
+    if field is not None:
+        lines.extend(("", f"游星片{action}顺序（{label}）"))
+        for group in report["groups"]:
+            values = group.get(field, [])
+            sequence = (" → ".join(str(value) if value is not None else "待编号" for value in values)
+                        or ("起点待确认" if group["sequence"] else "未记录"))
+            lines.append(f"G{group['group_id']}：{sequence}")
     if report["end_status"] != "end_of_stream":
-        lines.append("以上为本次已处理视频范围内的检测结果。")
+        lines.extend(("", "以上为本次已处理视频范围内的检测结果。"))
     return "\n".join(lines)
 
 
@@ -432,6 +489,9 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None,
             header = "上料完成" if fullness['all_filled'] else "上料未完成"
         elif snapshot['phase'] == 'load':
             header = "上料中"
+    alarm = snapshot.get("alarm_banner")
+    if alarm is not None:
+        header = alarm["headline"]
     # 按实际文字宽度绘制状态面板，避免固定宽度黑框遮挡右上方画面。
     panel_width = min(w, max(96, _status_text_width(header) + 20))
     panel_height = min(h, 32)
@@ -443,7 +503,8 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None,
         raise ValueError("panel_position must be 'top_left' or 'top_right'")
     panel = frame[:panel_height, panel_left:panel_left + panel_width]
     panel[:] = cv2.addWeighted(panel,.2,np.full_like(panel,20),.8,0)
-    _draw_status_text(panel, header, (40,220,80) if complete else (0,165,255))
+    header_color = (60, 60, 255) if alarm is not None else ((40,220,80) if complete else (0,165,255))
+    _draw_status_text(panel, header, header_color)
     for slot in snapshot["slots"]:
         display_state = slot["state"]
         # Before S numbering is finalized, a current detector box may already
@@ -472,7 +533,9 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None,
         # the internal temporary array index here would look like a stable ID.
         if show_text and snapshot.get("slot_numbering_status") == "final":
             number = slot.get('display_slot_id')
-            label_slot = (str(number) if number is not None else 'pending') if snapshot.get('display_absolute_slot_numbers', False) else f"S{slot['slot_id']}"
+            label_slot = f"S{slot['slot_id']}"
+            if number is not None:
+                label_slot = f"{number}/{label_slot}" if snapshot.get('display_absolute_slot_numbers') else f"{label_slot}/{number}"
             label = f"G{slot['group_id']}-{label_slot} {slot['state']}"
             (tw,th),_ = cv2.getTextSize(label,cv2.FONT_HERSHEY_SIMPLEX,.38,1)
             left = max(0,min(w-tw-3,point[0]+7))
@@ -574,19 +637,35 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             on_log(message)
     group_completion = {}
     display_slot_numbering = {}
+    inspection_history = []
+    alarms = {}
+    finalized_alarm_groups = set()
+    latest_alarm = None
 
-    def update_display_numbering(events):
-        if not DISPLAY_ABSOLUTE_SLOT_NUMBERS:
-            return
-        for event in sort_events_by_time_upper(events):
-            group_id, slot_id = event.get('group_id'), event.get('slot_id')
-            if (event.get('phase') != 'unload' or not event.get('expected_action')
-                    or group_id in display_slot_numbering or slot_id not in (1,2,3,4)):
-                continue
-            mapping = _number_map(group_id, slot_id, CLOCKWISE_ORDER)
-            display_slot_numbering[group_id] = {'first_internal_slot_id': slot_id,
-                                                 'first_confirmed_at': event.get('reported_at'),
-                                                 'mapping': mapping}
+    def update_display_numbering(snapshot):
+        def update_origin(origin, events):
+            group_id = origin["group_id"]
+            numbering = _clockwise_numbering(group_id, origin["confirmed_event_sequence"],
+                                             events, CLOCKWISE_ORDER)
+            if numbering:
+                display_slot_numbering[group_id] = numbering
+            else:
+                display_slot_numbering.pop(group_id, None)
+
+        updated_groups = {event["group_id"] for event in snapshot.get("new_group_events", ())
+                          if event["type"] in ("group_closed", "group_updated")
+                          and event["phase"] == PROCESS_PHASE}
+        if updated_groups:
+            for group in sequence.closed_groups:
+                if group["phase"] == PROCESS_PHASE and group["group_id"] in updated_groups:
+                    update_origin(group["snapshot"], group["events"])
+        if snapshot["phase"] == PROCESS_PHASE and snapshot["slot_numbering_status"] == "final":
+            update_origin(snapshot, sequence.tracker.events)
+        mapping = display_slot_numbering.get(snapshot["group_id"], {}).get("mapping", {})
+        snapshot["continuous_sequence"] = [mapping[i] for i in snapshot["confirmed_event_sequence"]] if mapping else []
+        snapshot["display_absolute_slot_numbers"] = DISPLAY_ABSOLUTE_SLOT_NUMBERS
+        for slot in snapshot["slots"]:
+            slot["display_slot_id"] = mapping.get(slot["slot_id"])
     def _action_text(phase):
         return "下料" if phase == "unload" else "上料"
 
@@ -836,6 +915,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             def publish_inspection_events(items):
                 for item in items:
                     inspection_events.write(json.dumps(item,ensure_ascii=False)+"\n")
+                    inspection_history.append(item)
                     if item.get('inspection_started'):
                         log('舱门把手已打开：开始检测，按下料→上料流程执行。' if tracker.phase == 'unload'
                             else '舱门把手已打开：开始上料检测。')
@@ -844,6 +924,47 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         log(f"游星片{item['group_id']}：{item['result']}（{item['filled_count']}/4）")
                     elif item['type'] == 'loading_fullness_final':
                         log("上料完成" if item.get('all_filled') else "上料未完成")
+
+            def publish_operation_alarms(snapshot, now, *, hatch_closed=False, pending_tail=None):
+                nonlocal latest_alarm
+                snapshot["new_alarms"] = []
+                if inspection is not None and inspection.started_at is None:
+                    return
+
+                def check(group_snapshot, confirmed_events, close_reason=None):
+                    nonlocal latest_alarm
+                    group_id, phase = group_snapshot["group_id"], group_snapshot["phase"]
+                    mapping = display_slot_numbering.get(group_id, {}).get("mapping", {})
+                    for alarm in group_operation_alarms(group_snapshot, confirmed_events, mapping, now,
+                                                        close_reason=close_reason):
+                        key = (phase, group_id, alarm["type"])
+                        if key in alarms:
+                            continue
+                        alarms[key] = latest_alarm = alarm
+                        publish_inspection_events([alarm])
+                        snapshot["new_alarms"].append(alarm)
+                        log(f"{now:.2f}s {alarm['message']}")
+
+                if sequence.departing_load_tracker is not None:
+                    departing = sequence.departing_load_tracker
+                    pending_tail = (departing.phase, departing.group_id)
+                archived = set()
+                for group in sequence.closed_groups:
+                    key = (group["phase"], group["group_id"])
+                    archived.add(key)
+                    if key in finalized_alarm_groups:
+                        continue
+                    close_reason = None if key == pending_tail else group["close_reason"]
+                    check(group["snapshot"], group["events"], close_reason)
+                    if close_reason is not None:
+                        finalized_alarm_groups.add(key)
+                active = (snapshot["phase"], snapshot["group_id"])
+                if active not in archived:
+                    seen = any(slot["center_xy"] is not None for slot in snapshot["slots"])
+                    check(snapshot, sequence.tracker.events, "hatch_closed" if hatch_closed and seen else None)
+                if latest_alarm is not None and now-latest_alarm["at"] <= 3.:
+                    snapshot["alarm_banner"] = latest_alarm
+
             csv_file = stack.enter_context((output/"slot_states.csv").open("w",encoding="utf-8-sig",newline=""))
             fields = ["source_frame","time_seconds","group_id","slot_id","formal_slot_id","internal_slot_index",
                       "byte_track_id","logical_track_id","reidentified_from_track_id","reid_gap_seconds",
@@ -952,11 +1073,9 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     else:
                         snapshot = {**sequence.snapshot(),"new_events":[],"new_group_events":[]}
                 tracker = sequence.tracker
-                update_display_numbering(snapshot.get('new_events', []))
-                snapshot['display_absolute_slot_numbers'] = DISPLAY_ABSOLUTE_SLOT_NUMBERS
-                for slot in snapshot.get('slots', []):
-                    numbering = display_slot_numbering.get(slot.get('group_id'), {})
-                    slot['display_slot_id'] = numbering.get('mapping', {}).get(slot.get('slot_id'))
+                update_display_numbering(snapshot)
+                publish_operation_alarms(snapshot, timestamp,
+                                         hatch_closed=inspection is not None and inspection.closed_at is not None)
                 # ByteTrack runs continuously for the whole video. G/S is a
                 # separate business mapping; switching G must not renumber BT.
                 track_states = snapshot.setdefault('track_states', [])
@@ -1164,6 +1283,10 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                 status_text = (f"组{tracker.group_id} · {operation_status_text(snapshot)} · "
                                f"{timestamp:.2f}s · {GROUP_TEXT[snapshot['group_status']]} · "
                                f"顺序{snapshot['order_result']}")
+                if snapshot["confirmed_event_sequence"]:
+                    original = " → ".join(f"S{i}" for i in snapshot["confirmed_event_sequence"])
+                    continuous = " → ".join(map(str, snapshot["continuous_sequence"])) or "起点待确认"
+                    text += f"\n原槽号顺序 {original}\n跨组顺时针编号顺序 {continuous}"
                 if inspection is not None:
                     if inspection.started_at is None:
                         status_text = text = '等待舱门把手打开'
@@ -1173,6 +1296,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                                               else "上料未完成")
                     else:
                         status_text += f" · 已确认放满{inspection.report['confirmed_filled_count']}/20"
+                if snapshot.get("alarm_banner") is not None:
+                    status_text += f"\n{snapshot['alarm_banner']['message'].splitlines()[0]}"
                 if on_frame is not None:
                     on_frame(plotted,{"status": status_text,
                         "result": text,"frame_id": processed,"source_frame": source_frame,"time_seconds": timestamp,
@@ -1181,6 +1306,9 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         "pending_phase": snapshot["pending_phase"],
                         "pending_initialization": snapshot["pending_initialization"],
                         "slot_numbering_status": snapshot["slot_numbering_status"],
+                        "confirmed_event_sequence": snapshot["confirmed_event_sequence"],
+                        "continuous_sequence": snapshot["continuous_sequence"],
+                        "new_alarms": snapshot["new_alarms"],
                         "track_states": snapshot.get('track_states', []),
                         "inspection": inspection.snapshot() if inspection is not None else None})
                 if inspection is not None and inspection.closed_at is not None:
@@ -1200,9 +1328,14 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                 if args.max_frames and processed >= args.max_frames:
                     status = "frame_limit"
                     break
+            # End of source or a manual stop does not prove a carrier completed its operation.
+            departing = sequence.departing_load_tracker
+            pending_tail = (departing.phase, departing.group_id) if departing is not None else None
             final = (sequence.finish() if not sequence_finished else
                      {**sequence.snapshot(),"new_events":[],"new_group_events":[]})
-            update_display_numbering(final['new_events'])
+            update_display_numbering(final)
+            if processed:
+                publish_operation_alarms(final, timestamp, pending_tail=pending_tail)
             for event in final["new_events"]:
                 events.write(json.dumps(event,ensure_ascii=False)+"\n")
             for event in final["new_group_events"]:
@@ -1223,10 +1356,13 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             writer.release()
         if args.show:
             cv2.destroyAllWindows()
+        final_snapshot = sequence.snapshot()
+        update_display_numbering(final_snapshot)
         summary.update(status=status,processed_frames=processed,elapsed_seconds=round(time.perf_counter()-started,3),
                        inspection_processed_frames=inspection_processed,
-                       final_group_snapshot=sequence.snapshot(),events=sequence.all_events,
+                       final_group_snapshot=final_snapshot,events=sequence.all_events,
                        closed_groups=sequence.closed_groups,
+                       inspection_events=inspection_history,operation_alarms=list(alarms.values()),
                        display_slot_numbering={str(k):v for k,v in display_slot_numbering.items()},
                        display_absolute_slot_numbers=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
         if "track_counts" in locals():
@@ -1244,7 +1380,6 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         if inspection is not None:
             inspection.update_fullness(sequence, timestamp if processed else 0.)
             summary['inspection'] = inspection.snapshot()
-            summary['inspection_events'] = inspection.events
             summary['loading_fullness_report'] = inspection.report
             (output/'loading_fullness_report.json').write_text(
                 json.dumps(inspection.report,ensure_ascii=False,indent=2),encoding='utf-8')

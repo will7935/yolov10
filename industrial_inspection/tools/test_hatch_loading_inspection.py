@@ -202,6 +202,59 @@ class HatchPipelineTests(unittest.TestCase):
                 on_log=logs.append,on_frame=lambda image,info:ui.append(info))
         return summary,logs,ui
 
+    def test_order_alarm_is_realtime_and_incomplete_alarm_waits_for_hatch_close(self):
+        frames = [boxes() + [handle('open')]] * 12
+        for filled in ((2,), (2, 3), (2, 3, 1)):
+            frames += [boxes(filled=filled) + [handle('open')]] * 4
+        frames += [boxes(filled=(2, 3, 1)) + [handle('open')]] * 6
+        closing = len(frames)
+        frames += [boxes(filled=(2, 3, 1)) + [handle('closed')]] * 3
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary, logs, ui = self.run_video(frames, root, PROCESS_PHASE='load',
+                                               AUTO_LOAD_AFTER_UNLOAD=False)
+            order, incomplete = summary['operation_alarms']
+            self.assertEqual((order['type'], order['reason']), ('slot_order_alarm', 'not_clockwise'))
+            self.assertEqual(order['slot_sequence'], [2, 4, 3])
+            self.assertEqual(order['continuous_sequence'], [1, 4, 3])
+            order_lines = ['原槽号顺序 S2 → S4 → S3', '跨组顺时针编号顺序 1 → 4 → 3']
+            self.assertEqual(order['message'].splitlines()[1:], order_lines)
+            order_frame = next(info for info in ui if order in info['new_alarms'])
+            self.assertEqual(order_frame['result'].splitlines()[-2:], order_lines)
+            self.assertLess(order['at'], closing / 10)
+            self.assertEqual(incomplete['type'], 'group_incomplete_alarm')
+            self.assertEqual(incomplete['reason'], 'hatch_closed')
+            self.assertEqual(incomplete['confirmed_count'], 3)
+            self.assertEqual(incomplete['slots'], [{'slot_id': 1, 'continuous_slot_id': 2,
+                                                     'last_confirmed_state': 'empty'}])
+            self.assertEqual(incomplete['at'], summary['inspection']['closed_at'])
+            self.assertEqual([a for info in ui for a in info['new_alarms']], [order, incomplete])
+            self.assertIn(order['message'], next(log for log in logs if '顺序异常' in log))
+            saved = [json.loads(line) for line in (root/'results'/'inspection_events.jsonl')
+                     .read_text(encoding='utf-8').splitlines()]
+            self.assertEqual(saved, summary['inspection_events'])
+
+    def test_incomplete_load_alarm_waits_for_departing_verification(self):
+        frames = [objects + [handle('open')]
+                  for objects in group_frames('load', physical_order=(2, 0, 1))]
+        frames += [[handle('open')]] * 16
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary, _, _ = self.run_video(frames, root, PROCESS_PHASE='load',
+                                           AUTO_LOAD_AFTER_UNLOAD=False)
+            first = summary['closed_groups'][0]
+            self.assertEqual(first['snapshot']['confirmed_event_sequence'], [2, 1, 3])
+            alarm, = summary['operation_alarms']
+            self.assertEqual((alarm['type'], alarm['group_id']), ('group_incomplete_alarm', 1))
+            self.assertEqual(alarm['slots'][0]['slot_id'], 4)
+            self.assertGreaterEqual(alarm['at'] + 1e-9, first['at'] + predict.IDENTITY_LOST_SECONDS)
+            stop_at = round(first['at'] * 10) + 2
+            (root/'early').mkdir()
+            early, _, _ = self.run_video(frames[:stop_at], root/'early', PROCESS_PHASE='load',
+                                         AUTO_LOAD_AFTER_UNLOAD=False)
+            self.assertEqual(len(early['closed_groups']), 1)
+            self.assertEqual(early['operation_alarms'], [])
+
     def test_full_unload_load_cycle_starts_at_open_and_finishes_at_close_with_twenty_slots(self):
         frames = [boxes(filled=range(4))+[handle('closed')]]*5
         frames += [boxes(filled=range(4))+[handle('open')]]*5

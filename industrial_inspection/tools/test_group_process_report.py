@@ -71,7 +71,8 @@ class GroupProcessReportTests(unittest.TestCase):
         self.assertEqual(report['matrix'][2],[1,0,1,1])
         text=predict.format_process_report(report)
         self.assertIn('游星片槽位上料完成矩阵',text)
-        self.assertIn('G3：10 → 11 → 12',text)
+        self.assertIn('G3：S1 → S3 → S4',text)
+        self.assertIn('G3：9 → 10 → 11',text)
         self.assertIn('G1：未记录',text)
         self.assertIn('已处理视频范围',text)
 
@@ -82,12 +83,77 @@ class GroupProcessReportTests(unittest.TestCase):
 
     def test_display_mapping_follows_unload_even_if_load_starts_elsewhere(self):
         current=snapshot(2,(3,1),states=('filled','empty','filled','empty'),phase='load')
-        data=summary(current)
+        data=summary(current,[snapshot(2,(2,1,3,4))])
+        data['phase']='unload'
         data['display_absolute_slot_numbers']=True
         data['display_slot_numbering']={'2': {'mapping': predict._number_map(2,2,(1,3,4,2))}}
-        report=predict.build_process_report(data)
+        report=predict.build_process_report(data,'load')
         self.assertEqual(report['groups'][1]['display_sequence'],[7,6])
         self.assertIn('G2：7 → 6',predict.format_process_report(report))
+
+    def test_recovered_unload_anchors_numbers_in_both_phases(self):
+        unload = snapshot(3, (4, 1, 2, 3))
+        load = snapshot(3, (2, 4), phase='load')
+        data = summary(load, [unload])
+        data['phase'] = 'unload'
+        data['events'] = [
+            {'group_id': 3, 'phase': 'unload', 'slot_id': 1, 'expected_action': True,
+             'time_upper': 12., 'reported_at': 12.2},
+            {'group_id': 3, 'phase': 'unload', 'slot_id': 4, 'expected_action': True,
+             'time_upper': 11., 'reported_at': 13.},
+        ]
+        unload_report = predict.build_process_report(data, 'unload')
+        group = unload_report['groups'][2]
+        self.assertEqual(group['clockwise_start_slot_id'], 4)
+        self.assertEqual(group['sequence'], [4, 1, 2, 3])
+        self.assertEqual(group['clockwise_sequence'], [1, 3, 2, 4])
+        self.assertEqual(group['continuous_sequence'], [9, 11, 10, 12])
+        original, continuous = predict.format_process_report(unload_report).split(
+            '\n\n游星片下料顺序（跨组顺时针编号）\n')
+        self.assertIn('游星片下料顺序（原槽号）\nG1：未记录\nG2：未记录\nG3：S4 → S1 → S2 → S3',
+                      original)
+        self.assertIn('G3：9 → 11 → 10 → 12', continuous)
+        load_group = predict.build_process_report(data, 'load')['groups'][2]
+        self.assertEqual(load_group['clockwise_sequence'], [2, 1])
+        self.assertEqual(load_group['continuous_sequence'], [10, 9])
+
+    def test_tied_first_events_leave_start_unresolved(self):
+        current = snapshot(1, (4, 2, 1))
+        data = summary(current)
+        data['events'] = [
+            {'group_id': 1, 'phase': 'unload', 'slot_id': slot_id,
+             'expected_action': True, 'time_upper': 10.}
+            for slot_id in (4, 2)
+        ]
+        report = predict.build_process_report(data)
+        group = report['groups'][0]
+        self.assertIsNone(group['clockwise_start_slot_id'])
+        self.assertEqual(group['clockwise_sequence'], [])
+        self.assertEqual(group['continuous_sequence'], [])
+        text = predict.format_process_report(report)
+        self.assertIn('游星片下料顺序（原槽号）\nG1：S4 → S2 → S1', text)
+        self.assertIn('游星片下料顺序（跨组顺时针编号）\nG1：起点待确认', text)
+
+    def test_load_only_anchors_numbers_to_first_load_even_in_absolute_display(self):
+        current = snapshot(2, (3, 4, 1), phase='load')
+        data = summary(current)
+        data['clockwise_order'] = [1, 3, 4, 2]
+        data['display_absolute_slot_numbers'] = True
+        data['display_slot_numbering'] = {'2': {'mapping': predict._number_map(2, 1, (1, 3, 4, 2))}}
+        report = predict.build_process_report(data)
+        group = report['groups'][1]
+        self.assertEqual(group['clockwise_start_slot_id'], 3)
+        self.assertEqual(group['clockwise_sequence'], [1, 2, 4])
+        self.assertEqual(group['continuous_sequence'], [5, 6, 8])
+        text = predict.format_process_report(report)
+        self.assertIn('游星片上料顺序（原槽号）\nG1：未记录\nG2：S3 → S4 → S1', text)
+        self.assertIn('游星片上料顺序（跨组顺时针编号）\nG1：未记录\nG2：5 → 6 → 8', text)
+
+    def test_incomplete_groups_reserve_their_full_number_ranges(self):
+        groups = [snapshot(1, (2,)), snapshot(2, (4, 1)), snapshot(4, (1, 3, 4, 2))]
+        report = predict.build_process_report(summary(snapshot(5, (3, 4)), groups))
+        self.assertEqual([g['continuous_sequence'] for g in report['groups']],
+                         [[1], [5, 7], [], [13, 14, 15, 16], [17, 18]])
 
 
 if __name__ == '__main__':
