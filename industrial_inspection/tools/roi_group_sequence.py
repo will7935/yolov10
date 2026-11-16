@@ -11,6 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from industrial_inspection.tools.slot_group_tracker import (
     SLOT_STATES, box_containment, box_iou, slot_layout_error, valid_slot_geometry)
 from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
+from industrial_inspection.tools.slot_two_point_contact import TwoPointHandContact
 
 
 class RoiGroupSequence:
@@ -32,7 +33,8 @@ class RoiGroupSequence:
                  require_first_unload_event_for_g1=False,
                  outside_mapping_quarantine_seconds=3.0,
                  use_previous_s4_layouts=False, edge_evidence_px=0.0,
-                 unload_entry_upper_right_band=(0., 0.)):
+                 unload_entry_upper_right_band=(0., 0.), two_point_extension_multiplier=0.,
+                 two_point_hand_hold_seconds=.8):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
@@ -69,6 +71,10 @@ class RoiGroupSequence:
         self._upper_roi_edges = [(start, end) for start, end in
             zip(self.contour, np.roll(self.contour, -1, axis=0))
             if orientation*(end[0]-start[0]) > abs(end[1]-start[1])]
+        if two_point_extension_multiplier:
+            tracker.two_point_hand_contact = TwoPointHandContact(
+                two_point_extension_multiplier, self._upper_roi_edges, self.contour,
+                hold_seconds=two_point_hand_hold_seconds)
         self.reject_transition_roi_detections = bool(reject_transition_roi_detections)
         self.transition_quarantine_min_frames = int(transition_quarantine_min_frames)
         self.require_first_unload_event_for_g1 = bool(require_first_unload_event_for_g1)
@@ -97,6 +103,7 @@ class RoiGroupSequence:
         self.exit_since = None
         self.return_since = None
         self.closed_groups, self.all_events = [], []
+        self.cancelled_s4_inferred_loads = 0
         self.pending_tracker = None
         self.departing_points = None
         self.departing_seen = None
@@ -433,13 +440,20 @@ class RoiGroupSequence:
         """Drop an unconfirmed G1 candidate after it actually leaves the ROI."""
         if not self._initial_g1_waiting_for_unload():
             return False
+        provisional = self.tracker._provisional
+        candidate = provisional or self.tracker
+        if any(
+                event is not None and event["action"] == "unload" and event["expected_action"]
+                for event in (slot.pending_visual_event for slot in candidate.slots)):
+            # 本帧先判断是否丢弃候选，再更新复核。保留候选直到复核实际完成，
+            # 包括超过时限后由第一帧确认或撤销事件的时刻。
+            return False
         identity = (self.tracker.phase, self.tracker.group_id)
         history = self._group_roi_tracks.get(identity, {})
-        provisional = getattr(self.tracker, "_provisional", None)
         provisional_ids = {int(track_id) for track_id in
                            getattr(provisional, "byte_track_ids", [])
                            if track_id is not None}
-        # Protect the candidate only while all four real provisional tracks
+        # Geometry alone protects the candidate while all four real provisional tracks
         # have continuous in-ROI support and stable relative geometry.  Three
         # visible tracks are insufficient: the fourth may be the stale point
         # that later produces a delayed or incorrect S-slot mapping.
@@ -785,13 +799,42 @@ class RoiGroupSequence:
         if previous is None or previous["snapshot"].get("slot_numbering_status") == "provisional":
             return result
         new_events = list(result["new_events"])
-        for slot, baseline in zip(tracker.slots, previous["snapshot"]["slots"]):
+        identity = (tracker.phase, tracker.group_id)
+        for slot, baseline, track_id in zip(tracker.slots, previous["snapshot"]["slots"],
+                                            tracker.byte_track_ids):
             if (baseline["last_confirmed_state"] != "empty" or baseline["last_confirmed_at"] is None
+                    or slot.pending_visual_event is not None
                     or any(e["slot_id"] == slot.slot_id for e in tracker.events)):
                 continue
+            evidence_id = slot.confirmed_visual_track_id
+            if (slot.confirmed == "filled" and slot.confirmation_source == "yolo"
+                    and evidence_id is not None and track_id is not None
+                    and self.track_store.logical_id(evidence_id) != self.track_store.logical_id(track_id)):
+                # The temporary spatial slot may have been reused by another track.
+                # For backfilled load events only, use that track's own observations.
+                record = self.track_store.tracks.get(track_id)
+                history = record["state"] if (record is not None and record["owner"] in (None, identity)
+                    and record["slot_id"] in (None, slot.slot_id)) else None
+                if (history is None or history.evidence_time is None
+                        or now-history.evidence_time > tracker.initialization_history_seconds):
+                    slot.confirmed = slot.state = "unknown"
+                    slot.confirmed_since = slot.confirmed_at = slot.evidence_time = None
+                    slot.confirmed_visual_track_id = slot.confirmation_source = None
+                    slot.candidate, slot.candidate_since, slot.candidate_count = "unknown", None, 0
+                    slot.candidate_visual_track_id = None
+                else:
+                    slot.confirmed, slot.evidence_time = history.confirmed, history.evidence_time
+                    slot.confirmed_since, slot.confirmed_at = history.confirmed_since, history.confirmed_at
+                    slot.confirmed_visual_track_id = history.confirmed_visual_track_id
+                    slot.confirmation_source = history.confirmation_source
+                    slot.state = history.state
+                    slot.candidate, slot.candidate_since, slot.candidate_count = (
+                        history.candidate, history.candidate_since, history.candidate_count)
+                    slot.candidate_visual_track_id = history.candidate_visual_track_id
             if slot.confirmed == "unknown":
                 slot.confirmed, slot.evidence_time = "empty", baseline["last_confirmed_at"]
                 slot.confirmed_since = slot.confirmed_at = baseline["last_confirmed_at"]
+                slot.confirmed_visual_track_id = None
                 slot.confirmation_source = "previous_unload_yolo"
             elif slot.confirmed == "filled":
                 # 上料在正式编号前已完成时，空和满都必须有实际检测依据。
@@ -804,6 +847,18 @@ class RoiGroupSequence:
                     "reported_at":float(now),
                     "recovered_before_initialization":True,"reason":"detected_after_unload_baseline"}
                 tracker.events.append(event)
+                new_events.append(event)
+        contact_tracker = tracker.two_point_hand_contact
+        baseline = previous["snapshot"]["slots"][3]
+        slot = tracker.slots[3]
+        if (contact_tracker is not None and tracker.load_hand_contact_enabled
+                and baseline["last_confirmed_state"] == "empty" and baseline.get("confirmation_source") == "yolo"
+                and baseline["last_confirmed_at"] is not None and slot.confirmed == "empty"
+                and slot.pending_visual_event is None and not any(e["slot_id"] == 4 for e in tracker.events)):
+            contact = contact_tracker.take_s4_load(tracker, baseline["last_confirmed_at"], now)
+            if contact is not None and (slot.confirmation_source == "previous_unload_yolo"
+                    or slot.evidence_time < contact.released_at):
+                event = tracker.infer_entry_s4_load(contact, now)
                 new_events.append(event)
         return {**tracker.snapshot(),"new_events":new_events}
 
@@ -979,6 +1034,11 @@ class RoiGroupSequence:
 
     def _close(self, now):
         self._finish_departing_load(now)
+        verify_departing = (self.tracker.points is not None and self.tracker.phase == "load"
+            and (self.tracker.s4_inferred_load is not None or any(
+                s.confirmed == "empty" or s.pending_visual_event is not None for s in self.tracker.slots)))
+        if not verify_departing:
+            self._deferred_new_events.extend(self.tracker.finish_visual_event_reviews(now))
         snap = self.tracker.snapshot()
         if self.tracker.points is None:
             snap["provisional_events"] = deepcopy(self.tracker._entry_events)
@@ -1000,8 +1060,7 @@ class RoiGroupSequence:
         self._group_events.append(record)
         # 组号立即切换，但旧组保留一个丢失时限供旋转后的填充框核验。
         # 旧框仍由原有退出点关联排除，不会参与下一组的编号。
-        if (self.tracker.points is not None and self.tracker.phase == "load"
-                and any(s.confirmed == "empty" for s in self.tracker.slots)):
+        if verify_departing:
             self.departing_load_tracker = self.tracker
             self.departing_load_deadline = now+self.tracker.lost_seconds
             self.departing_points = self.tracker.points.copy()
@@ -1053,6 +1112,7 @@ class RoiGroupSequence:
         tracker = self.departing_load_tracker
         if tracker is None:
             return
+        self._deferred_new_events.extend(tracker.finish_visual_event_reviews(now))
         self._refresh_closed_load(tracker, now)
         self.departing_load_tracker = self.departing_load_deadline = None
 
@@ -1063,10 +1123,22 @@ class RoiGroupSequence:
         hands = [o for o in objects if o["class_name"] == "hand"]
         events = tracker.verify_departing_load(matches, hands, now, enabled=self._observations_enabled)
         self._deferred_new_events.extend(events)
-        if events:
+        cancelled = self._record_s4_inferred_load_cancellation(tracker, now)
+        if events or cancelled:
             self._refresh_closed_load(tracker, now)
         if now >= self.departing_load_deadline:
             self._finish_departing_load(now)
+
+    def _record_s4_inferred_load_cancellation(self, tracker, now):
+        event = tracker.cancelled_s4_inferred_load
+        if event is None:
+            return False
+        tracker.cancelled_s4_inferred_load = None
+        self.all_events.remove(event)
+        self.cancelled_s4_inferred_loads += 1
+        self._group_events.append({"type": "s4_inferred_load_cancelled", "phase": tracker.phase,
+            "group_id": tracker.group_id, "at": float(now), "event": deepcopy(event)})
+        return True
 
     def _recheck_quarantined_entry_track(self, objects, admitted, tracker, now):
         """Review an unbound handoff track against three real incoming tracks."""
@@ -1405,7 +1477,7 @@ class RoiGroupSequence:
         if not discarded_initial_candidate and self.state == "entering":
             result = self._update_immediate_entry(objects, now, observations_enabled)
         elif not discarded_initial_candidate and self.state in ("waiting_next","stabilizing_next"):
-            result = self._update_entry(objects,now,observations_enabled)
+            result = self._update_entry(objects, now, observations_enabled)
         elif not discarded_initial_candidate and self.state == "sequence_complete":
             self._exclude_departing(objects, now)
         elif not discarded_initial_candidate:
@@ -1427,6 +1499,7 @@ class RoiGroupSequence:
                 translation_direction=self.direction if self.state == "exiting" else None,
                 s4_position_candidates=position_candidates,
                 recheck_initial_unload=self._g1_waiting_event)
+            self._record_s4_inferred_load_cancellation(self.tracker, now)
             if self.tracker.points is not None and self.state == "initializing":
                 self._arm(now)
             if self.state == "exiting" and (self.exit_min_slots == 1 or
@@ -1485,6 +1558,7 @@ class RoiGroupSequence:
             return {**self.snapshot(), "new_events": [], "new_group_events": []}
         now = self.last_time
         self._deferred_new_events.extend(self.tracker.finish_s4_unload_review(now))
+        self._deferred_new_events.extend(self.tracker.finish_visual_event_reviews(now))
         self._finish_departing_load(now)
         self.all_events.extend(deepcopy(self._deferred_new_events))
         return {**self.snapshot(), "new_events": deepcopy(self._deferred_new_events),

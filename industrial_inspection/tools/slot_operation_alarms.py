@@ -14,7 +14,8 @@ def group_operation_alarms(snapshot, events, numbering, now, *, close_reason=Non
     formal = snapshot["slot_numbering_status"] == "final"
     identity = {"at": float(now), "phase": phase, "group_id": group_id}
     alarms = []
-    if formal and snapshot["order_result"] == "fail":
+    if (formal and snapshot["order_result"] == "fail"
+            and (close_reason is not None or not snapshot.get("s4_inferred_load_pending"))):
         ordered = sort_events_by_time_upper(events)
         sequence = [event["slot_id"] for event in ordered]
         if any(not event["expected_action"] for event in ordered):

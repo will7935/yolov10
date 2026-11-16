@@ -192,6 +192,63 @@ class CycleSequenceTests(unittest.TestCase):
         self.assertEqual(event['reported_at'], 1.4)
         self.assertLessEqual(event['time_upper'], event['confirmed_at'])
 
+    def test_backfilled_load_uses_replacement_tracks_independent_filled_time(self):
+        sequence = self.previous_unload()
+        tracker = sequence.tracker
+        old_s4 = {**boxes(visible=(3,), filled=(3,))[0], "track_id": 80}
+        new_s2 = {**boxes(visible=(1,), filled=(1,))[0], "track_id": 90}
+        for now in (1., 1.1):
+            tracker.update([old_s4], now)
+        # Reproduce a temporary point whose filled timestamp was carried
+        # over to a neighbouring track before S2/S4 were finally numbered.
+        old_state = tracker.slots[3]
+        replacement = deepcopy(old_state)
+        replacement.slot_id = 2
+        tracker.slots[1] = replacement
+        tracker.byte_track_ids[1] = 90
+        for now in (1.7, 1.8):
+            sequence.track_store.observe([new_s2], now)
+        result = sequence._restore_load_baseline({"new_events": []}, 1.8)
+        events = {e["slot_id"]: e for e in result["new_events"]}
+        self.assertEqual(events[4]["time_upper"], 1.)
+        self.assertEqual(events[2]["time_upper"], 1.7)
+        self.assertEqual(events[2]["confirmed_at"], 1.8)
+        self.assertEqual(result["confirmed_event_sequence"], [4, 2])
+
+    def test_backfill_does_not_claim_fill_from_unconfirmed_replacement(self):
+        sequence = self.previous_unload()
+        tracker = sequence.tracker
+        old_box = {**boxes(visible=(3,), filled=(3,))[0], "track_id": 80}
+        for now in (1., 1.1):
+            tracker.update([old_box], now)
+        tracker.byte_track_ids[3] = 90
+        sequence.track_store.observe([{**old_box, "track_id": 90}], 1.2)
+        result = sequence._restore_load_baseline({"new_events": []}, 1.2)
+        self.assertFalse(result["new_events"])
+        self.assertEqual(result["slots"][3]["last_confirmed_state"], "empty")
+        self.assertEqual(result["slots"][3]["state"], "unknown")
+
+    def test_backfill_keeps_history_for_verified_same_slot_reidentification(self):
+        sequence = self.previous_unload()
+        tracker = sequence.tracker
+        store = sequence.track_store
+        store.reidentification_enabled = True
+        old_box = {**boxes(visible=(3,), filled=(3,))[0], "track_id": 80}
+        for now in (1., 1.1):
+            store.observe([old_box], now)
+            tracker.update([old_box], now)
+        identity = (tracker.phase, tracker.group_id)
+        store.bind(80, identity, 4, center=POINTS[3], now=1.1)
+        for now in (1.7, 1.8):
+            store.observe([{**old_box, "track_id": 90}], now)
+        store.bind(90, identity, 4, center=POINTS[3], now=1.8)
+        self.assertEqual(store.logical_id(90), 80)
+        tracker.byte_track_ids[3] = 90
+        result = sequence._restore_load_baseline({"new_events": []}, 1.8)
+        event, = result["new_events"]
+        self.assertEqual(event["time_upper"], 1.)
+        self.assertEqual(event["confirmed_at"], 1.1)
+
     def test_incremental_entry_recovers_early_load_without_duplicating_unload_events(self):
         sequence = self.make()
         for _ in range(5):
@@ -283,9 +340,16 @@ class CyclePipelineTests(unittest.TestCase):
             self.assertEqual(summary["processed_frames"], len(frames))
             self.assertEqual(summary["current_phase"], "load")
             self.assertEqual(summary["final_group_snapshot"]["group_status"], "sequence_complete")
-            expected_logs = [f"游星片{g}：{action}{state}" for action in ("下料", "上料")
-                             for g in range(1, 6) for state in ("未完成", "完成")]
-            self.assertEqual(logs[:-1], expected_logs)
+            for action in ("下料", "上料"):
+                for group_id in range(1, 6):
+                    self.assertTrue(any(f"s G{group_id} {action}\n原槽号顺序 S2 → S1 → S3 → S4" in log
+                                        for log in logs))
+            self.assertFalse(any("完成矩阵" in log for log in logs))
+            final_log = logs[-2]
+            for action in ("下料", "上料"):
+                self.assertIn(f"{action}完成统计（按取放事件）\n已确认 20/20 槽，完成 5/5 组", final_log)
+                self.assertIn(f"游星片{action}顺序（原槽号）", final_log)
+                self.assertIn(f"游星片{action}顺序（跨组顺时针编号）", final_log)
             self.assertEqual(summary["group_process_report"], summary["group_process_reports"]["unload"])
             for phase in ("unload", "load"):
                 report = summary["group_process_reports"][phase]
@@ -295,9 +359,9 @@ class CyclePipelineTests(unittest.TestCase):
             reports = json.loads((args.output_dir / "group_process_report.json").read_text(encoding="utf-8"))
             self.assertEqual(reports, saved["group_process_reports"])
             self.assertEqual(reports, summary["group_process_reports"])
-            self.assertEqual((args.output_dir / "group_process_report.txt").read_text(encoding="utf-8"), logs[-1] + "\n")
-            self.assertIn("槽位下料完成矩阵", logs[-1])
-            self.assertIn("槽位上料完成矩阵", logs[-1])
+            report_text = (args.output_dir / "group_process_report.txt").read_text(encoding="utf-8")
+            self.assertIn("槽位下料完成矩阵", report_text)
+            self.assertIn("槽位上料完成矩阵", report_text)
             events = [json.loads(line) for line in (args.output_dir / "slot_events.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(events, summary["events"])
             self.assertEqual(len(events), 40)

@@ -41,6 +41,46 @@ def g5_recovered_load_events():
 
 
 class TrackingTests(unittest.TestCase):
+    def test_short_visual_reversal_is_cancelled_after_return_is_confirmed(self):
+        t = tracker(phase="load", visual_reversal_review_seconds=.5)
+        observations = ((0., "empty"), (.1, "empty"), (.2, "filled"), (.3, "filled"),
+                        (.76, "empty"), (.81, "empty"), (.88, "empty"))
+        for now, state in observations:
+            result = t.update([detection(1, state, track_id=101)], now)
+            self.assertEqual(result["new_events"], [])
+            self.assertEqual(result["slots"][0]["last_confirmed_state"],
+                             "unknown" if now == 0. else "empty")
+        self.assertEqual(result["slots"][0]["last_confirmed_state"], "empty")
+        self.assertFalse(result["slots"][0]["visual_reversal_review_pending"])
+        self.assertEqual(t.events, [])
+
+    def test_single_reverse_frame_keeps_the_original_operation_time(self):
+        t = tracker(phase="load", visual_reversal_review_seconds=.5)
+        observations = ((0., "empty"), (.1, "empty"), (.2, "filled"), (.3, "filled"),
+                        (.76, "empty"), (.81, "filled"))
+        for now, state in observations:
+            result = t.update([detection(1, state, track_id=101)], now)
+        self.assertEqual([(e["action"], e["time_upper"], e["confirmed_at"])
+                          for e in result["new_events"]], [("load", .2, .3)])
+
+    def test_stable_load_and_later_removal_are_both_reported(self):
+        t = tracker(phase="load", visual_reversal_review_seconds=.5)
+        observations = ((0., "empty"), (.1, "empty"), (.2, "filled"), (.3, "filled"),
+                        (.85, "empty"), (.95, "empty"), (1.46, "empty"))
+        for now, state in observations:
+            t.update([detection(1, state, track_id=101)], now)
+        self.assertEqual([(e["action"], e["time_upper"]) for e in t.events],
+                         [("load", .2), ("unload", .85)])
+        self.assertEqual(t.order_result(), "fail")
+
+    def test_finishing_reports_a_confirmed_change_waiting_for_reversal_review(self):
+        t = tracker(phase="load", visual_reversal_review_seconds=.5)
+        for now, state in ((0., "empty"), (.1, "empty"), (.2, "filled"), (.3, "filled")):
+            result = t.update([detection(1, state, track_id=101)], now)
+        self.assertEqual(result["new_events"], [])
+        self.assertEqual([e["time_upper"] for e in t.finish_visual_event_reviews(.3)], [.2])
+        self.assertEqual(t.finish_visual_event_reviews(.3), [])
+
     def test_bytetrack_keeps_empty_and_filled_as_one_slot_track(self):
         byte_tracker=SlotByteTracker(30,high_thresh=.35,low_thresh=.1,buffer_seconds=1)
         box=[10,10,50,50]

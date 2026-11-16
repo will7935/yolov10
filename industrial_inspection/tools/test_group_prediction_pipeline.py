@@ -186,8 +186,9 @@ class PipelineTest(unittest.TestCase):
                 visible=[info for info in ui if info['group_id']==group_id and info['group_status']=='active']
                 self.assertTrue(visible)
                 self.assertEqual(visible[0]['slots'][0]['state'],'empty')
-            self.assertEqual(logs[:-1],['游星片1：下料未完成','游星片2：下料未完成'])
-            self.assertIn('游星片槽位下料完成矩阵',logs[-1])
+            for group_id in (1, 2):
+                self.assertTrue(any(f's G{group_id} 下料\n原槽号顺序 S1' in log for log in logs))
+            self.assertFalse(any('完成矩阵' in log for log in logs))
             self.assertEqual(summary['group_process_report']['matrix'][:2],[[1,0,0,0],[1,0,0,0]])
 
     def test_completed_groups_log_once_then_save_matrix_and_order_at_end(self):
@@ -215,14 +216,25 @@ class PipelineTest(unittest.TestCase):
             with (patch.object(predict.base,'load_detection_model',return_value=(SyntheticModel(frames),'synthetic')),
                   patch.object(predict,'CONFIRM_SECONDS',.1),patch.object(predict,'MIN_CONFIRM_FRAMES',2)):
                 summary=predict.run_prediction(args,roi_polygon=context,on_log=logs.append)
-            expected=[f'游星片{group}：下料{state}' for group in range(1,6) for state in ('未完成','完成')]
-            self.assertEqual(logs[:-1],expected)
+            for group in range(1, 6):
+                self.assertEqual(logs.count(f'游星片{group}：下料完成'), 1)
+            self.assertFalse(any('完成矩阵' in log for log in logs))
+            self.assertTrue(any('s G5 下料\n原槽号顺序 S2 → S1 → S3 → S4' in log for log in logs))
+            final_log = logs[-2]
+            self.assertTrue(final_log.startswith('工序结束汇总\n'))
+            self.assertIn('已确认 20/20 槽，完成 5/5 组', final_log)
+            self.assertIn('游星片下料顺序（原槽号）', final_log)
+            self.assertIn('G5：S2 → S1 → S3 → S4', final_log)
+            self.assertIn('游星片下料顺序（跨组顺时针编号）', final_log)
+            self.assertIn('G5：17 → 18 → 19 → 20', final_log)
+            self.assertTrue(logs[-1].startswith('工序报告已保存至 '))
             self.assertEqual(summary['group_process_report']['matrix'],[[1,1,1,1]]*5)
             self.assertTrue(all(g['sequence']==[2,1,3,4] for g in summary['group_process_report']['groups']))
             saved=json.loads((args.output_dir/'summary.json').read_text(encoding='utf-8'))
             self.assertEqual(saved['group_process_report'],summary['group_process_report'])
-            self.assertEqual((args.output_dir/'group_process_report.txt').read_text(encoding='utf-8'),logs[-1]+'\n')
-            self.assertIn('G5：2 → 1 → 3 → 4',logs[-1])
+            report = (args.output_dir/'group_process_report.txt').read_text(encoding='utf-8')
+            self.assertIn('游星片槽位下料完成矩阵', report)
+            self.assertIn('G5：S2 → S1 → S3 → S4', report)
 
     def test_five_groups_saved_and_reported_through_ui_callbacks(self):
         frames=[]

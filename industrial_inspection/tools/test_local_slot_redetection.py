@@ -14,8 +14,382 @@ import numpy as np
 from industrial_inspection.tools import predict_slot_groups as predict
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
 from industrial_inspection.tools.slot_group_tracker import SlotGroupTracker
+from industrial_inspection.tools.slot_two_point_contact import _contact_areas, two_point_slot_layout
 from industrial_inspection.tools.test_group_prediction_pipeline import SyntheticModel
 from industrial_inspection.tools.test_roi_group_sequence import POINTS, ROI, boxes
+
+
+class TwoPointContactTests(unittest.TestCase):
+    def setUp(self):
+        self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.visible = [
+            {"class_name": "wafer_slot_filled", "confidence": .95,
+             "track_id": i, "xyxy": [100, y-20, 140, y+20]}
+            for i, y in enumerate((140, 200), start=1)]
+
+    def test_shared_extension_respects_roi_direction_and_multiplier(self):
+        tracker = SlotGroupTracker()
+        measured = tracker._candidates(self.visible)
+        measured[1]["xyxy"] = [98, 180, 142, 220]
+        direction = np.array([.8, .6])
+        for multiplier in (1.5, 2.):
+            layout, extension = two_point_slot_layout(measured, direction, multiplier, ROI)
+            self.assertAlmostEqual(extension, 26.25 * multiplier)
+            np.testing.assert_allclose(layout[2:] - layout[:2],
+                                       np.tile(extension * direction, (2, 1)))
+
+    def test_rejects_diagonal_and_disproportionate_input(self):
+        tracker = SlotGroupTracker()
+        different = {**self.visible[1], "xyxy": [110, 180, 130, 220]}
+        diagonal = {**self.visible[1], "xyxy": [170, 180, 210, 220]}
+        for candidate in (different, diagonal):
+            layout = two_point_slot_layout(tracker._candidates([self.visible[0], candidate]),
+                                           np.array([1., 0.]), 1.5, ROI)
+            self.assertIsNone(layout)
+
+    def test_split_overlap_and_suspend_large_overlap(self):
+        centers = np.array([[180., 140.], [180., 169.]])
+        boxes = np.hstack((centers-20., centers+20.))
+        scores = _contact_areas(boxes, centers, [{"xyxy": [160, 155, 200, 159]}])
+        self.assertAlmostEqual(scores[0], 0.)
+        self.assertGreater(scores[1], 0.)
+        centers[1, 1] = 158.
+        self.assertIsNone(_contact_areas(np.hstack((centers-20., centers+20.)), centers, []))
+
+    def test_overlay_marks_both_prediction_centers_over_the_boxes(self):
+        contacts = [
+            {"center_xy": [180.2, 140.1], "box_xyxy": [150, 120, 210, 160],
+             "status": "prediction", "slot_id": None},
+            {"center_xy": [204.3, 161.2], "box_xyxy": [174, 141, 234, 181],
+             "status": "contact", "slot_id": None, "held": True},
+        ]
+        with patch.object(predict.cv2, "putText", wraps=cv2.putText) as draw_text:
+            predict.draw_two_point_hand_contacts(self.frame, contacts)
+            self.assertEqual([call.args[1] for call in draw_text.call_args_list],
+                             ["2PT PRED", "2PT HOLD TOUCH"])
+        for x, y in ((180, 140), (204, 161)):
+            self.assertGreater(int(self.frame[y, x].min()), 235)
+        blue, green, red = map(int, self.frame[120, 165])
+        self.assertGreater(min(green, red), blue+120)
+        blue, green, red = map(int, self.frame[181, 221])
+        self.assertGreater(min(blue, red), green+100)
+
+    def test_held_boxes_accumulate_contact_when_a_support_is_occluded_or_missing(self):
+        tracker = SlotGroupTracker(phase="load", slot2_below_slot3=True,
+            initialization_seconds=.1, geometry_initialization_seconds=.1,
+            minimum_frames=2, confirm_seconds=0., load_hand_contact_seconds=0.)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.)
+        for now in (0., .1, .2, .3):
+            measured = sequence.update(self.visible, now)["two_point_hand_contacts"]
+        hand = {"class_name": "hand", "confidence": .9, "xyxy": [117, 120, 198, 156]}
+        first = sequence.update(self.visible[1:] + [hand], .4)
+        second = sequence.update(self.visible + [hand], .5)
+        for frame in (first, second):
+            contacts = frame["two_point_hand_contacts"]
+            self.assertEqual([c["box_xyxy"] for c in contacts], [c["box_xyxy"] for c in measured])
+            self.assertTrue(all(c["held"] for c in contacts))
+            self.assertGreater(contacts[0]["coverage"], .15)
+            self.assertFalse(frame["new_events"])
+        self.assertEqual(first["two_point_hand_contacts"][0]["status"], "collecting")
+        self.assertEqual(second["two_point_hand_contacts"][0]["status"], "contact")
+        released = sequence.update(self.visible, .6)["two_point_hand_contacts"]
+        self.assertTrue(released[0]["held"])
+        self.assertEqual(released[0]["status"], "waiting_visual")
+        right = [{**self.visible[0], "track_id": i, "xyxy": [160, y-20, 200, y+20]}
+                 for i, y in ((3, 140), (4, 200))]
+        for now in (.7, .8, .9, 1.):
+            sequence.update(self.visible+right, now)
+        event, = sequence.all_events
+        self.assertEqual(event["reason"], "visual_after_two_point_hand_contact")
+        self.assertAlmostEqual(event["hand_contact_since"], .4)
+
+    def test_hand_center_must_be_inside_roi_for_contact_and_prediction_hold(self):
+        roi = np.array([[0, 0], [300, 0], [300, 210], [0, 210]], dtype=np.float32)
+        tracker = SlotGroupTracker(phase="load", initialization_seconds=.1,
+                                   geometry_initialization_seconds=.1, load_hand_contact_seconds=0.)
+        sequence = RoiGroupSequence(tracker, roi, two_point_extension_multiplier=3.)
+        for now in (0., .1, .2, .3):
+            sequence.update(self.visible, now)
+        outside_hand = {"class_name": "hand", "confidence": .99, "xyxy": [164, 187, 196, 253]}
+        for now in (.4, .5):
+            contacts = sequence.update(self.visible+[outside_hand], now)["two_point_hand_contacts"]
+            self.assertEqual([c["coverage"] for c in contacts], [0., 0.])
+            self.assertTrue(all(c["status"] == "prediction" for c in contacts))
+        outside_covering_anchor = {**outside_hand, "xyxy": [117, 190, 198, 255]}
+        result = sequence.update(self.visible[:1]+[outside_covering_anchor], .6)
+        self.assertTrue(all(c["held"] for c in result["two_point_hand_contacts"]))
+        self.assertEqual([c["coverage"] for c in result["two_point_hand_contacts"]], [0., 0.])
+
+        # A real hand can extend past the lower edge and still pass.
+        inside_covering_anchor = {**outside_hand, "xyxy": [117, 185, 198, 223]}
+        first = sequence.update(self.visible[:1]+[inside_covering_anchor], .7)
+        second = sequence.update(self.visible[:1]+[inside_covering_anchor], .8)
+        for result in (first, second):
+            contacts = result["two_point_hand_contacts"]
+            self.assertTrue(all(c["held"] for c in contacts))
+            self.assertGreater(contacts[1]["coverage"], .15)
+        self.assertEqual(second["two_point_hand_contacts"][1]["status"], "contact")
+
+    def test_held_boxes_expire_or_clear_upon_motion_pause(self):
+        hand = {"class_name": "hand", "confidence": .9, "xyxy": [117, 120, 198, 156]}
+        for stop_for_motion in (False, True):
+            with self.subTest(stop_for_motion=stop_for_motion):
+                tracker = SlotGroupTracker(phase="load", initialization_seconds=.1,
+                                           geometry_initialization_seconds=.1)
+                sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.,
+                                            two_point_hand_hold_seconds=.25)
+                for now in (0., .1, .2, .3):
+                    sequence.update(self.visible, now)
+                held = sequence.update([hand], .4)["two_point_hand_contacts"]
+                self.assertTrue(held[0]["held"])
+                self.assertAlmostEqual(held[0]["prediction_age_seconds"], .1)
+                if stop_for_motion:
+                    result = sequence.update(self.visible[1:] + [hand], .45, observations_enabled=False)
+                    self.assertFalse(result["two_point_hand_contacts"])
+                    check_at = .5
+                else:
+                    check_at = .56
+                result = sequence.update([hand], check_at)
+                self.assertFalse(result["two_point_hand_contacts"])
+                self.assertFalse(sequence.all_events)
+
+    def test_contact_continues_after_missing_support_and_single_anchor_jitter(self):
+        tracker = SlotGroupTracker(phase="load", initialization_seconds=.1,
+                                   geometry_initialization_seconds=.1, load_hand_contact_seconds=0.)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.)
+        for now in (0., .1, .2, .3):
+            sequence.update(self.visible, now)
+        hand_away_from_supports = {"class_name": "hand", "confidence": .9, "xyxy": [164, 124, 196, 156]}
+        result = sequence.update(self.visible[1:] + [hand_away_from_supports], .4)
+        self.assertEqual(result["two_point_hand_contacts"][0]["status"], "collecting")
+        moved = {**self.visible[1], "xyxy": [112, 180, 152, 220]}
+        result = sequence.update([moved, hand_away_from_supports], .5)
+        self.assertTrue(all(c["held"] for c in result["two_point_hand_contacts"]))
+        self.assertEqual(result["two_point_hand_contacts"][0]["status"], "contact")
+
+    def test_old_pair_serves_contact_until_both_new_positions_stabilize(self):
+        tracker = SlotGroupTracker(phase="load", initialization_seconds=.1,
+                                   geometry_initialization_seconds=.1, load_hand_contact_seconds=0.)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.)
+        for now in (0., .1, .2, .3):
+            contacts = sequence.update(self.visible, now)["two_point_hand_contacts"]
+        old_centers = [c["center_xy"] for c in contacts]
+        shifted = [dict(obj, xyxy=(np.array(obj["xyxy"])+[dx, 0, dx, 0]).tolist())
+                   for obj, dx in zip(self.visible, (10, -10))]
+        hand = {"class_name": "hand", "confidence": .9, "xyxy": [164, 120, 198, 156]}
+        for now, status in ((.4, "collecting"), (.45, "contact")):
+            contacts = sequence.update(shifted+[hand], now)["two_point_hand_contacts"]
+            self.assertEqual([c["center_xy"] for c in contacts], old_centers)
+            self.assertTrue(all(c["held"] for c in contacts))
+            self.assertEqual(contacts[0]["status"], status)
+        contacts = sequence.update(shifted+[hand], .51)["two_point_hand_contacts"]
+        self.assertFalse(any(c["held"] for c in contacts))
+        self.assertEqual([c["center_xy"] for c in contacts], [[190., 140.], [170., 200.]])
+        self.assertEqual(contacts[0]["status"], "contact")
+        self.assertAlmostEqual(contacts[0]["contact_since"], .4)
+
+    def test_coherent_motion_for_consecutive_frames_clears_old_boxes(self):
+        tracker = SlotGroupTracker(phase="load", initialization_seconds=.1,
+                                   geometry_initialization_seconds=.1)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.)
+        for now in (0., .1, .2, .3):
+            sequence.update(self.visible, now)
+        for dx, now in ((10, .4), (20, .45)):
+            shifted = [dict(obj, xyxy=(np.array(obj["xyxy"])+[dx, 0, dx, 0]).tolist())
+                       for obj in self.visible]
+            contacts = sequence.update(shifted, now)["two_point_hand_contacts"]
+            if dx == 10:
+                self.assertTrue(contacts and all(c["held"] for c in contacts))
+            else:
+                self.assertFalse(contacts)
+
+    def test_one_trusted_anchor_can_extend_hold_until_it_is_lost(self):
+        tracker = SlotGroupTracker(phase="load", initialization_seconds=.1,
+                                   geometry_initialization_seconds=.1)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.,
+                                    two_point_hand_hold_seconds=.25)
+        for now in (0., .1, .2, .3):
+            sequence.update(self.visible, now)
+        for now in (.4, .55, .7):
+            contacts = sequence.update(self.visible[1:], now)["two_point_hand_contacts"]
+            self.assertTrue(contacts and all(c["held"] for c in contacts))
+            self.assertEqual(contacts[0]["prediction_support_age_seconds"], 0.)
+        self.assertGreater(contacts[0]["prediction_age_seconds"], .25)
+        self.assertFalse(sequence.update([], .96)["two_point_hand_contacts"])
+
+    def test_contact_waits_for_vision_and_only_then_records_one_operation(self):
+        for phase, target in (("load", "filled"), ("unload", "empty")):
+            for entering in (False, True):
+                with self.subTest(phase=phase, entering=entering):
+                    tracker = SlotGroupTracker(phase=phase, slot2_below_slot3=True,
+                        initialization_seconds=.1, geometry_initialization_seconds=.1,
+                        minimum_frames=2, confirm_seconds=0., load_hand_contact_seconds=0.,
+                        load_hand_contact_min_frames=2)
+                    sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.)
+                    if entering:
+                        tracker.start_incremental_entry(40.)
+                        sequence.state = "entering"
+                    hand = {"class_name": "hand", "confidence": .9, "xyxy": [164, 124, 196, 156]}
+                    right = [{"class_name": f"wafer_slot_{target}", "confidence": .95,
+                              "track_id": track_id, "xyxy": [160, y-20, 200, y+20]}
+                             for track_id, y in ((3, 140), (4, 200))]
+                    for tick in range(11):
+                        objects = self.visible + ([hand] if tick in (4, 5) else right if tick >= 7 else [])
+                        result = sequence.update(objects, tick / 10)
+                        if tick < 7:
+                            self.assertFalse(result["new_events"])
+                        if tick == 5:
+                            self.assertEqual([c["status"] for c in result["two_point_hand_contacts"]],
+                                             ["contact", "prediction"])
+                        if tick == 6:
+                            self.assertEqual(result["two_point_hand_contacts"][0]["status"], "waiting_visual")
+                    event, = sequence.all_events
+                    self.assertEqual((event["slot_id"], event["action"], event["to"]), (3, phase, target))
+                    self.assertEqual(event["reason"], "visual_after_two_point_hand_contact")
+                    self.assertAlmostEqual(event["hand_contact_since"], .4)
+                    self.assertAlmostEqual(event["time_upper"], .6)
+                    self.assertAlmostEqual(event["visual_time_upper"], .7)
+
+    def test_ambiguous_hand_never_arms_both_predictions(self):
+        tracker = SlotGroupTracker(phase="load", initialization_seconds=.1,
+                                   geometry_initialization_seconds=.1)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.)
+        hand = {"class_name": "hand", "confidence": .9, "xyxy": [164, 120, 196, 220]}
+        for tick in range(7):
+            result = sequence.update(self.visible + ([hand] if tick in (4, 5) else []), tick / 10)
+            if tick == 5:
+                self.assertEqual([c["status"] for c in result["two_point_hand_contacts"]],
+                                 ["ambiguous", "ambiguous"])
+        self.assertFalse(tracker.two_point_hand_contact.pending)
+        self.assertFalse(sequence.all_events)
+
+    def _enter_load_with_two_prediction_contacts(self, *, contact_s4=True, empty_baseline=True):
+        points = np.array([[100, 180], [160, 180], [130, 140], [190, 140]], dtype=float)
+        slots = [{"class_name": "wafer_slot_empty", "confidence": .95, "track_id": i,
+                  "xyxy": [x-20, y-20, x+20, y+20]} for i, (x, y) in enumerate(points, start=1)]
+        tracker = SlotGroupTracker(group_id=4, phase="load", slot2_below_slot3=True,
+            allow_three_point_initialization=True, initialization_seconds=.1,
+            minimum_frames=2, confirm_seconds=0., load_hand_contact_seconds=0.)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.,
+                                    two_point_hand_hold_seconds=.15)
+        previous = SlotGroupTracker(points, group_id=4)
+        if empty_baseline:
+            previous.slots[3].confirmed = "empty"
+            previous.slots[3].evidence_time = -1.
+            previous.slots[3].confirmation_source = "yolo"
+        sequence.closed_groups.append({"phase": "unload", "group_id": 4, "snapshot": previous.snapshot()})
+        tracker.start_incremental_entry(32.)
+        sequence.state = "entering"
+        anchors = [slots[0], slots[2]]
+        hands = [{"class_name": "hand", "confidence": .95,
+                  "xyxy": box} for box in ([170, 122, 208, 158], [150, 122, 208, 173])]
+        if not contact_s4:
+            hands[0]["xyxy"] = hands[1]["xyxy"] = [141, 161, 178, 196]
+        for now in (0., .1, .2, .3):
+            sequence.update(anchors, now)
+        sequence.update(anchors + hands[:1], .4)
+        touch = sequence.update(anchors + hands[1:], .5)
+        self.assertEqual(sum(c["status"] == "contact" for c in touch["two_point_hand_contacts"]), 1)
+        if contact_s4:
+            self.assertTrue(all(c["coverage"] > .15 for c in touch["two_point_hand_contacts"]))
+        sequence.update(anchors, .6)
+        sequence.update([], .7)
+        expired = sequence.update([], .8)
+        self.assertFalse(expired["two_point_hand_contacts"])
+        for now in (.9, 1., 1.1):
+            mapped = sequence.update(slots[:3], now)
+        self.assertEqual(mapped["slot_numbering_status"], "final")
+        return sequence, mapped, slots
+
+    def test_late_mapping_recovers_s4_contact_and_cancels_after_stable_empty(self):
+        sequence, mapped, slots = self._enter_load_with_two_prediction_contacts()
+        event, = mapped["new_events"]
+        self.assertEqual((event["slot_id"], event["reason"]), (4, "two_point_hand_contact_inferred_load"))
+        self.assertEqual((event["hand_contact_since"], event["time_upper"]), (.4, .6))
+        self.assertTrue(event["inferred"])
+        self.assertEqual(mapped["confirmed_event_sequence"], [4])
+        first = sequence.update(slots, 1.2)
+        self.assertEqual(first["confirmed_event_sequence"], [4])
+        second = sequence.update(slots, 1.3)
+        self.assertEqual(second["confirmed_event_sequence"], [])
+        self.assertEqual(second["new_events"], [])
+        self.assertFalse(sequence.all_events)
+        cancellation, = second["new_group_events"]
+        self.assertEqual(cancellation["type"], "s4_inferred_load_cancelled")
+
+    def test_late_mapping_does_not_infer_s4_from_s2_contact_or_without_empty_baseline(self):
+        for contact_s4, empty_baseline in ((False, True), (True, False)):
+            with self.subTest(contact_s4=contact_s4, empty_baseline=empty_baseline):
+                sequence, mapped, _ = self._enter_load_with_two_prediction_contacts(
+                    contact_s4=contact_s4, empty_baseline=empty_baseline)
+                self.assertFalse(mapped["new_events"])
+                self.assertFalse(sequence.all_events)
+
+    def test_formal_contact_does_not_infer_state_without_vision_or_leak_to_next_group(self):
+        points = np.array([[120, 140], [120, 200], [180, 140], [180, 200]], dtype=float)
+        tracker = SlotGroupTracker(points, phase="load", initialization_seconds=.1,
+                                   geometry_initialization_seconds=.1, minimum_frames=2,
+                                   confirm_seconds=0., load_hand_contact_seconds=0., load_hand_contact_min_frames=2,
+                                   lost_seconds=1.)
+        sequence = RoiGroupSequence(tracker, ROI, two_point_extension_multiplier=3.)
+        hand = {"class_name": "hand", "confidence": .9, "xyxy": [164, 124, 196, 156]}
+        for tick in range(13):
+            result = sequence.update(self.visible + ([hand] if tick in (4, 5) else []), tick / 10)
+        self.assertEqual(result["slots"][2]["last_confirmed_state"], "unknown")
+        self.assertEqual(result["two_point_hand_contacts"][0]["status"], "waiting_visual")
+        self.assertEqual(result["two_point_hand_contacts"][0]["slot_id"], 3)
+        self.assertFalse(sequence.all_events)
+
+        new_tracker = sequence._new_tracker(2)
+        self.assertFalse(new_tracker.two_point_hand_contact.pending)
+        self.assertTrue(tracker.two_point_hand_contact.pending)
+
+        right = {"class_name": "wafer_slot_filled", "confidence": .95,
+                 "track_id": 3, "xyxy": [160, 120, 200, 160]}
+        sequence.update(self.visible+[right], 1.3)
+        result = sequence.update(self.visible+[right], 1.4)
+        event, = result["new_events"]
+        self.assertEqual(event["slot_id"], 3)
+        self.assertEqual(event["reason"], "visual_after_two_point_hand_contact")
+        self.assertFalse(sequence.update(self.visible+[right], 1.5)["new_events"])
+
+    def test_main_pipeline_uses_full_frames_without_two_point_crop_inference(self):
+        hand = {"class_name": "hand", "confidence": .9, "xyxy": [164, 124, 196, 156]}
+        right = [{"class_name": "wafer_slot_filled", "confidence": .95, "xyxy": [160, y-20, 200, y+20]}
+                 for y in (140, 200)]
+        packets = [self.visible + ([hand] if tick in (4, 5) else right if tick >= 7 else [])
+                   for tick in range(14)]
+
+        class FullFrameOnlyModel(SyntheticModel):
+            def predict(model, image, **kwargs):
+                self.assertEqual(image.shape[:2], (480, 640))
+                return super().predict(image, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/"source.mp4"
+            writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10., (640, 480))
+            self.assertTrue(writer.isOpened())
+            for _ in packets:
+                writer.write(self.frame)
+            writer.release()
+            args = argparse.Namespace(source=source, weights=root/"model.pt", output_dir=root/"results",
+                conf=.35, imgsz=640, device="cpu", stride=1, show=False, max_frames=0, nms_iou=.7,
+                write_video_output=False, run_regression_tests=False)
+            context = {"polygon": ROI/[640, 480], "size": (640, 480), "start_frame": 0}
+            model = FullFrameOnlyModel(packets)
+            with (patch.object(predict.base, "load_detection_model", return_value=(model, "synthetic")),
+                  patch.multiple(predict, PROCESS_PHASE="load", HATCH_CONTROL_ENABLED=False,
+                      TWO_POINT_EXTENSION_MULTIPLIER=3., LOCAL_REDETECT_ENABLED=True,
+                      CONFIRM_SECONDS=0., MIN_CONFIRM_FRAMES=2, INITIAL_GROUP_STABLE_SECONDS=.1)):
+                summary = predict.run_prediction(args, roi_polygon=context)
+            with (args.output_dir/"slot_states.jsonl").open(encoding="utf8") as records:
+                rows = [json.loads(row) for row in records]
+        self.assertTrue(any(c["status"] == "waiting_visual" for row in rows
+                            for c in row["two_point_hand_contacts"]))
+        self.assertTrue(all(not row["local_redetection"] for row in rows))
+        event, = summary["events"]
+        self.assertEqual(event["reason"], "visual_after_two_point_hand_contact")
 
 
 class LocalRedetectionTests(unittest.TestCase):

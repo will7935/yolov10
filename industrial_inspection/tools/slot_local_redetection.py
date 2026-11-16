@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, box_containment, valid_slot_geometry
+from industrial_inspection.tools.slot_group_tracker import (
+    SLOT_STATES, box_containment, valid_slot_geometry)
 
 
 @dataclass(frozen=True)
@@ -82,17 +83,16 @@ def _crop_bounds(center, crop_size, frame_size, *, keep_size=False):
     return max(0, left), max(0, top), min(width, left+crop_width), min(height, top+crop_height)
 
 
-def _detect_in_crop(model, frame, bounds, points, gate, sequence, args, thresholds, policy):
+def _crop_detections(model, frame, bounds, args, thresholds, policy):
     x1, y1, x2, y2 = bounds
     if x2-x1 < 32 or y2-y1 < 32:
-        return [], []
+        return []
 
-    center = points[3]
     result = model.predict(frame[y1:y2,x1:x2], imgsz=policy.image_size,
         conf=min(thresholds.slot_state, thresholds.hand), device=args.device, iou=args.nms_iou,
         agnostic_nms=False, verbose=False, save=False)[0]
     boxes = result.boxes.cpu()
-    accepted, hands = [], []
+    detections = []
     for cls, score, xy in zip(boxes.cls.tolist(), boxes.conf.tolist(), boxes.xyxy.tolist()):
         name = model.names[int(cls)]
         if name not in SLOT_STATES and name != "hand":
@@ -100,10 +100,18 @@ def _detect_in_crop(model, frame, bounds, points, gate, sequence, args, threshol
         if float(score) < thresholds.business_threshold(name):
             continue
         box = [xy[0]+x1, xy[1]+y1, xy[2]+x1, xy[3]+y1]
-        obj = {"class_id": int(cls), "class_name": name, "confidence": float(score),
-               "xyxy": box, "detection_source": "local_crop"}
+        detections.append({"class_id": int(cls), "class_name": name, "confidence": float(score),
+                           "xyxy": box, "detection_source": "local_crop"})
+    return detections
+
+
+def _detect_in_crop(model, frame, bounds, points, gate, sequence, args, thresholds, policy):
+    center = points[3]
+    accepted, hands = [], []
+    for obj in _crop_detections(model, frame, bounds, args, thresholds, policy):
+        box = obj["xyxy"]
         point = np.array([(box[0]+box[2])/2, (box[1]+box[3])/2])
-        if name == "hand":
+        if obj["class_name"] == "hand":
             if np.linalg.norm(point-center) <= gate or (
                     box[0] <= center[0] <= box[2] and box[1] <= center[1] <= box[3]):
                 hands.append(obj)

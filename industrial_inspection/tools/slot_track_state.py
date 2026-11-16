@@ -139,7 +139,8 @@ class SlotTrackStateStore:
             else:
                 record['reliable_since'], record['reliable_count'] = None, 0
             event = record['state'].observe(state, now, obj['confidence'], reason,
-                                           self.rules.confirm_seconds, self.rules.minimum_frames)
+                                           self.rules.confirm_seconds, self.rules.minimum_frames,
+                                           visual_track_id=track_id)
             if event is not None:
                 record['events'].append({**event, 'byte_track_id': track_id})
         for track_id, record in self.tracks.items():
@@ -212,7 +213,8 @@ class SlotTrackStateStore:
         group_ids = {track_id for track_id in tracker.byte_track_ids if self.owner(track_id) == identity}
         events = []
         for slot, track_id in zip(tracker.slots, tracker.byte_track_ids):
-            if slot.slot_id == 4 and tracker._pending_s4_unload is not None:
+            if (slot.pending_visual_event is not None
+                    or slot.slot_id == 4 and tracker._pending_s4_unload is not None):
                 continue
             history = self._edge_tracks.get(track_id)
             if history is None or self.owner(track_id) != identity:
@@ -346,7 +348,13 @@ class SlotTrackStateStore:
     def discard_candidate_events(self, track_id, identity, events):
         """Prevent cancelled provisional events from being imported again."""
         record = self.tracks.get(track_id)
-        if record is None or record['owner'] not in (None, identity) or record['slot_id'] is not None:
+        if record is not None and record['slot_id'] is None:
+            self.discard_visual_events(track_id, identity, events)
+
+    def discard_visual_events(self, track_id, identity, events):
+        """Remove cancelled evidence while preserving the import indices of surviving changes."""
+        record = self.tracks.get(track_id)
+        if record is None or record['owner'] not in (None, identity):
             return
         cancelled = {(event['action'], event['confirmed_at']) for event in events}
         retained = [(index, event) for index, event in enumerate(record['events'])
@@ -354,6 +362,10 @@ class SlotTrackStateStore:
         record['events'] = [event for _, event in retained]
         record['imported'] = {new_index for new_index, (index, _) in enumerate(retained)
                               if index in record['imported']}
+        edge = self._edge_tracks.get(track_id)
+        if edge is not None and self._edge_identity == identity:
+            edge.events[:] = [entry for entry in edge.events
+                              if (entry[0]['action'], entry[0]['confirmed_at']) not in cancelled]
 
     def restore(self, slot, track_id, identity, now):
         record = self.tracks.get(track_id)
@@ -370,7 +382,8 @@ class SlotTrackStateStore:
         if slot.confirmed == 'unknown' and not slot.candidate_count:
             prior = record['previous']
             for key in ('confirmed', 'evidence_time', 'confirmed_since', 'confirmed_at',
-                        'candidate', 'candidate_since', 'candidate_count', 'last_seen',
+                        'confirmed_visual_track_id',
+                        'candidate', 'candidate_since', 'candidate_count', 'candidate_visual_track_id', 'last_seen',
                         'confirmation_source'):
                 setattr(slot, key, deepcopy(getattr(prior, key)))
         events = []

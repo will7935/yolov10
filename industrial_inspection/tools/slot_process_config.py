@@ -72,6 +72,7 @@ REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1 = True
 MATCH_DISTANCE_RATIO = .46    # 匹配门限=最近两槽间距×此比例；放宽以容纳空/满框中心偏移，必须小于0.5
 CONFIRM_SECONDS = 0.0          # 槽位空/满状态不再设置时间门槛，只按MIN_CONFIRM_FRAMES确认
 MIN_CONFIRM_FRAMES = 4
+VISUAL_REVERSAL_REVIEW_SECONDS = .5  # 同槽短时间内确认空满往返时撤销这对视觉变化
 IDENTITY_LOST_SECONDS = 1.2   # 连续无匹配超时，锁定为unknown，避免下一组继承旧编号
 CONFLICT_CONF_MARGIN = .15    # 同位置空/满分数差小于该值时，输出unknown
 HAND_OVERLAP_RATIO = .2       # 手遮挡槽框达到此比例，或覆盖中心时，暂停该槽状态确认
@@ -100,6 +101,8 @@ ROI_EDGE_EVIDENCE_PX = 8.0   # 640×480下的ROI外视觉取证距离，0表示�
 LOCAL_REDETECT_ENABLED = True # 下料阶段正式 S4 被整图漏检时，用同一模型局部补检
 LOCAL_REDETECT_CROP_SIZE = (180, 140) # 原图裁剪宽、高（像素），保留槽周围背景
 LOCAL_REDETECT_IMAGE_SIZE = 320 # 局部图送入YOLO时的尺寸；分别沿用槽位/手部证据门槛
+TWO_POINT_EXTENSION_MULTIPLIER = 1.8 # 两点手接触预测向右延伸：中心到框边距离的均值乘此倍率；0关闭
+TWO_POINT_HAND_HOLD_SECONDS = .8     # 旧框等待新位置时可沿用；定位槽连续失联多久后清除，0关闭沿用
 ROTATION_INTERVALS = []       # 可选源视频秒数[(开始,结束),...]；期间跟踪位置、暂停空满确认
 SHOW_SLOT_TEXT = True         # 正式编号后在点旁标注S1-S4；初始化阶段在ByteTrack框上标状态
 SHOW_ALL_DETECTION_BOXES = True  # 显示审计下限以上的槽位真实检测框，不改变跟踪筛选

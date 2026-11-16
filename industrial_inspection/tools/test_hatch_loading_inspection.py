@@ -221,6 +221,20 @@ class HatchPipelineTests(unittest.TestCase):
             self.assertEqual(order['message'].splitlines()[1:], order_lines)
             order_frame = next(info for info in ui if order in info['new_alarms'])
             self.assertEqual(order_frame['result'].splitlines()[-2:], order_lines)
+            live = [log.splitlines() for log in logs if log.splitlines()[0].endswith('s G1 上料')]
+            self.assertEqual([lines[1:] for lines in live], [
+                ['原槽号顺序 S2', '跨组顺时针编号顺序 1'],
+                ['原槽号顺序 S2 → S4', '跨组顺时针编号顺序 1 → 4'],
+                order_lines,
+            ])
+            self.assertLess(float(live[0][0].split('s ')[0]), order['at'])
+            self.assertTrue(all('完成矩阵' not in log for log in logs))
+            final_log = logs[-2]
+            self.assertIn('上料完成统计（按取放事件）\n已确认 3/20 槽，完成 0/5 组', final_log)
+            self.assertIn('上料满槽核验（关门最终结果）', final_log)
+            self.assertIn('最终结果：未放满（3/20）', final_log)
+            report = (root/'results'/'group_process_report.txt').read_text(encoding='utf-8')
+            self.assertIn('游星片槽位上料完成矩阵', report)
             self.assertLess(order['at'], closing / 10)
             self.assertEqual(incomplete['type'], 'group_incomplete_alarm')
             self.assertEqual(incomplete['reason'], 'hatch_closed')

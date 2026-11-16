@@ -134,6 +134,44 @@ class GroupSequenceTests(unittest.TestCase):
                             for event in result['new_group_events']))
         self.assertIsNone(s.tracker.points)
 
+    def test_g1_keeps_candidate_until_first_unload_review_is_processed(self):
+        for reverses in (False, True):
+            with self.subTest(reverses=reverses):
+                tracker = SlotGroupTracker(confirm_seconds=.1, minimum_frames=2,
+                    initialization_seconds=.1, initialization_frames=2, visual_reversal_review_seconds=.5,
+                    require_unload_event_before_numbering=True)
+                sequence = RoiGroupSequence(tracker, ROI, require_first_unload_event_for_g1=True)
+                outside_points = POINTS.copy()
+                outside_points[2, 0] = -20.
+                for now, observed, filled in (
+                    (0., POINTS, (0, 1, 2, 3)), (.1, POINTS, (0, 1, 2, 3)),
+                    (.2, POINTS, (0, 1, 2, 3)), (.3, POINTS, (1, 2, 3)), (.4, POINTS, (1, 2, 3)),
+                    (.5, outside_points, (0, 1, 2, 3) if reverses else (1, 2, 3)),
+                    (.95, outside_points, (0, 1, 2, 3) if reverses else (1, 2, 3)),
+                ):
+                    objects = [dict(obj, track_id=500+i)
+                               for i, obj in enumerate(boxes(observed, filled=filled))]
+                    result = sequence.update(objects, now)
+                    self.assertFalse(any(e['type'] == 'group_candidate_discarded'
+                                         for e in result['new_group_events']))
+                    if now == .4:
+                        self.assertEqual(result['slot_numbering_status'], 'provisional')
+                        self.assertEqual(sequence.all_events, [])
+                        self.assertTrue(any(s['visual_reversal_review_pending'] for s in result['slots']))
+                if reverses:
+                    result = sequence.update([dict(obj, track_id=500+i) for i, obj in enumerate(
+                        boxes(outside_points, filled=(0, 1, 2, 3)))], 1.05)
+                    self.assertTrue(any(e['type'] == 'group_candidate_discarded'
+                                        for e in result['new_group_events']))
+                    self.assertEqual(sequence.all_events, [])
+                else:
+                    for now in (1.05, 1.15, 1.25):
+                        result = sequence.update([dict(obj, track_id=500+i) for i, obj in enumerate(
+                            boxes(filled=(1, 2, 3)))], now)
+                    self.assertEqual(result['slot_numbering_status'], 'final')
+                    self.assertEqual([(e['byte_track_id'], e['time_upper']) for e in sequence.all_events],
+                                     [(500, .3)])
+
     def test_reversed_g1_unload_is_discarded_before_numbering_and_cannot_be_reimported(self):
         tracker = SlotGroupTracker(confirm_seconds=0, minimum_frames=2, initialization_seconds=.1,
             geometry_initialization_seconds=.5, initialization_frames=2)

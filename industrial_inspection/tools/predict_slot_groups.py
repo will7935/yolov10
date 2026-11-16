@@ -26,6 +26,7 @@ from industrial_inspection.tools.slot_group_tracker import (
 from industrial_inspection.tools.slot_track_display import slot_track_label, slot_track_record
 from industrial_inspection.tools.slot_detection_policy import DetectionThresholds, prepare_business_detections
 from industrial_inspection.tools.slot_operation_alarms import group_operation_alarms
+from industrial_inspection.tools.slot_two_point_contact import LOAD_CONTACT_DOMINANCE_MARGIN
 from industrial_inspection.tools.slot_local_redetection import (
     LocalRedetectionPolicy, recover_missing_slots as recover_local_observations)
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
@@ -63,7 +64,7 @@ _TRIAL_UNLOAD_STABLE_SECONDS = .20
 # 每次完成主视频后，自动用同一套模型和分组逻辑处理五个原始回归视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
-REGRESSION_TESTS_ENABLED = False
+REGRESSION_TESTS_ENABLED = True
 REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
 REGRESSION_TEST_VIDEOS = (
     ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
@@ -87,6 +88,10 @@ REGRESSION_TEST_VIDEOS = (
     ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频13", REGRESSION_DATASET_ROOT / "测试视频13" / "camera_B_20260924_071629.avi",
      base.DEFAULT_SLOT_ROI_FILE),
 )
 REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
@@ -113,14 +118,15 @@ from industrial_inspection.tools.slot_process_config import (
     MIN_INITIALIZATION_FRAMES, INITIAL_GROUP_STABLE_SECONDS, INITIALIZATION_HISTORY_SECONDS,
     THREE_POINT_GROUP_INITIALIZATION, REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1, S4_USE_PREVIOUS_GROUP_LAYOUTS,
     MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
-    MIN_CONFIRM_FRAMES, IDENTITY_LOST_SECONDS, CONFLICT_CONF_MARGIN,
+    MIN_CONFIRM_FRAMES, VISUAL_REVERSAL_REVIEW_SECONDS, IDENTITY_LOST_SECONDS, CONFLICT_CONF_MARGIN,
     HAND_OVERLAP_RATIO, LOAD_HAND_CONTACT_ENABLED, LOAD_HAND_CONTACT_SECONDS,
     LOAD_HAND_CONTACT_MIN_FRAMES, LOAD_HAND_CONTACT_OVERLAP_RATIO, LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
     LOAD_HAND_CONTACT_COMPETING_SLOT_ID, LOAD_HAND_CONTACT_COMPETING_MARGIN, LOAD_HAND_CONTACT_COMPETING_RATIO,
     S4_CONTACT_PREDICTION_SECONDS, S4_PREDICTION_CONTACT_OVERLAP_RATIO,
     S4_HAND_REGION_ENABLED, S4_HAND_REGION_RESELECT, S4_HAND_REGION_FILE,
     ROI_TRACKING_MARGIN_PX, ROI_EDGE_EVIDENCE_PX, LOCAL_REDETECT_ENABLED, LOCAL_REDETECT_CROP_SIZE,
-    LOCAL_REDETECT_IMAGE_SIZE, ROTATION_INTERVALS,
+    LOCAL_REDETECT_IMAGE_SIZE, TWO_POINT_EXTENSION_MULTIPLIER, TWO_POINT_HAND_HOLD_SECONDS,
+    ROTATION_INTERVALS,
     SHOW_SLOT_TEXT, SHOW_ALL_DETECTION_BOXES, SHOW_NON_SLOT_DETECTION_BOXES,
     STATUS_PANEL_POSITION,
     BYTE_TRACK_SLOTS_ENABLED, BYTE_TRACK_LOW_CONFIDENCE,
@@ -231,6 +237,7 @@ def make_tracker(hand_region=None, *, unload_entry_numbering_seconds=None, machi
     return SlotGroupTracker(group_id=CURRENT_GROUP_ID,phase=PROCESS_PHASE,
         clockwise=CLOCKWISE_ORDER,match_distance_ratio=MATCH_DISTANCE_RATIO,confirm_seconds=CONFIRM_SECONDS,
         minimum_frames=MIN_CONFIRM_FRAMES,lost_seconds=IDENTITY_LOST_SECONDS,
+        visual_reversal_review_seconds=VISUAL_REVERSAL_REVIEW_SECONDS,
         conflict_margin=CONFLICT_CONF_MARGIN,hand_overlap=HAND_OVERLAP_RATIO,
         initialization_seconds=INITIALIZATION_SECONDS,initialization_frames=MIN_INITIALIZATION_FRAMES,
         geometry_initialization_seconds=INITIAL_GROUP_STABLE_SECONDS,
@@ -271,6 +278,8 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
         entry_stability_ratio=NEXT_GROUP_STABILITY_RATIO,entry_match_distance_px=NEXT_GROUP_MATCH_DISTANCE_PX,
         exit_direction=EXIT_DIRECTION,auto_load_after_unload=AUTO_LOAD_AFTER_UNLOAD,
         entry_birth_fraction=NEXT_GROUP_ENTRY_FRACTION,
+        two_point_extension_multiplier=TWO_POINT_EXTENSION_MULTIPLIER,
+        two_point_hand_hold_seconds=TWO_POINT_HAND_HOLD_SECONDS,
         unload_entry_upper_right_band=(UNLOAD_ENTRY_UPPER_RIGHT_MIN_X_RATIO*size[0],
             UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX*min(size[0]/640, size[1]/480)),
         reject_transition_roi_detections=REJECT_TRANSITION_ROI_DETECTIONS,
@@ -389,29 +398,37 @@ def build_process_report(summary, phase=None):
             "display_absolute_slot_numbers": summary.get("display_absolute_slot_numbers", DISPLAY_ABSOLUTE_SLOT_NUMBERS)}
 
 
-def format_process_report(report):
+def format_process_report(report, *, include_matrix=True):
     action = "下料" if report["phase"] == "unload" else "上料"
-    lines = [f"游星片槽位{action}完成矩阵（1=已确认，0=未确认，-=未检测到游星片）"]
+    groups = report["groups"]
     absolute = report.get("display_absolute_slot_numbers", False)
-    if not absolute:
-        lines.append("游星片    S1  S2  S3  S4")
-    for group in report["groups"]:
-        if absolute:
-            pairs = sorted((number, group['slot_completed'][i]) for i,number in
-                           enumerate(group['display_slot_numbers']) if number is not None)
-            cells = "  ".join(f"{number}:{'-' if value is None else value}" for number,value in pairs)
-            lines.append(f"G{group['group_id']}  {cells or '待编号'}")
-        else:
-            cells = "   ".join("-" if cell is None else str(cell) for cell in group['slot_completed'])
-            lines.append(f"G{group['group_id']}       {cells}")
+    if include_matrix:
+        lines = [f"游星片槽位{action}完成矩阵（1=已确认，0=未确认，-=未检测到游星片）"]
+        if not absolute:
+            lines.append("游星片    S1  S2  S3  S4")
+        for group in groups:
+            if absolute:
+                pairs = sorted((number, group['slot_completed'][i]) for i,number in
+                               enumerate(group['display_slot_numbers']) if number is not None)
+                cells = "  ".join(f"{number}:{'-' if value is None else value}" for number,value in pairs)
+                lines.append(f"G{group['group_id']}  {cells or '待编号'}")
+            else:
+                cells = "   ".join("-" if cell is None else str(cell) for cell in group['slot_completed'])
+                lines.append(f"G{group['group_id']}       {cells}")
+    else:
+        completed_slots = sum(cell == 1 for group in groups for cell in group["slot_completed"])
+        completed_groups = sum(group["completed"] for group in groups)
+        total_slots = len(groups)*len(report["slot_ids"])
+        lines = [f"{action}完成统计（按取放事件）",
+                 f"已确认 {completed_slots}/{total_slots} 槽，完成 {completed_groups}/{len(groups)} 组"]
     lines.extend(("", f"游星片{action}顺序（原槽号）"))
-    for group in report["groups"]:
+    for group in groups:
         sequence = " → ".join(f"S{slot_id}" for slot_id in group["sequence"]) or "未记录"
         lines.append(f"G{group['group_id']}：{sequence}")
 
-    if any("continuous_sequence" in group for group in report["groups"]):
+    if any("continuous_sequence" in group for group in groups):
         field, label = "continuous_sequence", "跨组顺时针编号"
-    elif any("clockwise_sequence" in group for group in report["groups"]):
+    elif any("clockwise_sequence" in group for group in groups):
         field, label = "clockwise_sequence", "组内顺时针编号"
     elif absolute:
         field, label = "display_sequence", "跨组顺时针编号"
@@ -419,7 +436,7 @@ def format_process_report(report):
         field = None
     if field is not None:
         lines.extend(("", f"游星片{action}顺序（{label}）"))
-        for group in report["groups"]:
+        for group in groups:
             values = group.get(field, [])
             sequence = (" → ".join(str(value) if value is not None else "待编号" for value in values)
                         or ("起点待确认" if group["sequence"] else "未记录"))
@@ -427,6 +444,12 @@ def format_process_report(report):
     if report["end_status"] != "end_of_stream":
         lines.extend(("", "以上为本次已处理视频范围内的检测结果。"))
     return "\n".join(lines)
+
+
+def _live_sequence_text(original, continuous):
+    raw = " → ".join(f"S{slot_id}" for slot_id in original) or "未记录"
+    numbered = " → ".join(map(str, continuous)) or "起点待确认"
+    return f"原槽号顺序 {raw}\n跨组顺时针编号顺序 {numbered}"
 
 
 @lru_cache(maxsize=1)
@@ -626,6 +649,29 @@ def draw_predicted_slot_boxes(frame, slots, roi_contour, *, color=(0, 220, 255),
     return frame
 
 
+def draw_two_point_hand_contacts(frame, contacts):
+    for contact in contacts:
+        color = (0, 220, 255) if contact["status"] == "prediction" else (220, 60, 220)
+        x1, y1, x2, y2 = map(round, contact["box_xyxy"])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+        label = {"prediction": "PRED", "collecting": "TOUCH?", "contact": "TOUCH",
+                 "waiting_visual": "WAIT", "ambiguous": "AMBIGUOUS",
+                 "visual_confirmed": "VERIFIED", "visual_observed": "OBSERVED"}[contact["status"]]
+        slot_id = contact["slot_id"]
+        text = "2PT" if slot_id is None else f"2PT S{slot_id}"
+        if contact.get("held"):
+            text += " HOLD"
+        if not contact.get("held") or contact["status"] != "prediction":
+            text += f" {label}"
+        cv2.putText(frame, text, (max(0, x1), max(14, y1-4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, .38, color, 1, cv2.LINE_AA)
+    # Draw the centers over both boxes, even when their outlines overlap.
+    for contact in contacts:
+        center = tuple(map(round, contact["center_xy"]))
+        cv2.drawMarker(frame, center, (0, 0, 0), cv2.MARKER_CROSS, 15, 3, cv2.LINE_AA)
+        cv2.drawMarker(frame, center, (255, 255, 255), cv2.MARKER_CROSS, 15, 1, cv2.LINE_AA)
+
+
 def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon=None):
     """接口兼容现有UI7V：roi_polygon参数携带ROI及视频信息。"""
     thresholds = resolve_detection_thresholds(args)
@@ -636,6 +682,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         if on_log is not None:
             on_log(message)
     group_completion = {}
+    logged_sequences = {}
     display_slot_numbering = {}
     inspection_history = []
     alarms = {}
@@ -668,6 +715,31 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             slot["display_slot_id"] = mapping.get(slot["slot_id"])
     def _action_text(phase):
         return "下料" if phase == "unload" else "上料"
+
+    def log_sequence_updates(snapshot, now):
+        changed = dict.fromkeys((event["phase"], event["group_id"])
+                               for event in snapshot["new_events"] if event["expected_action"])
+        for event in snapshot.get("new_group_events", ()):
+            if event["type"] == "s4_inferred_load_cancelled":
+                changed[(event["phase"], event["group_id"])] = None
+                log(f"{now:.2f}s G{event['group_id']} S4 连续检测为空，撤销手接触推断上料")
+        if not changed:
+            return
+        snapshots = {(snapshot["phase"], snapshot["group_id"]): snapshot}
+        snapshots.update({(group["phase"], group["group_id"]): group["snapshot"]
+                          for group in sequence.closed_groups})
+        for phase, group_id in changed:
+            group = snapshots.get((phase, group_id))
+            if group is None or group["slot_numbering_status"] != "final":
+                continue
+            original = tuple(group["confirmed_event_sequence"])
+            mapping = display_slot_numbering.get(group_id, {}).get("mapping", {})
+            continuous = tuple(mapping[slot_id] for slot_id in original) if mapping else ()
+            signature = original, continuous
+            if logged_sequences.get((phase, group_id)) != signature:
+                logged_sequences[(phase, group_id)] = signature
+                log(f"{now:.2f}s G{group_id} {_action_text(phase)}\n"
+                    f"{_live_sequence_text(original, continuous)}")
 
     def log_group_in_progress(phase, group_id):
         key = (phase, group_id)
@@ -830,6 +902,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "s4_hand_region_normalized": (None if context.get("s4_hand_region") is None
                                       else context["s4_hand_region"].tolist()),
         "confirm_seconds": CONFIRM_SECONDS,"min_confirm_frames": MIN_CONFIRM_FRAMES,
+        "visual_reversal_review_seconds": tracker.visual_reversal_review_seconds,
         "load_hand_contact_config": {"enabled": LOAD_HAND_CONTACT_ENABLED,
             "contact_seconds": LOAD_HAND_CONTACT_SECONDS,
             "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,
@@ -848,6 +921,15 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "local_redetection_config": {"enabled": LOCAL_REDETECT_ENABLED, "slot_ids": [4],
             "crop_size_wh": list(LOCAL_REDETECT_CROP_SIZE),"imgsz": LOCAL_REDETECT_IMAGE_SIZE,
             "conf": thresholds.slot_state,"hand_conf": thresholds.hand,"match_distance": "same_as_slot_tracker"},
+        "two_point_hand_contact_config": {"extension_multiplier": TWO_POINT_EXTENSION_MULTIPLIER,
+            "hold_seconds": TWO_POINT_HAND_HOLD_SECONDS,
+            "hold_timeout_basis": "last_reliable_anchor_near_prediction",
+            "hand_roi_policy": "center_inside_slot_roi",
+            "min_coverage": S4_PREDICTION_CONTACT_OVERLAP_RATIO,
+            "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES, "min_seconds": LOAD_HAND_CONTACT_SECONDS,
+            "verification": "full_frame_slot_observation",
+            "entry_s4_load_recovery": {"coverage_margin": LOAD_CONTACT_DOMINANCE_MARGIN,
+                "requires_previous_visual_empty": True, "cancel_on_confirmed_visual_empty": True}},
         "rotation_intervals": ROTATION_INTERVALS,"start_frame": index,"end_frame_exclusive": END_FRAME,
         "timestamp_method": "source_frame/source_fps","audio_included": False}
     if tracker.unload_entry_numbering_seconds is not None:
@@ -1063,7 +1145,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         and item.get("track_id") is None
                         and item["tracking_confidence"] >= thresholds.tracking_low]
                     snapshot = sequence.update(objects,timestamp,observations_enabled=enabled,
-                                               s4_position_candidates=s4_position_candidates)
+                        s4_position_candidates=s4_position_candidates)
                     inspection_processed += 1
                 else:
                     local_attempts = []
@@ -1074,6 +1156,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         snapshot = {**sequence.snapshot(),"new_events":[],"new_group_events":[]}
                 tracker = sequence.tracker
                 update_display_numbering(snapshot)
+                log_sequence_updates(snapshot, timestamp)
                 publish_operation_alarms(snapshot, timestamp,
                                          hatch_closed=inspection is not None and inspection.closed_at is not None)
                 # ByteTrack runs continuously for the whole video. G/S is a
@@ -1260,6 +1343,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         sequence.contour,
                         label_prefix="S" if snapshot.get("slot_numbering_status") == "final" else None,
                         absolute=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
+                    draw_two_point_hand_contacts(plotted, snapshot.get("two_point_hand_contacts", ()))
                     if DRAW_SLOT_ROI:
                         draw_roi(plotted,polygon)
                     if tracker.machine_center is not None:
@@ -1284,9 +1368,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                                f"{timestamp:.2f}s · {GROUP_TEXT[snapshot['group_status']]} · "
                                f"顺序{snapshot['order_result']}")
                 if snapshot["confirmed_event_sequence"]:
-                    original = " → ".join(f"S{i}" for i in snapshot["confirmed_event_sequence"])
-                    continuous = " → ".join(map(str, snapshot["continuous_sequence"])) or "起点待确认"
-                    text += f"\n原槽号顺序 {original}\n跨组顺时针编号顺序 {continuous}"
+                    text += "\n" + _live_sequence_text(snapshot["confirmed_event_sequence"],
+                                                       snapshot["continuous_sequence"])
                 if inspection is not None:
                     if inspection.started_at is None:
                         status_text = text = '等待舱门把手打开'
@@ -1335,6 +1418,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                      {**sequence.snapshot(),"new_events":[],"new_group_events":[]})
             update_display_numbering(final)
             if processed:
+                log_sequence_updates(final, timestamp)
                 publish_operation_alarms(final, timestamp, pending_tail=pending_tail)
             for event in final["new_events"]:
                 events.write(json.dumps(event,ensure_ascii=False)+"\n")
@@ -1365,6 +1449,10 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                        inspection_events=inspection_history,operation_alarms=list(alarms.values()),
                        display_slot_numbering={str(k):v for k,v in display_slot_numbering.items()},
                        display_absolute_slot_numbers=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
+        if sequence.cancelled_s4_inferred_loads:
+            with (output/"slot_events.jsonl").open("w", encoding="utf-8") as events:
+                for event in sequence.all_events:
+                    events.write(json.dumps(event, ensure_ascii=False)+"\n")
         if "track_counts" in locals():
             summary["slot_tracking"].update(track_counts=track_counts,
                 track_count=len(track_summary),
@@ -1395,7 +1483,13 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         (output/"summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     if not processed and status != "user_stopped":
         raise RuntimeError("没有处理任何帧")
-    log(report_text)
+    final_log = ["工序结束汇总"]
+    final_log.extend(format_process_report(report, include_matrix=False)
+                     for report in summary["group_process_reports"].values())
+    if inspection is not None:
+        final_log.append(format_fullness_report(inspection.report))
+    log("\n\n".join(final_log))
+    log(f"工序报告已保存至 {output / 'group_process_report.txt'}")
     return summary
 
 
