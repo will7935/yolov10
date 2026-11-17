@@ -104,7 +104,7 @@ from industrial_inspection.tools.slot_process_config import (
     PROCESS_PHASE, AUTO_LOAD_AFTER_UNLOAD, HATCH_CONTROL_ENABLED,
     HATCH_OPEN_POLYGON, HATCH_CLOSED_POLYGON, HATCH_CONFIRM_SECONDS,
     HATCH_MIN_CONFIRM_FRAMES, HATCH_MAX_GAP_SECONDS, HATCH_DISTANCE_MODE,
-    HATCH_CLOSED_DISTANCE_MAX, HATCH_OPEN_DISTANCE_MIN, HATCH_MISSING_OPEN_SECONDS,
+    HATCH_CLOSED_DISTANCE_MAX, HATCH_OPEN_DISTANCE_MIN, HATCH_MISSING_OPEN_SECONDS, HATCH_STARTUP_NO_HANDLE_SECONDS,
     HATCH_REFERENCE_UPDATE_ALPHA, CLOCKWISE_ORDER, DISPLAY_ABSOLUTE_SLOT_NUMBERS,
     GROUP_TRACKING_ENABLED, AUTO_GROUP_SWITCH, EXIT_CONFIRM_SECONDS,
     EXIT_BOUNDARY_MARGIN_PX, EXIT_MIN_SLOTS, PARTIAL_EXIT_MIN_SLOTS,
@@ -497,6 +497,11 @@ def _status_text_width(text):
     return max(1, width)
 
 
+def s4_load_review_status(snapshot):
+    return {"suspected": "疑似 S4 接触，待确认",
+            "waiting_for_visual": "S4 接触待视觉确认"}.get(snapshot.get("s4_load_contact_review"))
+
+
 def overlay_status(frame,snapshot,show_text=True,inspection=None,
                    panel_position=STATUS_PANEL_POSITION):
     """在画面上方显示当前组工序状态；槽位状态保留在各中心点旁。"""
@@ -515,6 +520,8 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None,
     alarm = snapshot.get("alarm_banner")
     if alarm is not None:
         header = alarm["headline"]
+    elif review_status := s4_load_review_status(snapshot):
+        header = f"{header} · {review_status}"
     # 按实际文字宽度绘制状态面板，避免固定宽度黑框遮挡右上方画面。
     panel_width = min(w, max(96, _status_text_width(header) + 20))
     panel_height = min(h, 32)
@@ -634,18 +641,19 @@ def draw_predicted_slot_boxes(frame, slots, roi_contour, *, color=(0, 220, 255),
         center = slot.get("center_xy")
         if box is None or center is None or cv2.pointPolygonTest(roi_contour, tuple(center), False) < 0:
             continue
+        box_color = (160, 160, 160) if slot.get("position_is_held") else color
         x1, y1, x2, y2 = (int(round(value)) for value in box)
         for x in range(x1, x2, 12):
-            cv2.line(frame, (x, y1), (min(x+6, x2), y1), color, 1, cv2.LINE_AA)
-            cv2.line(frame, (x, y2), (min(x+6, x2), y2), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (x, y1), (min(x+6, x2), y1), box_color, 1, cv2.LINE_AA)
+            cv2.line(frame, (x, y2), (min(x+6, x2), y2), box_color, 1, cv2.LINE_AA)
         for y in range(y1, y2, 12):
-            cv2.line(frame, (x1, y), (x1, min(y+6, y2)), color, 1, cv2.LINE_AA)
-            cv2.line(frame, (x2, y), (x2, min(y+6, y2)), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (x1, y), (x1, min(y+6, y2)), box_color, 1, cv2.LINE_AA)
+            cv2.line(frame, (x2, y), (x2, min(y+6, y2)), box_color, 1, cv2.LINE_AA)
         number = slot.get('display_slot_id')
         slot_label = (str(number) if number is not None else "pending") if absolute else (f"{label_prefix}{slot['slot_id']}" if label_prefix else "slot")
         label = f"G{slot['group_id']}-{slot_label} PRED"
         cv2.putText(frame, label, (x1, max(14, y1-4)), cv2.FONT_HERSHEY_SIMPLEX,
-                    .38, color, 1, cv2.LINE_AA)
+                    .38, box_color, 1, cv2.LINE_AA)
     return frame
 
 
@@ -789,7 +797,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         distance_mode=HATCH_DISTANCE_MODE, closed_distance_max=HATCH_CLOSED_DISTANCE_MAX,
         open_distance_min=HATCH_OPEN_DISTANCE_MIN,
         missing_open_seconds=HATCH_MISSING_OPEN_SECONDS,
-        reference_update_alpha=HATCH_REFERENCE_UPDATE_ALPHA)) if HATCH_CONTROL_ENABLED else None
+        reference_update_alpha=HATCH_REFERENCE_UPDATE_ALPHA),
+        startup_no_handle_seconds=HATCH_STARTUP_NO_HANDLE_SECONDS) if HATCH_CONTROL_ENABLED else None
     sequence_finished = False
     output = args.output_dir or Path(OUTPUT_ROOT)/(args.source.stem+"_slots_"+datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     output.mkdir(parents=True,exist_ok=False)
@@ -867,6 +876,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             "closed_distance_max": HATCH_CLOSED_DISTANCE_MAX,
             "open_distance_min": HATCH_OPEN_DISTANCE_MIN,
             "missing_open_seconds": HATCH_MISSING_OPEN_SECONDS,
+            "startup_no_handle_seconds": HATCH_STARTUP_NO_HANDLE_SECONDS,
             "reference_update_alpha": HATCH_REFERENCE_UPDATE_ALPHA},
         "automatic_grouping_implemented": True,"automatic_grouping_enabled": AUTO_GROUP_SWITCH,
         "group_assignment": "roi_exit_sequence" if AUTO_GROUP_SWITCH else "configured",
@@ -999,8 +1009,11 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     inspection_events.write(json.dumps(item,ensure_ascii=False)+"\n")
                     inspection_history.append(item)
                     if item.get('inspection_started'):
-                        log('舱门把手已打开：开始检测，按下料→上料流程执行。' if tracker.phase == 'unload'
-                            else '舱门把手已打开：开始上料检测。')
+                        if item.get('reason') == 'startup_no_handle':
+                            log(f'视频开始后 {HATCH_STARTUP_NO_HANDLE_SECONDS:g} 秒未检测到舱门把手，已启动槽位检测。')
+                        else:
+                            log('舱门把手已打开：开始检测，按下料→上料流程执行。' if tracker.phase == 'unload'
+                                else '舱门把手已打开：开始上料检测。')
                         log_group_in_progress(tracker.phase, tracker.group_id)
                     elif item['type'] == 'group_fullness':
                         log(f"游星片{item['group_id']}：{item['result']}（{item['filled_count']}/4）")
@@ -1034,7 +1047,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                 for group in sequence.closed_groups:
                     key = (group["phase"], group["group_id"])
                     archived.add(key)
-                    if key in finalized_alarm_groups:
+                    if key in finalized_alarm_groups or group.get("unload_reversal_review_pending"):
                         continue
                     close_reason = None if key == pending_tail else group["close_reason"]
                     check(group["snapshot"], group["events"], close_reason)
@@ -1293,7 +1306,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     group_events.write(json.dumps(event,ensure_ascii=False)+"\n")
                     if event["type"] == "group_started":
                         log_group_in_progress(event["phase"], event["group_id"])
-                    if event["type"] in ("group_closed", "group_updated"):
+                    if event["type"] in ("group_closed", "group_updated") and not event.get("unload_reversal_review_pending"):
                         log_group_completion(event["snapshot"], terminal=True)
                 if inspection is None or inspection.started_at is not None:
                     log_group_completion(snapshot)
@@ -1381,6 +1394,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         status_text += f" · 已确认放满{inspection.report['confirmed_filled_count']}/20"
                 if snapshot.get("alarm_banner") is not None:
                     status_text += f"\n{snapshot['alarm_banner']['message'].splitlines()[0]}"
+                if review_status := s4_load_review_status(snapshot):
+                    status_text += f"\n{review_status}"
                 if on_frame is not None:
                     on_frame(plotted,{"status": status_text,
                         "result": text,"frame_id": processed,"source_frame": source_frame,"time_seconds": timestamp,
@@ -1392,6 +1407,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         "confirmed_event_sequence": snapshot["confirmed_event_sequence"],
                         "continuous_sequence": snapshot["continuous_sequence"],
                         "new_alarms": snapshot["new_alarms"],
+                        "s4_load_contact_review": snapshot.get("s4_load_contact_review"),
                         "track_states": snapshot.get('track_states', []),
                         "inspection": inspection.snapshot() if inspection is not None else None})
                 if inspection is not None and inspection.closed_at is not None:
@@ -1426,7 +1442,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                 group_events.write(json.dumps(event,ensure_ascii=False)+"\n")
                 if event["type"] == "group_started":
                     log_group_in_progress(event["phase"], event["group_id"])
-                if event["type"] in ("group_closed", "group_updated"):
+                if event["type"] in ("group_closed", "group_updated") and not event.get("unload_reversal_review_pending"):
                     log_group_completion(event["snapshot"], terminal=True)
             if processed and (inspection is None or inspection.started_at is not None):
                 log_group_completion(final, terminal=True)
@@ -1449,7 +1465,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                        inspection_events=inspection_history,operation_alarms=list(alarms.values()),
                        display_slot_numbering={str(k):v for k,v in display_slot_numbering.items()},
                        display_absolute_slot_numbers=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
-        if sequence.cancelled_s4_inferred_loads:
+        if sequence.cancelled_s4_inferred_loads or sequence.revised_transition_loads:
             with (output/"slot_events.jsonl").open("w", encoding="utf-8") as events:
                 for event in sequence.all_events:
                     events.write(json.dumps(event, ensure_ascii=False)+"\n")

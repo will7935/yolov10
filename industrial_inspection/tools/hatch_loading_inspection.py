@@ -172,11 +172,17 @@ def build_loading_fullness_report(sequence, *, started, finalized=False):
 
 
 class HatchLoadingInspection:
-    """一次开门至关门的工序；保留原下料到上料流程，关门冻结本轮统计。"""
+    """开门或片头无把手时开始工序，确认关门后冻结统计。"""
 
-    def __init__(self, monitor):
+    def __init__(self, monitor, *, startup_no_handle_seconds=2.0):
+        if not math.isfinite(startup_no_handle_seconds) or startup_no_handle_seconds <= 0:
+            raise ValueError("片头把手观察时间须为正有限数")
         self.monitor = monitor
+        self.startup_no_handle_seconds = float(startup_no_handle_seconds)
+        self._first_frame_at = None
+        self._startup_handle_seen = False
         self.started_at = self.closed_at = None
+        self.start_reason = None
         self._group_results = {}
         self._final_reported = False
         self.report = None
@@ -188,11 +194,24 @@ class HatchLoadingInspection:
 
     def observe_handle(self, objects, now, size):
         events = self.monitor.update(objects, now, size)
+        if self._first_frame_at is None:
+            self._first_frame_at = float(now)
+        deadline = self._first_frame_at + self.startup_no_handle_seconds
+        if now <= deadline+1e-9 and self.monitor.current_center is not None:
+            self._startup_handle_seen = True
+        if (self.started_at is None and not self._startup_handle_seen and now+1e-9 >= deadline
+                and not any(event['state'] == 'open' for event in events)):
+            self.started_at = float(now)
+            self.start_reason = 'startup_no_handle'
+            events.insert(0, {'type': 'slot_detection_started', 'at': float(now),
+                'observed_since': self._first_frame_at, 'reason': self.start_reason,
+                'inspection_started': True})
         for event in events:
-            if event['state'] == 'open' and self.started_at is None:
+            if event.get('state') == 'open' and self.started_at is None:
                 self.started_at = now
+                self.start_reason = 'hatch_opened'
                 event['inspection_started'] = True
-            elif event['state'] == 'closed' and self.active:
+            elif event.get('state') == 'closed' and self.active:
                 self.closed_at = now
                 event['inspection_finished'] = True
         self.events.extend(deepcopy(events))
@@ -225,6 +244,7 @@ class HatchLoadingInspection:
         return {'status': 'completed' if self.closed_at is not None else
                 'detecting' if self.active else 'waiting_open',
                 'started_at': self.started_at, 'closed_at': self.closed_at,
+                'start_reason': self.start_reason,
                 'handle': self.monitor.snapshot(), 'fullness': deepcopy(self.report)}
 
 

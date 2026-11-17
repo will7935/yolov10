@@ -235,13 +235,15 @@ class S4PredictionCacheTests(unittest.TestCase):
                          'visual_state_unchanged')
         self.assertIsNone(result['slots'][3]['prediction_contact'])
 
-    def test_prediction_expiry_keeps_original_center_contact(self):
+    def test_held_prediction_keeps_original_center_contact(self):
         tracker = self.tracker()
         hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [185, 185, 215, 215]}
         result = tracker.update([detection(1, 'filled'), hand], .81)
         slot = result['slots'][3]
-        self.assertIsNone(slot['tracking_box_xyxy'])
-        self.assertEqual(slot['temporary_contact_box_reason'], 'prediction_expired')
+        self.assertEqual(slot['tracking_box_xyxy'], [180., 180., 220., 220.])
+        self.assertTrue(slot['position_is_held'])
+        self.assertEqual(slot['temporary_contact_box_xyxy'], slot['tracking_box_xyxy'])
+        self.assertEqual(slot['temporary_contact_box_reason'], 'held_position')
         self.assertEqual(slot['load_contact_count'], 1)
         self.assertTrue(result['s4_contact_diagnostic']['contact_accepted'])
 
@@ -249,13 +251,14 @@ class S4PredictionCacheTests(unittest.TestCase):
         tracker = self.tracker()
         tracker.update([detection(i, 'filled') for i in (1, 2, 3)], 1.)
         self.assertEqual(tracker.slots[3].last_valid_box_at, 1.)
-        tracker.update([detection(i, 'filled') for i in range(1, 5)], 1.1)
+        moved = CENTERS + [8., 6.]
+        tracker.update([detection(i, 'filled', centers=moved) for i in range(1, 5)], 1.1)
         slot = tracker.slots[3]
         self.assertEqual(slot.last_valid_box_source, 'detection')
-        self.assertEqual(slot.last_valid_center_xy, (200., 200.))
+        self.assertEqual(slot.last_valid_center_xy, (208., 206.))
         self.assertIsNone(slot.temporary_contact_box_xyxy)
 
-    def test_hand_departure_clears_box_and_waits_for_verification(self):
+    def test_hand_departure_keeps_box_and_waits_for_verification(self):
         tracker = self.tracker()
         center_hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [185, 185, 215, 215]}
         hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [178, 185, 190, 215]}
@@ -267,15 +270,16 @@ class S4PredictionCacheTests(unittest.TestCase):
         self.assertEqual(result['s4_contact_diagnostic']['accumulation_status'],
                          'pending_contact_during_prediction')
         result = tracker.update([detection(1, 'filled')], .3)
-        self.assertIsNone(result['slots'][3]['tracking_box_xyxy'])
-        self.assertFalse(result['s4_contact_diagnostic']['temporary_contact_box_active'])
+        self.assertEqual(result['slots'][3]['tracking_box_xyxy'], [180., 180., 220., 220.])
+        self.assertTrue(result['slots'][3]['position_is_held'])
+        self.assertTrue(result['s4_contact_diagnostic']['temporary_contact_box_active'])
         self.assertTrue(result['slots'][3]['load_contact_pending'])
         for now in (.4, .5):
             result = tracker.update([detection(1, 'filled'), detection(4, 'empty')], now)
         self.assertEqual(result['new_events'][0]['slot_id'], 4)
         self.assertEqual(result['new_events'][0]['action'], 'unload')
 
-    def test_expiry_during_held_contact_waits_for_vision_without_starting_release(self):
+    def test_held_contact_uses_cached_box_until_the_hand_leaves(self):
         tracker = self.tracker()
         center_hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [185, 185, 215, 215]}
         hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [178, 185, 190, 215]}
@@ -284,14 +288,99 @@ class S4PredictionCacheTests(unittest.TestCase):
         tracker.update([detection(1, 'filled'), hand], .75)
         for now in (.81, 1.4):
             result = tracker.update([detection(1, 'filled'), hand], now)
-            self.assertIsNone(result['slots'][3]['tracking_box_xyxy'])
+            self.assertEqual(result['slots'][3]['temporary_contact_box_xyxy'], [180., 180., 220., 220.])
             self.assertIsNone(result['slots'][3]['load_contact_released_at'])
             self.assertEqual(result['s4_contact_diagnostic']['accumulation_status'],
-                             'pending_contact_waiting_for_visual')
+                             'pending_contact_during_prediction')
         self.assertEqual(tracker.events, [])
-        tracker.update([detection(1, 'filled')], 2.)
-        self.assertFalse(tracker.slots[3].load_contact_pending)
+        result = tracker.update([detection(1, 'filled')], 1.5)
+        self.assertEqual(result['slots'][3]['load_contact_released_at'], 1.5)
+        self.assertTrue(result['slots'][3]['position_is_held'])
+        self.assertEqual(result['slots'][3]['temporary_contact_box_xyxy'], [180., 180., 220., 220.])
         self.assertEqual(tracker.events, [])
+
+    def test_prediction_only_contact_can_complete_after_expiry(self):
+        tracker = self.tracker()
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [178, 185, 190, 215]}
+        for now in (.75, .81, .9):
+            result = tracker.update([detection(1, 'filled'), hand], now)
+        slot = result['slots'][3]
+        self.assertEqual(slot['last_valid_box_at'], 0.)
+        self.assertEqual(slot['prediction_contact']['frames'], 3)
+        self.assertTrue(slot['prediction_contact']['pending'])
+        self.assertEqual(slot['prediction_contact']['since'], .75)
+        self.assertEqual(tracker.events, [])
+        released = tracker.update([detection(1, 'filled')], .95)['slots'][3]
+        self.assertEqual(released['prediction_contact']['released_at'], .95)
+        self.assertEqual(released['temporary_contact_box_xyxy'], slot['tracking_box_xyxy'])
+        self.assertEqual(released['tracking_box_xyxy'], slot['tracking_box_xyxy'])
+        for now in (1., 1.1):
+            tracker.update([detection(1, 'filled'), detection(4, 'empty')], now)
+        event, = tracker.events
+        self.assertEqual(event['reason'], 'empty_after_prediction_contact')
+
+    def test_held_box_can_start_contact_and_still_needs_visual_confirmation(self):
+        tracker = self.tracker()
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [178, 185, 190, 215]}
+        for now in (.81, .9):
+            slot = tracker.update([detection(1, 'filled'), hand], now)['slots'][3]
+            self.assertTrue(slot['position_is_held'])
+            self.assertEqual(slot['temporary_contact_box_xyxy'], slot['tracking_box_xyxy'])
+            self.assertEqual(slot['last_valid_box_at'], 0.)
+        self.assertTrue(slot['prediction_contact']['pending'])
+        self.assertTrue(slot['prediction_contact']['started_on_held_box'])
+        for now in (.95, 1.5):
+            tracker.update([detection(1, 'filled')], now)
+            self.assertEqual(tracker.events, [])
+        for now in (1.6, 1.7):
+            tracker.update([detection(1, 'filled'), detection(4, 'empty')], now)
+        event, = tracker.events
+        self.assertEqual(event['time_upper'], .95)
+        self.assertEqual(event['visual_time_upper'], 1.6)
+
+    def test_held_box_contact_overlapping_s3_requires_that_exact_unload_to_survive_review(self):
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [95, 183, 193, 217]}
+        for reverses in (False, True):
+            with self.subTest(reverses=reverses):
+                tracker = self.tracker()
+                tracker.visual_reversal_review_seconds = .5
+                tracker.update([detection(i, 'filled') for i in (1, 2, 3)], .1)
+                for now in (.2, .3):
+                    tracker.update([detection(1, 'empty'), detection(2, 'filled'), detection(3, 'filled')], now)
+                tracker.update([detection(2, 'filled'), hand], .85)
+                self.assertIsNone(tracker.slots[3].prediction_contact)
+                for now in (.91, .97):
+                    tracker.update([detection(2, 'filled'), detection(3, 'empty')], now)
+                for now in (1.11, 1.16):
+                    result = tracker.update([detection(2, 'filled'), hand], now)
+                evidence = result['slots'][3]['prediction_contact']
+                self.assertTrue(evidence['pending'])
+                self.assertEqual(evidence['competing_unloads'], ((3, .97),))
+                support = [detection(2, 'filled')]
+                if reverses:
+                    support.append(detection(3, 'filled'))
+                for now in (1.2, 1.25, 1.3):
+                    result = tracker.update(support+[detection(4, 'empty')], now)
+                self.assertEqual([e['slot_id'] for e in tracker.events], [1])
+                status = result['s4_contact_diagnostic']['prediction_contact']['status'] if not reverses else None
+                if not reverses:
+                    self.assertEqual(status, 'waiting_for_competing_unloads')
+                tracker.update(support+[detection(4, 'empty')], 1.5)
+                expected = [1] if reverses else [1, 3, 4]
+                self.assertEqual([e['slot_id'] for e in tracker.events], expected)
+
+    def test_confirmed_motion_clears_cached_position_and_extended_contact(self):
+        tracker = self.tracker()
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [178, 185, 190, 215]}
+        tracker.update([detection(1, 'filled'), hand], .75)
+        result = tracker.update([detection(i, 'filled') for i in (1, 2, 3)] + [hand], .81,
+                                before_observe=lambda *_: False)
+        slot = result['slots'][3]
+        self.assertIsNone(slot['last_valid_box_at'])
+        self.assertIsNone(slot['center_xy'])
+        self.assertIsNone(slot['tracking_box_xyxy'])
+        self.assertIsNone(slot['prediction_contact'])
+        self.assertEqual(slot['temporary_contact_box_reason'], 'rotation_or_transition')
 
     def test_candidate_group_with_internal_points_cannot_use_cache(self):
         tracker = SlotGroupTracker(require_unload_event_before_numbering=True,
@@ -313,6 +402,7 @@ class S4PredictionCacheTests(unittest.TestCase):
         tracker.identity_lost = True
         result = tracker.update([], .15)
         self.assertIsNone(result['slots'][3]['tracking_box_xyxy'])
+        self.assertIsNone(result['slots'][3]['last_valid_center_xy'])
         self.assertIsNone(result['slots'][3]['prediction_contact'])
         self.assertEqual(result['slots'][3]['temporary_contact_box_reason'], 'identity_lost')
         tracker.reset_group(2)

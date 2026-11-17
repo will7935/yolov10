@@ -120,12 +120,13 @@ class TransitionQuarantineTests(unittest.TestCase):
         self.assertIsNone(result['transition_quarantine_until'])
 
     def test_missing_slot_rechecks_quarantine_and_recovers_track_history(self):
-        cases = (('unload', False, True), ('unload', True, False), ('load', False, False))
+        cases = (('unload', False, True), ('unload', True, False), ('load', False, True), ('load', True, False))
         for phase, ambiguous, should_recover in cases:
             with self.subTest(phase=phase, ambiguous=ambiguous):
                 sequence = self.make(phase=phase)
                 sequence.tracker.allow_three_point_initialization = False
-                candidate = {**slot(283, [290, 180]), 'class_name': 'wafer_slot_filled'}
+                initial, target = ('filled', 'empty') if phase == 'unload' else ('empty', 'filled')
+                candidate = {**slot(283, [290, 180]), 'class_name': f'wafer_slot_{initial}'}
                 alternative = slot(284, [310, 164])
                 candidates = [candidate, alternative] if ambiguous else [candidate]
                 for now in (.3, .35, .4, .45):
@@ -138,7 +139,7 @@ class TransitionQuarantineTests(unittest.TestCase):
                 for frame in range(6, 25):
                     now = frame/10
                     if frame >= 11:
-                        candidate = slot(283, [290, 180])
+                        candidate = {**candidate, 'class_name': f'wafer_slot_{target}'}
                     candidates = [candidate, alternative] if ambiguous else [candidate]
                     result = sequence.update(incoming+candidates, now)
                     group_events.extend(result['new_group_events'])
@@ -153,9 +154,65 @@ class TransitionQuarantineTests(unittest.TestCase):
                 self.assertIn(283, sequence.tracker.byte_track_ids)
                 self.assertEqual(len(events), 1)
                 self.assertEqual((events[0]['group_id'], events[0]['action'], events[0]['time_upper']),
-                                 (2, 'unload', 1.1))
+                                 (2, phase, 1.1))
                 recovered = [event for event in group_events if event['type'] == 'transition_track_recovered']
                 self.assertEqual([event['track_id'] for event in recovered], [283])
+
+    def test_three_point_load_handoff_reviews_only_the_historical_event(self):
+        for replacement in ('same_id', 'new_id', 'known_event', 'competing', 'rotating'):
+            with self.subTest(replacement=replacement):
+                sequence = self.make(phase='load')
+                sequence.tracker.allow_three_point_initialization = True
+                candidate = slot(283, [270, 163])
+                for now in (.3, .35, .4, .45):
+                    sequence.update(group()+[candidate], now)
+                self.close(sequence)
+                incoming = [slot(309, [330, 180]), slot(310, [305, 230])]
+                for frame in range(6, 21):
+                    now = frame/10
+                    if now >= 1.1:
+                        candidate = dict(candidate, class_name='wafer_slot_filled')
+                    result = sequence.update(incoming+[candidate], now)
+                self.assertEqual(result['slot_numbering_status'], 'final')
+                self.assertEqual(sequence.tracker.byte_track_ids, [283, 310, 309, None])
+                self.assertTrue(result['slots'][3]['geometry_inferred'])
+                self.assertFalse(sequence.is_transition_quarantined_track(283))
+                self.assertEqual(sequence.all_events, [])
+
+                if replacement == 'known_event':
+                    prior = dict(group_id=2, slot_id=1, phase='load', action='load', expected_action=True,
+                                 time_lower=1.3, time_upper=1.4, confirmed_at=1.5, reported_at=2.)
+                    sequence.tracker.events.append(prior)
+                    sequence.all_events.append(dict(prior))
+                observations = incoming+[candidate]
+                if replacement != 'same_id':
+                    new = dict(slot(312, [275, 165]), class_name='wafer_slot_filled')
+                    observations = incoming+[new]
+                if replacement == 'competing':
+                    observations.append(dict(slot(313, [264, 157]), class_name='wafer_slot_filled'))
+                if replacement == 'rotating':
+                    observations = [slot(309, [328, 164]), slot(310, [284, 196]), new]
+                for now in (2.1, 2.2, 2.3, 2.4):
+                    result = sequence.update(observations, now)
+                if replacement in ('same_id', 'new_id', 'known_event'):
+                    event, = sequence.all_events
+                    self.assertEqual((event['byte_track_id'], event['time_upper']), (283, 1.1))
+                    self.assertEqual(event.get('reassociated_to_byte_track_id'),
+                                     None if replacement == 'same_id' else 312)
+                    if replacement == 'known_event':
+                        self.assertEqual(event['supersedes_reported_at'], 2.)
+                        self.assertEqual(sequence.revised_transition_loads, 1)
+                else:
+                    self.assertEqual(sequence.all_events, [])
+                    self.assertEqual(sequence.tracker.byte_track_ids[0], 283)
+                # A measured slot can exit while the history or S4 is still unconfirmed.
+                last_incoming = observations[1:]
+                exit_position = [328 if replacement == 'rotating' else 330, 74]
+                result = sequence.update([slot(309, exit_position), *last_incoming], 2.5)
+                self.assertEqual(result['group_id'], 3)
+                unconfirmed = [event for event in result['new_group_events']
+                               if event['type'] == 'transition_load_history_unconfirmed']
+                self.assertEqual(len(unconfirmed), int(replacement in ('competing', 'rotating')))
 
     def test_long_missing_unassigned_id_is_recorded_without_being_quarantined(self):
         sequence = self.make()

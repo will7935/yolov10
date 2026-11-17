@@ -91,6 +91,35 @@ class HatchHandleTests(unittest.TestCase):
         self.assertIsNone(inspection.closed_at)
         self.assertEqual(inspection.snapshot()['status'], 'waiting_open')
 
+    def test_startup_window_ignores_invalid_handle_and_uses_video_time(self):
+        inspection = HatchLoadingInspection(monitor())
+        self.assertEqual(inspection.observe_handle([], 10., (640, 480)), [])
+        self.assertEqual(inspection.observe_handle([handle('closed', .1)], 11.9, (640, 480)), [])
+        self.assertEqual(inspection.observe_handle([], 11.99, (640, 480)), [])
+        event, = inspection.observe_handle([], 12., (640, 480))
+        self.assertTrue(inspection.active)
+        self.assertEqual((event['reason'], event['at']), ('startup_no_handle', 12.))
+        self.assertEqual(inspection.monitor.state, 'unknown')
+        self.assertEqual(inspection.observe_handle([], 12.1, (640, 480)), [])
+        for now in (12.2, 12.3, 12.4):
+            events = inspection.observe_handle([handle('closed')], now, (640, 480))
+        self.assertTrue(events[0]['inspection_finished'])
+        self.assertEqual(inspection.closed_at, 12.4)
+
+    def test_one_valid_handle_within_startup_window_preserves_open_gate(self):
+        for at in (.2, 2.):
+            with self.subTest(at=at):
+                inspection = HatchLoadingInspection(monitor())
+                inspection.observe_handle([], 0., (640, 480))
+                outside = dict(handle('closed'), xyxy=[100, 20, 120, 40])
+                inspection.observe_handle([outside], at, (640, 480))
+                self.assertEqual(inspection.observe_handle([], 2.1, (640, 480)), [])
+                self.assertIsNone(inspection.started_at)
+                for now in (2.2, 2.3, 2.4):
+                    events = inspection.observe_handle([handle('open')], now, (640, 480))
+                self.assertEqual(events[0]['type'], 'hatch_opened')
+                self.assertEqual(inspection.start_reason, 'hatch_opened')
+
     def test_conflict_short_glitch_and_low_confidence_do_not_finish(self):
         inspection = HatchLoadingInspection(monitor())
         for now in (0., .1, .2):
@@ -310,7 +339,7 @@ class HatchPipelineTests(unittest.TestCase):
             self.assertIn('上料检测结束：未放满（3/20）',logs)
 
     def test_no_open_signal_never_starts_or_reports_a_final_result(self):
-        frames = [boxes(filled=range(4))+[handle('closed')]]*10
+        frames = [boxes(filled=range(4))+[handle('closed')]]*25
         with tempfile.TemporaryDirectory() as directory:
             summary,logs,ui = self.run_video(frames,Path(directory))
             self.assertEqual(summary['inspection_processed_frames'],0)
@@ -319,6 +348,23 @@ class HatchPipelineTests(unittest.TestCase):
             self.assertFalse(summary['loading_fullness_report']['finalized'])
             self.assertFalse(summary['group_process_report']['groups'][0]['observed'])
             self.assertFalse(any(line.startswith('上料检测结束') for line in logs))
+
+    def test_no_startup_handle_enables_slots_on_timeout_and_later_close_stops(self):
+        slots = boxes(filled=range(4))
+        frames = [slots]*25 + [slots+[handle('open')]]*5 + [slots+[handle('closed')]]*5
+        with tempfile.TemporaryDirectory() as directory:
+            summary, logs, ui = self.run_video(frames, Path(directory), PROCESS_PHASE='load',
+                                               AUTO_LOAD_AFTER_UNLOAD=False)
+            self.assertEqual(ui[19]['inspection']['status'], 'waiting_open')
+            self.assertEqual(ui[20]['inspection']['status'], 'detecting')
+            self.assertEqual(ui[20]['inspection']['handle']['state'], 'unknown')
+            started, = [e for e in summary['inspection_events'] if e.get('inspection_started')]
+            self.assertEqual((started['type'], started['reason'], started['at']),
+                             ('slot_detection_started', 'startup_no_handle', 2.))
+            self.assertEqual(summary['inspection_processed_frames'], 11)
+            self.assertEqual(summary['status'], 'hatch_closed')
+            self.assertEqual(summary['inspection']['closed_at'], 3.1)
+            self.assertTrue(any('已启动槽位检测' in line for line in logs))
 
     def test_video_ending_with_open_door_leaves_final_result_pending(self):
         frames = [boxes(filled=range(4))+[handle('open')]]*6+[boxes(filled=range(4))]*10

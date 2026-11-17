@@ -367,7 +367,7 @@ class SlotTrackStateStore:
             edge.events[:] = [entry for entry in edge.events
                               if (entry[0]['action'], entry[0]['confirmed_at']) not in cancelled]
 
-    def restore(self, slot, track_id, identity, now):
+    def restore(self, slot, track_id, identity, now, *, include_events=True):
         record = self.tracks.get(track_id)
         if record is None or not self.bind(track_id, identity):
             return []
@@ -386,6 +386,8 @@ class SlotTrackStateStore:
                         'candidate', 'candidate_since', 'candidate_count', 'candidate_visual_track_id', 'last_seen',
                         'confirmation_source'):
                 setattr(slot, key, deepcopy(getattr(prior, key)))
+        if not include_events:
+            return []
         events = []
         for index, event in enumerate(record['events']):
             if event['confirmed_at'] >= now or index in record['imported']:

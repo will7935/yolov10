@@ -113,6 +113,53 @@ class GroupSequenceTests(unittest.TestCase):
         for _ in range(3): result=self.step(s,boxes())
         self.assertEqual(result['group_status'],'active')
 
+    def test_unload_exit_preserves_reversal_review_across_immediate_handoff(self):
+        for outcome in ('empty_at_exit', 'empty_after_exit', 'still_filled', 'different_id', 'end_of_video'):
+            with self.subTest(outcome=outcome):
+                tracker = SlotGroupTracker(POINTS, phase='unload', confirm_seconds=0,
+                    minimum_frames=4, visual_reversal_review_seconds=.5)
+                sequence = RoiGroupSequence(tracker, ROI, exit_min_slots=1, partial_exit_slots=1)
+                for frame in range(8):
+                    observations = boxes(filled=(2,) if frame >= 4 else ())
+                    sequence.update([dict(obj, track_id=101+i) for i, obj in enumerate(observations)],
+                                    frame*.05)
+                slot = tracker.slots[2]
+                self.assertEqual(slot.pending_visual_event['action'], 'load')
+
+                empty_probe = dict(boxes(visible=(2,))[0], track_id=103)
+                filled_probe = dict(empty_probe, class_name='wafer_slot_filled')
+                if outcome in ('empty_at_exit', 'empty_after_exit'):
+                    for now in (.4, .45, .5) if outcome == 'empty_at_exit' else (.4, .45):
+                        observations = [dict(obj, track_id=101+i) for i, obj in enumerate(boxes())]
+                        sequence.update(observations, now)
+                exit_points = POINTS.copy()
+                exit_points[0, 0] = -12.
+                observations = boxes(exit_points,
+                    filled=() if outcome.startswith('empty') else (2,))
+                closed_at = {'empty_at_exit': .55, 'empty_after_exit': .5}.get(outcome, .4)
+                result = sequence.update([dict(obj, track_id=101+i) for i, obj in enumerate(observations)],
+                                         closed_at)
+                self.assertEqual((result['group_id'], result['group_status']), (2, 'entering'))
+                self.assertEqual(sequence.all_events, [])
+                group = sequence.closed_groups[0]
+                self.assertEqual(bool(group.get('unload_reversal_review_pending')), outcome != 'empty_at_exit')
+
+                if outcome == 'empty_after_exit':
+                    sequence.update([empty_probe], .55)
+                elif outcome in ('still_filled', 'different_id'):
+                    probe = filled_probe if outcome == 'still_filled' else dict(empty_probe, track_id=203)
+                    for now in (.5, .6, .7, .8, .85):
+                        sequence.update([probe], now)
+                elif outcome == 'end_of_video':
+                    sequence.finish()
+
+                expected = {'still_filled': 'filled', 'different_id': 'unknown',
+                            'end_of_video': 'unknown'}.get(outcome, 'empty')
+                self.assertEqual(group['snapshot']['slots'][2]['last_confirmed_state'], expected)
+                self.assertFalse(group.get('unload_reversal_review_pending', False))
+                self.assertEqual([(event['group_id'], event['action']) for event in sequence.all_events],
+                                 [(1, 'load')] if outcome == 'still_filled' else [])
+
     def test_unconfirmed_initial_g1_candidate_is_discarded_after_leaving_roi(self):
         t=SlotGroupTracker(None, group_id=1, phase='unload',
                            require_unload_event_before_numbering=True,

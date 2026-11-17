@@ -10,6 +10,7 @@ from scipy.optimize import linear_sum_assignment
 
 from industrial_inspection.tools.slot_group_tracker import (
     SLOT_STATES, box_containment, box_iou, slot_layout_error, valid_slot_geometry)
+from industrial_inspection.tools.slot_s4_load_lookback import S4LoadLookback
 from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
 from industrial_inspection.tools.slot_two_point_contact import TwoPointHandContact
 
@@ -104,6 +105,7 @@ class RoiGroupSequence:
         self.return_since = None
         self.closed_groups, self.all_events = [], []
         self.cancelled_s4_inferred_loads = 0
+        self.revised_transition_loads = 0
         self.pending_tracker = None
         self.departing_points = None
         self.departing_seen = None
@@ -125,6 +127,7 @@ class RoiGroupSequence:
         self.departing_load_tracker = None
         self.departing_load_deadline = None
         self._deferred_new_events = []
+        self._departing_unload_reviews = {}
         self._observations_enabled = True
         self._restored_load_groups = set()
         self.track_store = SlotTrackStateStore(
@@ -146,6 +149,10 @@ class RoiGroupSequence:
         self._transition_quarantine_until = None
         self._transition_recheck_ids = set()
         self._transition_recheck = None
+        self._transition_entry_track = None
+        self._transition_load_review = None
+        self._s4_load_lookback = S4LoadLookback(self.contour, self.entry_match_distance_px)
+        self._s4_load_hint = False
         self.mapping_time = None
         self._g1_waiting_event = bool(
             self.require_first_unload_event_for_g1
@@ -600,6 +607,9 @@ class RoiGroupSequence:
         self._transition_quarantine_until = None
         self._transition_recheck_ids.clear()
         self._transition_recheck = None
+        self._transition_entry_track = None
+        self._s4_load_lookback.clear()
+        self._s4_load_hint = False
         if not self.reject_transition_roi_detections:
             return
         history = self._group_roi_tracks.get((self.tracker.phase, self.tracker.group_id), {})
@@ -800,9 +810,17 @@ class RoiGroupSequence:
             return result
         new_events = list(result["new_events"])
         identity = (tracker.phase, tracker.group_id)
+        transition_track_id = tracker.transition_load_track_id
+        transition_record = self.track_store.tracks.get(transition_track_id)
+        defer_transition_history = transition_record is not None and any(
+            event['action'] == 'load' and event['confirmed_at'] < now
+            for event in transition_record['events'])
         for slot, baseline, track_id in zip(tracker.slots, previous["snapshot"]["slots"],
                                             tracker.byte_track_ids):
-            if (baseline["last_confirmed_state"] != "empty" or baseline["last_confirmed_at"] is None
+            if ((self._transition_load_review is not None
+                    and slot.slot_id == tracker.transition_load_slot_index+1)
+                    or (defer_transition_history and track_id == transition_track_id)
+                    or baseline["last_confirmed_state"] != "empty" or baseline["last_confirmed_at"] is None
                     or slot.pending_visual_event is not None
                     or any(e["slot_id"] == slot.slot_id for e in tracker.events)):
                 continue
@@ -851,6 +869,11 @@ class RoiGroupSequence:
         contact_tracker = tracker.two_point_hand_contact
         baseline = previous["snapshot"]["slots"][3]
         slot = tracker.slots[3]
+        if (tracker.transition_load_track_id is not None and slot.geometry_inferred
+                and baseline["last_confirmed_state"] == "empty" and baseline.get("confirmation_source") == "yolo"
+                and baseline["last_confirmed_at"] is not None and slot.confirmed == "empty"):
+            tracker.s4_load_contact_lookback = self._s4_load_lookback.resolve(
+                tracker, now, baseline["last_confirmed_at"])
         if (contact_tracker is not None and tracker.load_hand_contact_enabled
                 and baseline["last_confirmed_state"] == "empty" and baseline.get("confirmation_source") == "yolo"
                 and baseline["last_confirmed_at"] is not None and slot.confirmed == "empty"
@@ -1034,11 +1057,14 @@ class RoiGroupSequence:
 
     def _close(self, now):
         self._finish_departing_load(now)
+        self._finish_transition_load_review(now)
+        review_unload = self.tracker.points is not None and bool(self.tracker.pending_unload_reversals())
         verify_departing = (self.tracker.points is not None and self.tracker.phase == "load"
             and (self.tracker.s4_inferred_load is not None or any(
                 s.confirmed == "empty" or s.pending_visual_event is not None for s in self.tracker.slots)))
         if not verify_departing:
-            self._deferred_new_events.extend(self.tracker.finish_visual_event_reviews(now))
+            self._deferred_new_events.extend(self.tracker.finish_visual_event_reviews(
+                now, preserve_unload_reversals=review_unload))
         snap = self.tracker.snapshot()
         if self.tracker.points is None:
             snap["provisional_events"] = deepcopy(self.tracker._entry_events)
@@ -1055,6 +1081,9 @@ class RoiGroupSequence:
                   "crossed_slot_ids": [i+1 for i in sorted(self.crossed)],
                   "required_crossings": self._required_crossings,"snapshot": snap,
                   "events": deepcopy(self.tracker.events)}
+        if review_unload:
+            self._departing_unload_reviews[(self.tracker.phase, self.tracker.group_id)] = self.tracker
+            record.update(unload_reversal_review_pending=True, operation_result="pending")
         self.closed_groups.append(deepcopy(record))
         self.track_store.closed.add((self.tracker.phase, self.tracker.group_id))
         self._group_events.append(record)
@@ -1096,7 +1125,7 @@ class RoiGroupSequence:
         # 旧组已关闭，永久隔离集合只对该组有效；下一组重新建立自己的集合。
         self._outside_mapping_quarantine_track_ids.clear()
 
-    def _refresh_closed_load(self, tracker, now):
+    def _refresh_closed_group(self, tracker, now, reason):
         record = next(g for g in self.closed_groups
                       if g["group_id"] == tracker.group_id and g["phase"] == tracker.phase)
         snapshot = tracker.snapshot()
@@ -1105,15 +1134,39 @@ class RoiGroupSequence:
         record.update(snapshot=snapshot, events=deepcopy(tracker.events),
             operation_result="fail" if order == "fail" else (
                 "pass" if order == "pass" and snapshot["all_four_target_previously_verified"] else "pending"))
+        record.pop("unload_reversal_review_pending", None)
         self._group_events.append({"type": "group_updated", "group_id": tracker.group_id, "phase": tracker.phase,
-            "at": now, "reason": "departing_load_verification", "snapshot": deepcopy(snapshot)})
+            "at": now, "reason": reason, "snapshot": deepcopy(snapshot)})
+
+    def _review_departing_unloads(self, objects, now, enabled):
+        for identity, tracker in list(self._departing_unload_reviews.items()):
+            candidates = (tracker._candidates([obj for obj in objects
+                if obj.get("detection_source") != "local_crop" and self.track_store.owner(obj.get("track_id")) == identity])
+                if enabled else [])
+            for slot in tracker.pending_unload_reversals():
+                track_id = slot.pending_visual_event.get("byte_track_id")
+                record = self.track_store.tracks.get(track_id)
+                matches = [obj for obj in candidates if obj.get("track_id") == track_id
+                    and record is not None and record["slot_id"] == slot.slot_id
+                    and self._distance(obj["center"]) >= -self.buffer_px
+                    and np.linalg.norm(np.asarray(obj["center"])-tracker.points[slot.slot_id-1])
+                        <= self.entry_match_distance_px]
+                obj = matches[0] if len(matches) == 1 else None
+                events = tracker.review_departing_unload_slot(slot, obj, self._hands, now)
+                if obj is not None and slot.observation != "unknown":
+                    tracker.points[slot.slot_id-1] = obj["center"]
+                tracker.events.extend(events)
+                self._deferred_new_events.extend(events)
+            if not tracker.pending_unload_reversals():
+                del self._departing_unload_reviews[identity]
+                self._refresh_closed_group(tracker, now, "departing_unload_reversal_review")
 
     def _finish_departing_load(self, now):
         tracker = self.departing_load_tracker
         if tracker is None:
             return
         self._deferred_new_events.extend(tracker.finish_visual_event_reviews(now))
-        self._refresh_closed_load(tracker, now)
+        self._refresh_closed_group(tracker, now, "departing_load_verification")
         self.departing_load_tracker = self.departing_load_deadline = None
 
     def _verify_departing_load(self, matches, objects, now):
@@ -1125,7 +1178,7 @@ class RoiGroupSequence:
         self._deferred_new_events.extend(events)
         cancelled = self._record_s4_inferred_load_cancellation(tracker, now)
         if events or cancelled:
-            self._refresh_closed_load(tracker, now)
+            self._refresh_closed_group(tracker, now, "departing_load_verification")
         if now >= self.departing_load_deadline:
             self._finish_departing_load(now)
 
@@ -1141,7 +1194,7 @@ class RoiGroupSequence:
         return True
 
     def _recheck_quarantined_entry_track(self, objects, admitted, tracker, now):
-        """Review an unbound handoff track against three real incoming tracks."""
+        """Check whether an unbound handoff track fits the incoming slot geometry."""
         previous = self._transition_recheck
         self._transition_recheck = None
         if not self._transition_recheck_ids or self._transition_quarantine_until is not None:
@@ -1149,7 +1202,8 @@ class RoiGroupSequence:
         established_ids = {track_id for index, track_id in enumerate(tracker._entry_track_ids)
                            if track_id is not None and index not in tracker._entry_inferred_indices}
         support = tracker._candidates(admitted)
-        if (len(established_ids) != 3 or len(support) != 3
+        allowed_support_counts = (2, 3) if tracker.phase == 'load' else (3,)
+        if (len(established_ids) not in allowed_support_counts or len(support) != len(established_ids)
                 or {obj.get('track_id') for obj in support} != established_ids):
             return None
 
@@ -1168,22 +1222,39 @@ class RoiGroupSequence:
         old_points = [] if self.departing_points is None else [
             point for index, (point, seen) in enumerate(zip(self.departing_points, self.departing_seen))
             if index not in self.departing_untrackable_indices and now-seen <= tracker.lost_seconds]
-        centers = [obj['center'] for obj in support]
-        eligible = [obj for obj in tracker._candidates(objects)
-                    if obj.get('track_id') in self._transition_recheck_ids
-                    and self.track_store.owner(obj['track_id']) is None and reliable(obj)
-                    and not self._in_unload_entry_upper_right_band(obj['center'])
-                    and all(np.linalg.norm(np.asarray(obj['center'])-point) > self.departing_gate*.35
-                            for point in old_points)
-                    and slot_layout_error([*centers, obj['center']]) is not None]
+        centers = [obj['center'] for obj in sorted(support, key=lambda item: item['track_id'])]
+        eligible = []
+        for obj in tracker._candidates(objects):
+            if (obj.get('track_id') not in self._transition_recheck_ids
+                    or self.track_store.owner(obj['track_id']) is not None or not reliable(obj)
+                    or (tracker.phase == 'unload' and self._in_unload_entry_upper_right_band(obj['center']))
+                    or any(np.linalg.norm(np.asarray(obj['center'])-point) <= self.departing_gate*.35
+                           for point in old_points)):
+                continue
+            measured = np.asarray([*centers, obj['center']])
+            layout = measured
+            if len(measured) == 3:
+                if min(np.linalg.norm(measured[-1]-measured[:2], axis=1)) <= self.entry_match_distance_px:
+                    continue
+                predicted, _ = tracker._infer_entry_s4(measured, self.contour)
+                if predicted is None or self._distance(predicted) < 0:
+                    continue
+                layout = np.vstack((measured, predicted))
+            if slot_layout_error(layout) is not None:
+                numbering = (tracker._numbering_order_with_predicted_s4(layout, {3}) if len(measured) == 3
+                             else tracker._numbering_order(layout))
+                eligible.append((obj, measured, tuple(numbering)))
         if len(eligible) != 1:
             return None
-        candidate = eligible[0]
-        key = (candidate['track_id'], tuple(sorted(established_ids)))
+        candidate, measured, ordering = eligible[0]
+        key = (candidate['track_id'], tuple(sorted(established_ids)), ordering)
         count = 1
-        if previous is not None and previous[0] == key and now-previous[2] <= .25:
-            count = previous[1]+1
-        self._transition_recheck = (key, count, now)
+        anchor = measured
+        spacing = min(np.linalg.norm(a-b) for i, a in enumerate(measured) for b in measured[i+1:])
+        if (previous is not None and previous[0] == key and now-previous[2] <= .25
+                and np.max(np.linalg.norm(measured-previous[3], axis=1)) <= spacing*self.entry_stability_ratio):
+            count, anchor = previous[1]+1, previous[3]
+        self._transition_recheck = (key, count, now, anchor)
         return candidate if count >= max(3, tracker.initialization_frames) else None
 
     def _entry_objects(self, objects, now, *, review_quarantined=False):
@@ -1194,7 +1265,13 @@ class RoiGroupSequence:
         objects = self._exclude_departing(objects, now)
         admitted = self._admit_entry_objects(self._exclude_transition_quarantine(objects, now), tracker, now)
         recovered = None
-        if review_quarantined:
+        if self._transition_entry_track is not None:
+            track_id = self._transition_entry_track[0]
+            if track_id in tracker._entry_track_ids:
+                admitted.extend(obj for obj in objects if obj.get('track_id') == track_id
+                                and obj['class_name'] in SLOT_STATES)
+                self._track_rejections.pop(track_id, None)
+        elif review_quarantined:
             recovered = self._recheck_quarantined_entry_track(objects, admitted, tracker, now)
         else:
             self._transition_recheck = None
@@ -1400,26 +1477,120 @@ class RoiGroupSequence:
         self._group_events.append({"type": "group_started", "group_id": self.tracker.group_id,
             "phase": self.tracker.phase, "at": now, "reason": "single_slot_roi_exit"})
 
+    def _start_transition_load_review(self, tracker, track_id, support_ids, numbering, now):
+        roles = {point: slot for slot, point in enumerate(numbering)}
+        anchors = tuple((roles[i], track) for i, track in enumerate(support_ids))
+        index = roles[2]
+        recorded = self.track_store.tracks[track_id]['events']
+        has_history = any(event['action'] == 'load' and event['confirmed_at'] < now for event in recorded)
+        if (any(tracker.byte_track_ids[i] != track for i, track in anchors)
+                or (track_id in tracker.byte_track_ids and tracker.byte_track_ids[index] != track_id)):
+            if has_history:
+                self._group_events.append({"type": "transition_load_history_unconfirmed", "track_id": track_id,
+                    "group_id": tracker.group_id, "phase": tracker.phase, "at": now,
+                    "slot_id": None, "reason": "numbering_roles_disagree"})
+            return
+        tracker.transition_load_slot_index = index
+        if has_history:
+            self._transition_load_review = (track_id, anchors, now)
+
+    def _finish_transition_load_review(self, now):
+        if self._transition_load_review is None:
+            return
+        track_id, _, _ = self._transition_load_review
+        self._group_events.append({"type": "transition_load_history_unconfirmed", "track_id": track_id,
+            "group_id": self.tracker.group_id, "phase": self.tracker.phase, "at": now,
+            "slot_id": self.tracker.transition_load_slot_index+1})
+        self._transition_load_review = None
+
+    def _review_transition_load(self, result, now):
+        if self._transition_load_review is None or self.state != 'active':
+            return result
+        tracker = self.tracker
+        track_id, anchors, started = self._transition_load_review
+        index = tracker.transition_load_slot_index
+        slot = tracker.slots[index]
+        matched_id = tracker.byte_track_ids[index]
+        record = self.track_store.tracks.get(matched_id)
+        old = self.track_store.tracks.get(track_id)
+        if (record is None or old is None or slot.state != 'filled' or not slot.geometry_observed
+                or record['state'].state != 'filled' or record['state'].confirmation_source != 'yolo'
+                or slot.pending_visual_event is not None
+                or any(tracker.byte_track_ids[i] != anchor or not tracker.slots[i].geometry_observed
+                       or self.track_store.tracks[anchor]['reliable_since'] is None for i, anchor in anchors)
+                or record['last_seen'] != now or record['reliable_since'] is None
+                or record['reliable_count'] < max(tracker.initialization_frames, tracker.minimum_frames)
+                or now-max(started, record['reliable_since'])+1e-9
+                    < max(tracker.initialization_seconds, tracker.confirm_seconds)):
+            return result
+        recorded = old['events']
+        if (len(recorded) != 1 or recorded[0]['action'] != 'load' or recorded[0]['confirmed_at'] >= started
+                or now-recorded[0]['confirmed_at']+1e-9 < tracker.visual_reversal_review_seconds
+                or (matched_id != track_id and (old['last_seen'] >= record['first_seen']
+                    or record['first_seen']-old['last_seen'] > tracker.initialization_history_seconds))):
+            return result
+        existing = [event for event in tracker.events if event['slot_id'] == slot.slot_id]
+        if existing and (len(existing) != 1 or existing[0]['action'] != 'load'):
+            return result
+        event = {**recorded[0], "slot_id": slot.slot_id, "group_id": tracker.group_id, "phase": "load",
+                 "expected_action": True, "reported_at": now, "recovered_before_initialization": True,
+                 "reason": "track_history_before_slot_mapping"}
+        if matched_id != track_id:
+            event["reassociated_to_byte_track_id"] = matched_id
+        self.track_store.bind(track_id, (tracker.phase, tracker.group_id), slot.slot_id)
+        self._transition_load_review = None
+        self._group_events.append({"type": "transition_load_history_confirmed", "track_id": track_id,
+            "group_id": tracker.group_id, "phase": tracker.phase, "at": now,
+            "slot_id": slot.slot_id, "matched_track_id": matched_id})
+        new_events = result["new_events"]
+        if existing:
+            previous = existing[0]
+            if previous["time_upper"] <= event["time_upper"]:
+                return result
+            tracker.events.remove(previous)
+            new_events = [item for item in new_events if item != previous]
+            if previous in self.all_events:
+                self.all_events.remove(previous)
+                self.revised_transition_loads += 1
+                event["supersedes_reported_at"] = previous["reported_at"]
+        tracker.events.append(event)
+        return {**tracker.snapshot(), "new_events": [*new_events, event]}
+
     def _update_immediate_entry(self, objects, now, enabled):
         objects, recovered = self._entry_objects(
-            objects, now, review_quarantined=enabled and self.tracker.phase == 'unload')
+            objects, now, review_quarantined=enabled)
+        candidate = self._transition_entry_track
+        if recovered is not None:
+            candidate = self._transition_recheck[0]
         self._entry_count = len(self.tracker._candidates(objects))
+        two_anchor_track_id = candidate[0] if candidate is not None and len(candidate[1]) == 2 else None
+        self.tracker.transition_load_track_id = two_anchor_track_id
+        self._record_entry_s4_load_contact(now, enabled)
         result = self.tracker.update(objects, now, observations_enabled=enabled, roi_contour=self.contour)
         if recovered is not None:
             track_id = recovered['track_id']
             if track_id in self.tracker._entry_track_ids or track_id in self.tracker.byte_track_ids:
+                self._track_rejections.pop(track_id, None)
+                self._transition_entry_track = candidate
+                self._transition_recheck = None
+        if self.tracker.points is not None and self._transition_entry_track is not None:
+            track_id, support_ids, numbering = self._transition_entry_track
+            if two_anchor_track_id is not None:
+                self._start_transition_load_review(self.tracker, track_id, support_ids, numbering, now)
+            if track_id in self.tracker.byte_track_ids or self._transition_load_review is not None:
                 self._transition_quarantine_track_ids.discard(track_id)
                 self._transition_recheck_ids.discard(track_id)
-                self._track_rejections.pop(track_id, None)
                 self._group_events.append({'type': 'transition_track_recovered', 'track_id': track_id,
                     'group_id': self.tracker.group_id, 'phase': self.tracker.phase, 'at': now,
-                    'support_track_ids': list(self._transition_recheck[0][1])})
-                self._transition_recheck = None
+                    'support_track_ids': list(support_ids)})
+            self._transition_entry_track = None
         if self._entry_revision != self.tracker._entry_revision:
             self.inside_seen, self.crossed = {}, {}
             self._entry_revision = self.tracker._entry_revision
         if self.tracker.points is not None:
             result = self._restore_load_baseline(result, now)
+            self._s4_load_lookback.clear()
+            self._s4_load_hint = False
             self._arm(now)
         else:
             # A single physical turn closes at most one established group.
@@ -1427,6 +1598,28 @@ class RoiGroupSequence:
             self.inside_seen.clear()
             self.crossed.clear()
         return result
+
+    def _record_entry_s4_load_contact(self, now, enabled):
+        tracker = self.tracker
+        if (not enabled or tracker.phase != "load" or not tracker.load_hand_contact_enabled
+                or self._transition_quarantine_until is not None or not self._transition_recheck_ids):
+            self._s4_load_lookback.clear()
+            self._s4_load_hint = False
+            return
+        identity = (tracker.phase, tracker.group_id)
+        tracks = {}
+        for track_id in set(tracker._entry_track_ids) | self._transition_recheck_ids:
+            record = self.track_store.tracks.get(track_id)
+            if record is not None and record["owner"] in (None, identity):
+                tracks[track_id] = record
+        previous = self.closed_groups[-1] if self.closed_groups else None
+        reference = None
+        if previous is not None and previous["phase"] == "load":
+            centers = previous["snapshot"]["initialization"].get("initial_centers_xy")
+            if centers is not None and slot_layout_error(centers) is not None:
+                reference = np.asarray(centers)
+        self._s4_load_hint = self._s4_load_lookback.record(
+            tracker, now, self._hands, tracks, reference, self._transition_recheck_ids)
 
     def _update_entry(self, objects, now, enabled):
         objects, _ = self._entry_objects(objects,now)
@@ -1474,6 +1667,7 @@ class RoiGroupSequence:
                 reentry_allowed=lambda center: self._distance(center) >= self.margin and (
                     self._entry_progress(center) is None
                     or self._entry_progress(center) <= self.entry_birth_fraction))
+        self._review_departing_unloads(objects, now, observations_enabled)
         if not discarded_initial_candidate and self.state == "entering":
             result = self._update_immediate_entry(objects, now, observations_enabled)
         elif not discarded_initial_candidate and self.state in ("waiting_next","stabilizing_next"):
@@ -1499,6 +1693,8 @@ class RoiGroupSequence:
                 translation_direction=self.direction if self.state == "exiting" else None,
                 s4_position_candidates=position_candidates,
                 recheck_initial_unload=self._g1_waiting_event)
+            if observations_enabled:
+                result = self._review_transition_load(result, now)
             self._record_s4_inferred_load_cancellation(self.tracker, now)
             if self.tracker.points is not None and self.state == "initializing":
                 self._arm(now)
@@ -1557,7 +1753,12 @@ class RoiGroupSequence:
         if self.last_time is None:
             return {**self.snapshot(), "new_events": [], "new_group_events": []}
         now = self.last_time
+        self._finish_transition_load_review(now)
         self._deferred_new_events.extend(self.tracker.finish_s4_unload_review(now))
+        for tracker in self._departing_unload_reviews.values():
+            tracker.finish_pending_unload_reversals()
+            self._refresh_closed_group(tracker, now, "departing_unload_reversal_review")
+        self._departing_unload_reviews.clear()
         self._deferred_new_events.extend(self.tracker.finish_visual_event_reviews(now))
         self._finish_departing_load(now)
         self.all_events.extend(deepcopy(self._deferred_new_events))
@@ -1568,6 +1769,8 @@ class RoiGroupSequence:
         return {"group_assignment": "roi_exit_sequence" if self.enabled else "configured",
                 "group_status": self.state,"pending_group_id": self.pending_tracker.group_id
                     if self.pending_tracker is not None else None,
+                "s4_load_contact_review": ("suspected" if self._s4_load_hint else
+                    "waiting_for_visual" if self.tracker.s4_load_contact_lookback is not None else None),
                 "pending_phase": self.pending_tracker.phase if self.pending_tracker is not None else None,
                 "closed_group_count": len(self.closed_groups),
                 "crossed_slot_ids": [i+1 for i in sorted(self.crossed)],
