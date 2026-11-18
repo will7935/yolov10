@@ -251,13 +251,15 @@ class SlotTrackStateStore:
         record = self.tracks.get(track_id)
         return None if record is None else record['owner']
 
-    def split_reused_id(self, track_id, old_record, target_slot, now, first_seen):
+    def split_reused_id(self, track_id, old_record, target_slot, now, first_seen, *,
+                        method='bytetrack_id_reused_after_gap'):
         """Open a new segment for an ID reused at another physical slot."""
         track_id = int(track_id)
         archived = self.archived_segments.setdefault(track_id, [])
         archived.append(deepcopy(old_record))
         old_owner = old_record['owner']
         self.aliases.pop(track_id, None)
+        self._edge_tracks.pop(track_id, None)
         self.tracks[track_id] = dict(
             state=SlotState(0), previous=SlotState(0), events=[], imported=set(),
             owner=None, slot_id=None, first_seen=float(now), last_seen=float(now),
@@ -271,7 +273,7 @@ class SlotTrackStateStore:
             'previous_slot_id': old_record['slot_id'], 'slot_id': int(target_slot),
             'gap_seconds': round(float(first_seen-old_record['last_seen']), 6),
             'first_seen': float(first_seen),
-            'method': 'bytetrack_id_reused_after_gap', 'at': float(now)})
+            'method': method, 'at': float(now)})
 
     def bind(self, track_id, identity, slot_id=None, *, center=None, now=None):
         record = self.tracks.get(track_id)

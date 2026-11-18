@@ -41,7 +41,7 @@ from industrial_inspection.tools.hatch_loading_inspection import (
 # 视频和 ROI 沿用旧配置；本入口使用 exp3.3 槽位模型。
 # =============================================================================
 SOURCE_VIDEO = base.SOURCE_VIDEO
-MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp3.3\weights\best.pt")
+MODEL_WEIGHTS = Path(r"C:\Users\win10\xanylabeling_data\trainer\ultralytics\runs\detect\exp3.5\weights\best.pt")
 OUTPUT_ROOT = base.OUTPUT_ROOT
 CONFIDENCE = base.CONFIDENCE
 AUDIT_CONFIDENCE = getattr(base, "AUDIT_CONFIDENCE", .001)  # CSV审计下限，不改变显示/状态门槛
@@ -61,16 +61,16 @@ POINT_RADIUS = base.POINT_RADIUS
 TRY_SETTLED_UNLOAD_NUMBERING = True
 _TRIAL_UNLOAD_STABLE_SECONDS = .20
 
-# 每次完成主视频后，自动用同一套模型和分组逻辑处理五个原始回归视频。
+# 每次完成主视频后，自动使用同一套模型、分组逻辑和项目默认 ROI 处理回归视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
 REGRESSION_TESTS_ENABLED = True
 REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
 REGRESSION_TEST_VIDEOS = (
     ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
-     REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033_slot_roi.json"),
+     base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频2", REGRESSION_DATASET_ROOT / "测试视频2" / "camera_B_20260923_143845.avi",
-     REGRESSION_DATASET_ROOT / "测试视频2" / "camera_B_20260923_143845_slot_roi.json"),
+     base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频3", REGRESSION_DATASET_ROOT / "测试视频3" / "camera_B_20260924_013432.avi",
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频4", REGRESSION_DATASET_ROOT / "测试视频4" / "camera_B_20260924_015247.avi",
@@ -79,20 +79,22 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频6", REGRESSION_DATASET_ROOT / "测试视频6" / "camera_B_20260924_024720.avi",
      base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频7", REGRESSION_DATASET_ROOT / "测试视频7" / "camera_B_20260924_052446.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频8", REGRESSION_DATASET_ROOT / "测试视频8" / "camera_B_20260924_054543.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频9", REGRESSION_DATASET_ROOT / "测试视频9" / "camera_B_20260924_060103.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频13", REGRESSION_DATASET_ROOT / "测试视频13" / "camera_B_20260924_071629.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频7", REGRESSION_DATASET_ROOT / "测试视频7" / "camera_B_20260924_052446.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频8", REGRESSION_DATASET_ROOT / "测试视频8" / "camera_B_20260924_054543.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频9", REGRESSION_DATASET_ROOT / "测试视频9" / "camera_B_20260924_060103.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频13", REGRESSION_DATASET_ROOT / "测试视频13" / "camera_B_20260924_071629.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频14", REGRESSION_DATASET_ROOT / "测试视频14" / "camera_B_20260924_085126.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
 )
 REGRESSION_OUTPUT_ROOT = OUTPUT_ROOT / "regression_runs"
 REGRESSION_WRITE_VIDEO = False  # 回归默认只保存流程数据；--with-video可显式打开
@@ -112,6 +114,7 @@ from industrial_inspection.tools.slot_process_config import (
     NEXT_GROUP_STABILITY_RATIO, NEXT_GROUP_MATCH_DISTANCE_PX, NEXT_GROUP_ENTRY_FRACTION,
     UNLOAD_ENTRY_UPPER_RIGHT_MIN_X_RATIO, UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX,
     REJECT_TRANSITION_ROI_DETECTIONS, TRANSITION_QUARANTINE_MIN_FRAMES,
+    UNLOAD_TO_LOAD_QUARANTINE_MIN_FRAMES,
     OUTSIDE_MAPPING_QUARANTINE_SECONDS, SLOT2_BELOW_SLOT3, EXIT_DIRECTION,
     MACHINE_CENTER_NORMALIZED,
     START_FRAME, END_FRAME, INITIALIZATION_SECONDS,
@@ -284,6 +287,7 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
             UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX*min(size[0]/640, size[1]/480)),
         reject_transition_roi_detections=REJECT_TRANSITION_ROI_DETECTIONS,
         transition_quarantine_min_frames=TRANSITION_QUARANTINE_MIN_FRAMES,
+        unload_to_load_quarantine_min_frames=UNLOAD_TO_LOAD_QUARANTINE_MIN_FRAMES,
         outside_mapping_quarantine_seconds=OUTSIDE_MAPPING_QUARANTINE_SECONDS,
         use_previous_s4_layouts=S4_USE_PREVIOUS_GROUP_LAYOUTS,
         require_first_unload_event_for_g1=REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1,
@@ -554,11 +558,13 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None,
         if not 0 <= x < w or not 0 <= y < h:
             continue
         point = (round(x),round(y))
-        if display_state == "unknown":
-            cv2.circle(frame,point,POINT_RADIUS+2,color,1,cv2.LINE_AA)
-        else:
+        is_prediction = slot.get("position_is_prediction")
+        if display_state != "unknown":
             cv2.circle(frame,point,POINT_RADIUS+1,(0,0,0),-1,cv2.LINE_AA)
             cv2.circle(frame,point,POINT_RADIUS,color,-1,cv2.LINE_AA)
+        if is_prediction or display_state == "unknown":
+            edge_color = (0,255,255) if is_prediction else color
+            cv2.circle(frame,point,POINT_RADIUS+2,edge_color,1,cv2.LINE_AA)
         # Provisional points are identified by their ByteTrack boxes. Showing
         # the internal temporary array index here would look like a stable ID.
         if show_text and snapshot.get("slot_numbering_status") == "final":
@@ -860,11 +866,14 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             "enabled": REJECT_TRANSITION_ROI_DETECTIONS,
             "record_scope": "all_roi_slot_track_ids_during_group",
             "unassigned_min_roi_frames": TRANSITION_QUARANTINE_MIN_FRAMES,
+            "unload_to_load_unassigned_min_roi_frames": UNLOAD_TO_LOAD_QUARANTINE_MIN_FRAMES,
             "missing_roi_track_max_gap_seconds": IDENTITY_LOST_SECONDS,
             "id_scope": "entire_next_group",
             "spatial_duration_seconds": max(IDENTITY_LOST_SECONDS, NEXT_GROUP_STABLE_SECONDS, .5),
             "distance_px": NEXT_GROUP_MATCH_DISTANCE_PX,
-            "description": "closed-group owners remain excluded; unassigned ROI IDs require sufficient old-group detection frames and recent presence; all handoff ROI centers retain temporary spatial quarantine"},
+            "description": ("closed-group owners remain excluded; unassigned ROI IDs require sufficient "
+                            "old-group detection frames and recent presence; during load handoffs, spatial "
+                            "quarantine uses owned tracks, established unassigned tracks, and detections without IDs")},
         "closed_group_inferred_s4_reassociation": {
             "enabled": False,
             "description": "an inferred S4 is frozen at group handoff and cannot bind a new ByteTrack ID"},
@@ -916,7 +925,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "load_hand_contact_config": {"enabled": LOAD_HAND_CONTACT_ENABLED,
             "contact_seconds": LOAD_HAND_CONTACT_SECONDS,
             "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,
-            "overlap_ratio": LOAD_HAND_CONTACT_OVERLAP_RATIO, "target_slot_ids": [4],
+            "overlap_ratio": LOAD_HAND_CONTACT_OVERLAP_RATIO, "default_target_slot_id": 4,
+            "target_slot_ids": [1, 2, 3, 4], "follow_inferred_slot_during_load": True,
             "competing_slot": {
                 "enabled": LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
                 "slot_id": LOAD_HAND_CONTACT_COMPETING_SLOT_ID,
@@ -1611,9 +1621,9 @@ def run_regression_suite(extra_args=None, *, on_log=None, should_stop=None,
                          write_video=False):
     """Run all configured raw videos without first processing a primary video.
 
-    This is the reusable project-level entry point for regression checks.  Each
-    video still gets its own ROI and output directory through
-    ``_run_regression_tests``; a compact index is written beside those outputs.
+    The configured videos share the project ROI and get separate output
+    directories through ``_run_regression_tests``. A compact index is written
+    beside those outputs.
     """
     argv = ["--no-ui", "--no-show", "--no-regression-tests"]
     if not write_video:

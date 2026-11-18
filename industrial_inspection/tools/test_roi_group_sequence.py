@@ -85,6 +85,42 @@ class GroupSequenceTests(unittest.TestCase):
         hand = {'class_name':'hand', 'confidence':.9, 'xyxy':[255,185,280,195]}
         self.assertTrue(sequence.tracker._hand_contact(3, [hand]))
 
+    def test_load_splits_reused_id_with_simultaneous_replacement_and_missing_target(self):
+        tracker = SlotGroupTracker(POINTS, phase='load', confirm_seconds=.1, minimum_frames=2)
+        sequence = RoiGroupSequence(tracker, ROI, reidentification_enabled=True)
+        initial = [dict(box, track_id=10+i) for i, box in enumerate(boxes())]
+        for _ in range(3):
+            self.step(sequence, initial)
+        replacement = dict(initial[3], track_id=20, class_name='wafer_slot_filled')
+        old_id_at_s3 = dict(initial[2], track_id=13)
+        for _ in range(4):
+            result = self.step(sequence, initial[:2]+[replacement])
+        self.assertEqual([slot['byte_track_id'] for slot in result['slots']], [10, 11, 12, 20])
+        self.assertEqual(result['slots'][3]['last_confirmed_state'], 'filled')
+
+        # A reused ID near S3 cannot split while its S4 replacement is unseen.
+        for _ in range(3):
+            self.step(sequence, initial[:2]+[old_id_at_s3])
+        self.assertEqual(sequence.track_store.tracks[13]['slot_id'], 4)
+        self.step(sequence, initial[:2]+[old_id_at_s3, replacement])
+        self.assertEqual(sequence.track_store.tracks[13]['slot_id'], 4)
+        for _ in range(2):
+            self.step(sequence, initial[:2]+[old_id_at_s3, replacement])
+            self.assertEqual(sequence.track_store.tracks[13]['slot_id'], 4)
+        result = self.step(sequence, initial[:2]+[old_id_at_s3, replacement])
+        self.assertEqual([slot['byte_track_id'] for slot in result['slots']], [10, 11, 13, 20])
+        self.assertEqual(result['slots'][2]['last_confirmed_state'], 'empty')
+        split, = [event for event in sequence.track_store.reidentification_events
+                  if event['method'] == 'bytetrack_id_reused_at_other_slot']
+        self.assertEqual((split['track_id'], split['previous_slot_id'], split['slot_id']), (13, 4, 3))
+        self.assertLess(split['gap_seconds'], tracker.lost_seconds)
+
+        filled_s3 = dict(old_id_at_s3, class_name='wafer_slot_filled')
+        for _ in range(3):
+            self.step(sequence, initial[:2]+[filled_s3, replacement])
+        sequence_events = [(event['slot_id'], event['action']) for event in tracker.events]
+        self.assertEqual(sequence_events, [(4, 'load'), (3, 'load')])
+
     def test_load_hand_contact_without_filled_stays_unconfirmed_at_end(self):
         tracker = SlotGroupTracker(POINTS,phase='load',confirm_seconds=.1,minimum_frames=2,
                                    load_hand_contact_seconds=.15)
@@ -241,6 +277,44 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(result['slot_numbering_status'], 'final')
         self.assertEqual([(event['byte_track_id'], event['action'], event['time_upper'])
                           for event in sequence.all_events], [(500, 'unload', 1.2)])
+
+    def test_g1_waits_for_visual_refill_to_disprove_provisional_contact_unload(self):
+        tracker = SlotGroupTracker(confirm_seconds=0, minimum_frames=2,
+            initialization_seconds=.1, initialization_frames=2, visual_reversal_review_seconds=.5,
+            require_unload_event_before_numbering=True)
+        sequence = RoiGroupSequence(tracker, ROI, require_first_unload_event_for_g1=True)
+        full = [dict(obj, track_id=500+i) for i, obj in enumerate(boxes(filled=range(4)))]
+        for now in (0., .1, .2):
+            sequence.update(full, now)
+        provisional = tracker._provisional
+        slot = provisional.slots[provisional.byte_track_ids.index(503)]
+        contact = dict(slot_id=slot.slot_id, action='unload', expected_action=True,
+            inferred=True, reason='hand_contact_inferred_unload', byte_track_id=None,
+            confirmed_at=.22, time_lower=.2, time_upper=.21, **{'from': 'filled', 'to': 'empty'})
+        provisional.events.append(contact)
+        slot.pending_visual_event = dict(slot_id=slot.slot_id, action='load',
+            expected_action=False, byte_track_id=503, confirmed_at=.24, time_lower=.22, time_upper=.23,
+            recovered_before_initialization=False, **{'from': 'empty', 'to': 'filled'})
+
+        result = sequence.update(full, .3)
+        self.assertEqual(result['slot_numbering_status'], 'provisional')
+        self.assertEqual(tracker.initialization['reason'], 'waiting_for_initial_unload_visual_review')
+        self.assertEqual(provisional.events, [contact])
+        self.assertEqual(sequence.all_events, [])
+
+        result = sequence.update(full, .8)
+        self.assertIs(tracker._provisional, provisional)
+        self.assertEqual(result['slot_numbering_status'], 'provisional')
+        self.assertEqual(provisional.events, [])
+        self.assertEqual(sequence.all_events, [])
+
+        first_empty = [dict(obj, track_id=500+i)
+                       for i, obj in enumerate(boxes(filled=(0, 1, 2)))]
+        for now in (.9, 1., 1.3, 1.6):
+            result = sequence.update(first_empty, now)
+        self.assertEqual(result['slot_numbering_status'], 'final')
+        self.assertEqual([(event['byte_track_id'], event['action'], event['time_upper'])
+                          for event in sequence.all_events], [(503, 'unload', .9)])
 
     def test_disappearance_does_not_count_as_exit(self):
         s=self.make()

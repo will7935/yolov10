@@ -90,6 +90,44 @@ class TransitionQuarantineTests(unittest.TestCase):
         sequence.state = 'active'
         self.assertEqual(sequence._admit_entry_objects(candidates, tracker, .7), candidates)
 
+    def test_first_unload_group_filters_unbound_tracks_in_upper_right_band(self):
+        sequence = self.make()
+        sequence.unload_entry_upper_right_band = (180, 12)
+        established = slot(102, [200, 87])
+        incoming = slot(283, [230, 87])
+        self.assertEqual(sequence._active_objects([established, incoming], .3), [established])
+        self.assertEqual(sequence._track_rejections[283], 'unload_entry_upper_right_band')
+        self.assertEqual(sequence._active_objects([slot(283, [230, 104])], .4), [slot(283, [230, 104])])
+
+    def test_unload_to_load_handoff_uses_its_own_frame_threshold(self):
+        tracker = SlotGroupTracker(POINTS, group_id=5, phase='unload', lost_seconds=1.2)
+        sequence = RoiGroupSequence(tracker, ROI, exit_min_slots=1, partial_exit_slots=1,
+            auto_load_after_unload=True, transition_quarantine_min_frames=9,
+            unload_to_load_quarantine_min_frames=13)
+        first = slot(283, [350, 150])
+        second = slot(284, [370, 150])
+        for frame in range(13):
+            # The second track has one fewer observation when the last unload group leaves.
+            incoming = [first, second] if frame else [first]
+            points = POINTS.copy()
+            if frame == 12:
+                points[0] = [100, 75]
+            result = sequence.update(group(points) + incoming, frame / 10)
+        self.assertEqual((result['phase'], result['group_id']), ('load', 1))
+        self.assertTrue(sequence.is_transition_quarantined_track(283))
+        self.assertFalse(sequence.is_transition_quarantined_track(284))
+        self.assertEqual(sequence.transition_quarantine_min_frames, 9)
+
+    def test_short_lived_incoming_load_track_does_not_quarantine_its_position(self):
+        sequence = self.make(phase='load')
+        candidate = slot(192, [350, 270])
+        sequence.update(group() + [candidate], .45)
+        self.close(sequence, extra=[candidate])
+        result = sequence.update([candidate, slot(309, [200, 200])], .6)
+        records = {r['byte_track_id']: r for r in result['track_states']}
+        self.assertEqual(records[192]['mapping_reason'], 'waiting_slot_numbering')
+        self.assertEqual(records[309]['mapping_reason'], 'transition_roi_quarantine')
+
     def test_same_group_missing_track_restores_original_slot_without_quarantine(self):
         sequence = self.make()
         before = sequence.tracker.byte_track_ids.index(101)

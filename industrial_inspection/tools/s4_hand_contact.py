@@ -30,11 +30,11 @@ class HandContactEvidence:
                 "source": self.source, "candidates": self.candidates}
 
 
-def _centered_box(point, size):
+def centered_box(point, size):
     if size is None or not np.isfinite(size).all():
         return None
     width, height = max(float(size[0]), 1.), max(float(size[1]), 1.)
-    return [point[0]-width/2, point[1]-height/2, point[0]+width/2, point[1]+height/2]
+    return (point[0]-width/2, point[1]-height/2, point[0]+width/2, point[1]+height/2)
 
 
 def box_overlap_ratio(box, hand_box):
@@ -51,9 +51,9 @@ def evaluate_s4_contact(points, box_sizes, slot_index, hands, policy, *, region=
     先尝试原有中心/框接触，再尝试区域补偿。开启区域不能覆盖原本有效的接触。
     其他槽中心覆盖的歧义检查独立于competing_enabled，关闭竞争面积比较仍保留此检查。
     """
-    target_box = _centered_box(points[slot_index], box_sizes[slot_index])
+    target_box = centered_box(points[slot_index], box_sizes[slot_index])
     competing_index = policy.competing_index
-    competing_box = (_centered_box(points[competing_index], box_sizes[competing_index])
+    competing_box = (centered_box(points[competing_index], box_sizes[competing_index])
                      if 0 <= competing_index < len(points) else None)
     direct, regional, hits, diagnostics = [], [], [], []
 

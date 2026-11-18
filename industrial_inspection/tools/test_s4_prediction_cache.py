@@ -448,6 +448,191 @@ class S4PositionRecoveryTests(unittest.TestCase):
         self.assertEqual(result['slots'][3]['center_xy'], [155., 200.])
         self.assertIsNone(result['slots'][3]['byte_track_id'])
 
+    def test_load_binds_recovered_s4_after_three_consecutive_frames_with_three_matched_anchors(self):
+        tracker = SlotGroupTracker(CENTERS, phase='load', match_distance_ratio=.4,
+            confirm_seconds=0., minimum_frames=2)
+        tracker.slots[3].geometry_inferred = True
+        roi = np.float32([[50, 50], [250, 50], [250, 250], [50, 250]])
+        sequence = RoiGroupSequence(tracker, roi)
+        measured = {**self.gray_box, 'track_id': 14, 'confidence': .9}
+
+        for now in (0., .05, .1):
+            result = sequence.update(self.support[:2]+[measured], now)
+            self.assertIsNone(result['slots'][3]['byte_track_id'])
+        self.assertEqual(result['slots'][3]['last_valid_box_source'], 'unassigned_detection')
+
+        sequence.update(self.support, .15)
+        for now in (.2, .25):
+            objects = self.support[:2]+[measured]
+            result = sequence.update(objects, now)
+            self.assertIsNone(result['slots'][3]['byte_track_id'])
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [85, 85, 115, 115]}
+        result = sequence.update(self.support+[measured, hand], .3)
+        self.assertEqual(result['slots'][3]['byte_track_id'], 14)
+        self.assertEqual(result['slots'][3]['center_xy'], [155., 200.])
+        self.assertFalse(result['slots'][3]['geometry_inferred'])
+        self.assertEqual(sequence.track_store.owner(14), ('load', 1))
+        self.assertFalse(any(o['track_id'] == 14 for o in result['unassigned_slot_detections']))
+
+        sequence.update(self.support+[measured], .35)
+        filled = dict(measured, class_name='wafer_slot_filled')
+        for now in (.4, .45):
+            result = sequence.update(self.support+[filled], now)
+        event, = result['new_events']
+        self.assertEqual((event['slot_id'], event['action'], event['byte_track_id']), (4, 'load', 14))
+        self.assertFalse(event.get('inferred'))
+
+    def test_binding_s4_does_not_import_unbound_load_history(self):
+        for already_reported in (False, True):
+            with self.subTest(already_reported=already_reported):
+                tracker = SlotGroupTracker(CENTERS, phase='load', match_distance_ratio=.4,
+                    confirm_seconds=0., minimum_frames=2)
+                slot = tracker.slots[3]
+                slot.geometry_inferred = True
+                roi = np.float32([[50, 50], [250, 50], [250, 250], [50, 250]])
+                sequence = RoiGroupSequence(tracker, roi)
+                measured = {**self.gray_box, 'track_id': 14, 'confidence': .9}
+                for now in (0., .05):
+                    sequence.update(self.support[:2]+[measured], now)
+                slot.confirmed = slot.state = 'filled' if already_reported else 'empty'
+                slot.confirmation_source = 'hand_contact' if already_reported else 'previous_unload_yolo'
+                slot.evidence_time = .05
+                if already_reported:
+                    tracker.events.append({'group_id': 1, 'phase': 'load', 'slot_id': 4, 'action': 'load',
+                        'from': 'empty', 'to': 'filled', 'expected_action': True, 'inferred': True,
+                        'time_lower': .05, 'time_upper': .1, 'confirmed_at': .15})
+                filled = dict(measured, class_name='wafer_slot_filled')
+                for now in (.1, .15):
+                    sequence.update(self.support[:2]+[filled], now)
+                history = sequence.track_store.tracks[14]['events']
+                self.assertEqual([event['action'] for event in history], ['load'])
+
+                result = sequence.update(self.support+[filled], .2)
+                self.assertEqual(result['slots'][3]['byte_track_id'], 14)
+                self.assertEqual(result['new_events'], [])
+                for now in (.25, .3):
+                    result = sequence.update(self.support+[filled], now)
+                event, = tracker.events
+                self.assertEqual(event['time_upper'], .1 if already_reported else .2)
+                self.assertEqual(bool(event.get('inferred')), already_reported)
+
+    def test_load_binds_the_missing_s2_without_using_s4_contact(self):
+        tracker = SlotGroupTracker(CENTERS, phase='load', match_distance_ratio=.4,
+            confirm_seconds=0., minimum_frames=2)
+        tracker._load_numbering_reference = CENTERS.copy()
+        tracker.slots[1].geometry_inferred = True
+        support = [detection(i, 'empty', track_id=i) for i in (1, 3, 4)]
+        measured = detection(2, 'empty', centers=CENTERS+[-45, 0], track_id=14)
+        for now in (0., .05, .1, .15):
+            result = tracker.update(support+[measured], now)
+        self.assertEqual([s['byte_track_id'] for s in result['slots']], [1, 14, 3, 4])
+        self.assertIsNone(result['slots'][1]['temporary_contact_box_xyxy'])
+        self.assertEqual(result['slots'][1]['last_confirmed_state'], 'empty')
+        filled = dict(measured, class_name='wafer_slot_filled')
+        for now in (.2, .25):
+            result = tracker.update(support+[filled], now)
+        event, = result['new_events']
+        self.assertEqual((event['slot_id'], event['action'], event['byte_track_id']), (2, 'load', 14))
+        self.assertFalse(event.get('inferred'))
+
+    def test_load_hand_inference_follows_the_missing_slot(self):
+        tracker = SlotGroupTracker(CENTERS, phase='load', confirm_seconds=0.,
+            minimum_frames=2, load_hand_contact_seconds=.05, load_hand_contact_min_frames=2,
+            s4_hand_region=np.float32([[175, 175], [225, 175], [225, 225], [175, 225]]))
+        tracker._load_numbering_reference = CENTERS.copy()
+        tracker.slots[1].geometry_inferred = True
+        support = [detection(i, 'empty', track_id=i) for i in (1, 3, 4)]
+        s2_hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [184, 81, 196, 98]}
+        s4_hand = {**s2_hand, 'xyxy': [180, 180, 220, 220]}
+        for now in (0., .05):
+            tracker.update(support+[detection(2, 'empty', track_id=2)], now)
+        tracker.slots[1].geometry_inferred = True
+        for now in (.1, .15):
+            result = tracker.update(support+[s2_hand], now)
+        self.assertEqual(result['slots'][1]['load_contact_count'], 0)
+
+        tracker._load_verified_empty_slots = {2}
+        for now in (.2, .25):
+            result = tracker.update(support+[s4_hand], now)
+        self.assertEqual(result['slots'][1]['load_contact_count'], 0)
+        self.assertEqual(result['slots'][3]['load_contact_count'], 0)
+        for now in (.3, .35):
+            result = tracker.update(support+[s2_hand], now)
+        self.assertTrue(result['slots'][1]['load_contact_pending'])
+        self.assertEqual(result['s4_contact_diagnostic']['target_slot_id'], 2)
+        self.assertEqual(result['s4_contact_diagnostic']['source'], 'predicted_slot_box')
+        self.assertEqual(result['slots'][1]['temporary_contact_box_xyxy'], [180., 80., 220., 120.])
+
+        tracker.update(support, .4)
+        result = tracker.update(support, .9)
+        event, = result['new_events']
+        self.assertEqual((event['slot_id'], event['action'], event['reason']),
+                         (2, 'load', 'hand_contact_inferred_load'))
+        self.assertTrue(event['inferred'])
+        for now in (1., 1.05, 1.1, 1.65):
+            tracker.update(support+([s2_hand] if now <= 1.05 else []), now)
+        self.assertEqual(len(tracker.events), 1)
+
+    def test_load_contact_box_moves_with_the_inferred_slot_point(self):
+        tracker = SlotGroupTracker(CENTERS, phase='load')
+        tracker.slots[1].geometry_inferred = True
+        for now, shift in ((0., [0., 0.]), (.05, [9., 5.])):
+            support = [detection(i, 'empty', centers=CENTERS+shift, track_id=i) for i in (1, 3, 4)]
+            slot = tracker.update(support, now)['slots'][1]
+            np.testing.assert_allclose(slot['center_xy'], CENTERS[1]+shift, atol=.01)
+            self.assertTrue(slot['position_is_prediction'])
+            box = np.asarray(slot['temporary_contact_box_xyxy']).reshape(2, 2)
+            np.testing.assert_allclose(box.mean(axis=0), slot['center_xy'], atol=.01)
+            np.testing.assert_allclose(box[1]-box[0], [40, 40], atol=.01)
+            self.assertEqual(slot['tracking_box_xyxy'], slot['temporary_contact_box_xyxy'])
+
+    def test_load_resumes_prediction_when_an_observed_slot_goes_missing(self):
+        tracker = SlotGroupTracker(CENTERS, phase='load', s4_contact_prediction_seconds=.8,
+            confirm_seconds=0., minimum_frames=2, load_hand_contact_seconds=0.)
+        tracker._load_numbering_reference = CENTERS.copy()
+        tracker._load_verified_empty_slots = {2}
+        all_slots = [detection(i, 'empty', track_id=i) for i in range(1, 5)]
+        for now in (0., .05):
+            slot = tracker.update(all_slots, now)['slots'][1]
+        self.assertFalse(slot['position_is_prediction'])
+        self.assertEqual(slot['byte_track_id'], 2)
+
+        moved = [detection(i, 'empty', centers=CENTERS+[8., 4.], track_id=i) for i in range(1, 5)]
+        result = tracker.update([moved[0], moved[2], moved[3]], .1)
+        slot = result['slots'][1]
+        self.assertEqual(slot['center_xy'], [208., 104.])
+        self.assertEqual(slot['temporary_contact_box_xyxy'], [188., 84., 228., 124.])
+        self.assertTrue(slot['position_is_prediction'])
+        self.assertFalse(slot['position_is_held'])
+
+        support = [moved[0], moved[2]]
+        held = tracker.update(support, .2)['slots'][1]
+        self.assertTrue(held['position_is_held'])
+        self.assertEqual(held['temporary_contact_box_xyxy'], slot['temporary_contact_box_xyxy'])
+        hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [193, 89, 223, 119]}
+        for now in (.25, .3):
+            result = tracker.update(support+[hand], now)
+        self.assertEqual(result['s4_contact_diagnostic']['target_slot_id'], 2)
+        self.assertTrue(result['slots'][1]['prediction_contact']['pending'])
+        self.assertFalse(result['slots'][1]['load_contact_pending'])
+        tracker.update(support, .35)
+        expired = tracker.update(support, 1.)['slots'][1]
+        self.assertFalse(expired['position_is_prediction'])
+        self.assertIsNone(expired['temporary_contact_box_xyxy'])
+        self.assertEqual(expired['last_confirmed_state'], 'empty')
+        self.assertEqual(tracker.events, [])
+
+        moved[1] = dict(moved[1], class_name='wafer_slot_filled')
+        tracker.update(moved, 1.05)
+        result = tracker.update(moved, 1.1)
+        observed = result['slots'][1]
+        self.assertFalse(observed['position_is_prediction'])
+        self.assertEqual(observed['byte_track_id'], 2)
+        self.assertIsNone(observed['temporary_contact_box_xyxy'])
+        event, = result['new_events']
+        self.assertEqual((event['slot_id'], event['reason']), (2, 'visual_after_prediction_contact'))
+        self.assertEqual((event['time_upper'], event['visual_time_upper']), (.35, 1.05))
+
     def test_real_s4_takes_priority_over_gray_box(self):
         for now in (0., .05, .1):
             result = self.tracker.update(self.support+[detection(4, 'filled', track_id=4)], now,
@@ -506,6 +691,31 @@ class S4MeasuredLayoutTests(unittest.TestCase):
         result = self.enter_with_three_slots()
         self.assertEqual(result['initialization']['s4_reference_group_ids'], [])
         self.assertEqual(result['slots'][3]['center_xy'], [225., 212.])
+
+    def test_load_numbering_keeps_measured_s4_when_s2_is_hidden(self):
+        tracker = SlotGroupTracker(phase='load', slot2_below_slot3=True,
+            machine_center=(637, 266), initialization_seconds=.05, initialization_frames=2,
+            allow_three_point_initialization=True)
+        tracker._load_numbering_reference = self.layout.copy()
+        tracker.start_incremental_entry(40)
+        load = np.array([[463, 308], [573, 331], [434, 244], [547, 270]], dtype=float)
+        visible = [detection(i, 'empty', centers=load, track_id=i+100) for i in (1, 3, 4)]
+        for now in (0., .05, .1, .15, .2, .25, .3):
+            result = tracker.update(visible, now)
+        self.assertEqual(result['slot_numbering_status'], 'final')
+        self.assertEqual(result['initialization']['inferred_slot_ids'], [2])
+        self.assertEqual([s['byte_track_id'] for s in result['slots']], [101, None, 103, 104])
+
+    def test_load_projects_same_group_layout_when_local_guess_leaves_roi(self):
+        tracker = SlotGroupTracker(phase='load', machine_center=(637, 266))
+        layout = np.array([[441, 289], [547, 323], [456, 242], [543, 267]], dtype=float)
+        tracker._load_numbering_reference = np.array(
+            [[381.8, 220.2], [501., 274.2], [430.4, 196.8], [530.9, 240.]], dtype=float)
+        visible = layout[[0, 1, 3]]
+        roi = np.float32([[279, 144], [628, 228], [633, 384], [300, 318]])
+        point, groups = tracker._infer_entry_s4(visible, roi)
+        np.testing.assert_allclose(point, layout[2], atol=2.)
+        self.assertEqual(groups, [1])
 
     def test_recalculates_once_after_three_real_slots_stabilize_again(self):
         tracker = SlotGroupTracker(initialization_seconds=.05, initialization_frames=2,

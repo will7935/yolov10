@@ -31,6 +31,7 @@ class RoiGroupSequence:
                  reidentification_enabled=False, reidentification_max_gap_seconds=15.0,
                  reidentification_max_distance_px=40.0,
                  reject_transition_roi_detections=True, transition_quarantine_min_frames=4,
+                 unload_to_load_quarantine_min_frames=None,
                  require_first_unload_event_for_g1=False,
                  outside_mapping_quarantine_seconds=3.0,
                  use_previous_s4_layouts=False, edge_evidence_px=0.0,
@@ -52,10 +53,11 @@ class RoiGroupSequence:
             raise ValueError("新组逐点匹配距离须为正有限像素值")
         if not np.isfinite(entry_birth_fraction) or not 0 < entry_birth_fraction <= 1:
             raise ValueError("新轨迹入口深度比例须在0..1之间")
-        if (not isinstance(transition_quarantine_min_frames, (int, np.integer))
-                or isinstance(transition_quarantine_min_frames, bool)
-                or transition_quarantine_min_frames < 1):
-            raise ValueError("旧组未绑定轨迹的隔离出现帧数须为正整数")
+        if unload_to_load_quarantine_min_frames is None:
+            unload_to_load_quarantine_min_frames = transition_quarantine_min_frames
+        for frames in (transition_quarantine_min_frames, unload_to_load_quarantine_min_frames):
+            if not isinstance(frames, (int, np.integer)) or isinstance(frames, bool) or frames < 1:
+                raise ValueError("旧组未绑定轨迹的隔离出现帧数须为正整数")
         self.enabled, self.buffer_px, self.margin = enabled, buffer_px, boundary_margin_px
         self.auto_load_after_unload = bool(auto_load_after_unload)
         self.exit_seconds, self.exit_min_slots = exit_seconds, exit_min_slots
@@ -78,6 +80,7 @@ class RoiGroupSequence:
                 hold_seconds=two_point_hand_hold_seconds)
         self.reject_transition_roi_detections = bool(reject_transition_roi_detections)
         self.transition_quarantine_min_frames = int(transition_quarantine_min_frames)
+        self.unload_to_load_quarantine_min_frames = int(unload_to_load_quarantine_min_frames)
         self.require_first_unload_event_for_g1 = bool(require_first_unload_event_for_g1)
         if (not np.isfinite(outside_mapping_quarantine_seconds)
                 or outside_mapping_quarantine_seconds < 0):
@@ -276,6 +279,12 @@ class RoiGroupSequence:
                           for old_group, samples in self._unload_layouts.items() if old_group < group_id]
             result._s4_reference_layouts = tuple((old_group, layout)
                 for old_group, layout in references if valid_slot_geometry(layout))
+        elif result.phase == "load" and self.use_previous_s4_layouts:
+            samples = self._unload_layouts.get(group_id)
+            if samples:
+                layout = np.median(samples, axis=0)
+                if valid_slot_geometry(layout):
+                    result._load_numbering_reference = layout
         if entry:
             result.initialization_seconds = self.entry_seconds
             result.geometry_initialization_seconds = self.entry_seconds
@@ -612,10 +621,14 @@ class RoiGroupSequence:
         self._s4_load_hint = False
         if not self.reject_transition_roi_detections:
             return
-        history = self._group_roi_tracks.get((self.tracker.phase, self.tracker.group_id), {})
+        phase, group_id = self.tracker.phase, self.tracker.group_id
+        history = self._group_roi_tracks.get((phase, group_id), {})
+        min_frames = self.transition_quarantine_min_frames
+        if phase == "unload" and group_id == 5 and self.auto_load_after_unload:
+            min_frames = self.unload_to_load_quarantine_min_frames
         for track_id, record in history.items():
             if (self.track_store.owner(track_id) is None
-                    and record['inside_frames'] >= self.transition_quarantine_min_frames
+                    and record['inside_frames'] >= min_frames
                     and record['inside_roi']
                     and now-record['last_seen'] <= self.tracker.lost_seconds):
                 if track_id not in self._transition_quarantine_track_ids:
@@ -626,6 +639,11 @@ class RoiGroupSequence:
         # 历史漏检点只隔离ID，不把滞后坐标扩成空间屏蔽区域。
         for obj in objects:
             if obj.get('class_name') not in SLOT_STATES:
+                continue
+            # 上料换组时，刚进入ROI的未绑定轨迹不能用自身位置挡住下一组。
+            track_id = obj.get('track_id')
+            if (phase == "load" and track_id is not None and self.track_store.owner(track_id) is None
+                    and history.get(track_id, {}).get('inside_frames', 0) < min_frames):
                 continue
             box = obj.get('xyxy')
             if box is None:
@@ -686,7 +704,7 @@ class RoiGroupSequence:
             self._reject_track(obj, obj['reason'])
 
     def _split_reused_track_ids(self, objects, now):
-        """Split a stale BT ID only after its old and new slot are unambiguous."""
+        """Split a reused BT ID after its old and new slot are unambiguous."""
         tracker = self.tracker
         if (not self.track_store.reidentification_enabled or self.state != 'active'
                 or tracker.points is None or tracker.reference_points is None):
@@ -695,6 +713,12 @@ class RoiGroupSequence:
         identity = (tracker.phase, tracker.group_id)
         gate = min(self.track_store.reidentification_max_distance_px,
                    tracker._spacing() * tracker.match_distance_ratio)
+        observations = {}
+        for obj in objects:
+            track_id = obj.get('track_id')
+            if obj.get('class_name') in SLOT_STATES and track_id is not None:
+                track_id = int(track_id)
+                observations[track_id] = None if track_id in observations else obj
         seen = set()
         for obj in objects:
             track_id = obj.get('track_id')
@@ -714,11 +738,10 @@ class RoiGroupSequence:
             if candidate is None:
                 old_slot = record.get('slot_id')
                 old_center = record.get('center')
+                gap = now-float(record['last_seen'])
                 if (record.get('owner') != identity or old_slot is None
                         or old_center is None
-                        or now-float(record['last_seen']) <= tracker.lost_seconds
-                        or now-float(record['last_seen']) >
-                           self.track_store.reidentification_max_gap_seconds
+                        or gap > self.track_store.reidentification_max_gap_seconds
                         or self._distance(center) < 0
                         or track_id in self._outside_mapping_quarantine_track_ids
                         or track_id in self._transition_quarantine_track_ids):
@@ -732,8 +755,7 @@ class RoiGroupSequence:
                 expected_state = 'empty' if tracker.phase == 'unload' else 'filled'
                 if (replacement_id is None or replacement_id == track_id
                         or source_seen is None or now-source_seen > .25
-                        or source_slot.confirmed != expected_state
-                        or np.linalg.norm(center-np.asarray(old_center)) <= gate):
+                        or source_slot.confirmed != expected_state):
                     continue
                 distances = np.linalg.norm(tracker.reference_points-center, axis=1)
                 order = np.argsort(distances)
@@ -745,12 +767,20 @@ class RoiGroupSequence:
                 target_seen = target_slot.last_seen
                 if (target_seen is not None and now-target_seen < .2):
                     continue
-                if (target_slot.confirmed != ('filled' if tracker.phase == 'unload' else 'empty')
-                        or SLOT_STATES[obj['class_name']] != expected_state):
+                if target_slot.confirmed != ('filled' if tracker.phase == 'unload' else 'empty'):
+                    continue
+                after_gap = (gap > tracker.lost_seconds and SLOT_STATES[obj['class_name']] == expected_state
+                             and np.linalg.norm(center-np.asarray(old_center)) > gate)
+                if after_gap:
+                    method = 'bytetrack_id_reused_after_gap'
+                elif tracker.phase == 'load' and self._supports_reused_load_id(
+                        track_id, old_slot-1, target, center, observations, identity, gate):
+                    method = 'bytetrack_id_reused_at_other_slot'
+                else:
                     continue
                 candidate = {'old_record': deepcopy(record), 'old_slot': old_slot,
                              'target_slot': target+1, 'last_seen': float(now),
-                             'first_seen': float(now), 'count': 0}
+                             'first_seen': float(now), 'count': 0, 'method': method}
                 self._reused_id_candidates[track_id] = candidate
 
             target = candidate['target_slot']-1
@@ -758,6 +788,11 @@ class RoiGroupSequence:
             source_seen = tracker.slots[old_slot].last_seen
             target_seen = tracker.slots[target].last_seen
             expected_state = 'empty' if tracker.phase == 'unload' else 'filled'
+            if candidate['method'] == 'bytetrack_id_reused_at_other_slot':
+                supported = self._supports_reused_load_id(track_id, old_slot, target, center,
+                                                          observations, identity, gate)
+            else:
+                supported = SLOT_STATES[obj['class_name']] == expected_state
             if (now-candidate['last_seen'] > .25
                     or self._distance(center) < 0
                     or np.linalg.norm(tracker.reference_points[target]-center) > gate
@@ -765,7 +800,7 @@ class RoiGroupSequence:
                     or source_seen is None or now-source_seen > .25
                     or tracker.slots[old_slot].confirmed != expected_state
                     or target_seen is not None and now-target_seen < .2
-                    or SLOT_STATES[obj['class_name']] != expected_state):
+                        or not supported):
                 self._reused_id_candidates.pop(track_id, None)
                 continue
             candidate['count'] += 1
@@ -773,11 +808,35 @@ class RoiGroupSequence:
             if candidate['count'] >= 3:
                 self.track_store.split_reused_id(
                     track_id, candidate['old_record'], candidate['target_slot'],
-                    now, candidate['first_seen'])
+                    now, candidate['first_seen'], method=candidate['method'])
                 self._reused_id_candidates.pop(track_id, None)
         for track_id in list(self._reused_id_candidates):
             if track_id not in seen or now-self._reused_id_candidates[track_id]['last_seen'] > .25:
                 self._reused_id_candidates.pop(track_id, None)
+
+    def _supports_reused_load_id(self, track_id, old_slot, target, center, observations, identity, gate):
+        tracker = self.tracker
+        replacement_id = tracker.byte_track_ids[old_slot]
+        target_id = tracker.byte_track_ids[target]
+        detection, replacement = observations.get(track_id), observations.get(replacement_id)
+        if (detection is None or replacement is None or replacement_id == track_id
+                or target_id in observations or self.track_store.owner(replacement_id) != identity
+                or replacement['class_name'] != 'wafer_slot_filled'
+                or tracker.slots[target].confirmed != 'empty'
+                or any(obj.get('detection_source', 'full_frame') != 'full_frame'
+                       for obj in (detection, replacement))):
+            return False
+        old_point = tracker.reference_points[old_slot]
+        distances = np.linalg.norm(tracker.reference_points-center, axis=1)
+        other_distance = np.min(np.delete(distances, target))
+        if (distances[target] > gate or other_distance-distances[target] < max(5., gate*.15)
+                or distances[old_slot] <= gate):
+            return False
+        box = np.asarray(replacement['xyxy'])
+        replacement_center = (box[:2]+box[2:])/2
+        return (self._distance(replacement_center) >= 0 and np.linalg.norm(replacement_center-old_point) <= gate
+                and not tracker._occluded(dict(replacement, center=replacement_center), self._hands)
+                and not tracker._occluded(dict(detection, center=center), self._hands))
 
     def _track_metadata(self, objects, result):
         records = self.track_store.visible_records(objects)
@@ -808,6 +867,9 @@ class RoiGroupSequence:
                          if g["phase"] == "unload" and g["group_id"] == tracker.group_id), None)
         if previous is None or previous["snapshot"].get("slot_numbering_status") == "provisional":
             return result
+        tracker._load_verified_empty_slots = {slot["slot_id"] for slot in previous["snapshot"]["slots"]
+            if slot["last_confirmed_state"] == "empty" and slot["last_confirmed_at"] is not None
+            and slot.get("confirmation_source") == "yolo"}
         new_events = list(result["new_events"])
         identity = (tracker.phase, tracker.group_id)
         transition_track_id = tracker.transition_load_track_id
@@ -914,6 +976,7 @@ class RoiGroupSequence:
             or self.tracker._spacing()*self.tracker.match_distance_ratio)
         formal_ids = {int(track_id) for track_id in self.tracker.byte_track_ids
                       if track_id is not None}
+        initial_unload_group = self.tracker.phase == "unload" and self.tracker.group_id == 1
         quarantine_active = (self.mapping_time is not None
                              and self.outside_mapping_quarantine_seconds > 0
                              and now - self.mapping_time < self.outside_mapping_quarantine_seconds)
@@ -931,6 +994,11 @@ class RoiGroupSequence:
             if distance >= 0 or (reference is not None and distance >= -self.buffer_px
                     and ((obj.get('track_id') is not None and obj.get('track_id') in self.tracker.byte_track_ids)
                          or np.min(np.linalg.norm(reference-center,axis=1)) <= gate)):
+                if (initial_unload_group
+                        and (self._g1_waiting_event or obj.get('track_id') not in formal_ids)
+                        and self._in_unload_entry_upper_right_band(center)):
+                    self._reject_track(obj, 'unload_entry_upper_right_band')
+                    continue
                 result.append(obj)
         return result
 

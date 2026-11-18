@@ -50,7 +50,8 @@ NEXT_GROUP_ENTRY_FRACTION = .6 # 沿EXIT_DIRECTION从入口到出口的前60%允
 UNLOAD_ENTRY_UPPER_RIGHT_MIN_X_RATIO = 500 / 640  # 右上窄带的起始横坐标占画面宽度的比例
 UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX = 12.0  # 640×480下沿ROI上边沿向内的距离，0关闭
 REJECT_TRANSITION_ROI_DETECTIONS = True # 换组时隔离有稳定旧组证据的未绑定ID，并启用短时空间隔离
-TRANSITION_QUARANTINE_MIN_FRAMES = 5 # 未绑定ID在旧组ROI内累计真实出现至少此帧数，才持续隔离
+TRANSITION_QUARANTINE_MIN_FRAMES = 9 # 未绑定ID在旧组ROI内累计真实出现至少此帧数，才持续隔离
+UNLOAD_TO_LOAD_QUARANTINE_MIN_FRAMES = 13 # 仅在下料G5切换到上料G1时用于未绑定ID
 OUTSIDE_MAPPING_QUARANTINE_SECONDS = 3.0 # 新组映射后短时间内，ROI外新ID不参与当前组判断
 SLOT2_BELOW_SLOT3 = True      # 左上S1、顺时针1→3→4→2，y辅助核验S2通常在S3下方；编号后不重排
 MACHINE_CENTER_NORMALIZED = (637 / 640, 266 / 480) # 机心点选坐标；四槽证据充分时最近点为S4，None关闭
@@ -78,9 +79,9 @@ IDENTITY_LOST_SECONDS = 1.2   # 连续无匹配超时，锁定为unknown，避�
 CONFLICT_CONF_MARGIN = .15    # 同位置空/满分数差小于该值时，输出unknown
 HAND_OVERLAP_RATIO = .2       # 手遮挡槽框达到此比例，或覆盖中心时，暂停该槽状态确认
 
-# S4手部接触补偿：只提供操作证据，由槽位状态机确认事件
-LOAD_HAND_CONTACT_ENABLED = True       # 仅S4的手接触可补足本工序的unknown空满变化
-# 以下接触门槛仅用于S4，上料和下料均适用，与MIN_CONFIRM_FRAMES的空满视觉确认门槛独立。
+# 缺失槽手部接触补偿：只提供操作证据，由槽位状态机确认事件
+LOAD_HAND_CONTACT_ENABLED = True       # 三点上料跟随唯一缺失槽，其余场景沿用S4补偿
+# 接触门槛与MIN_CONFIRM_FRAMES的空满视觉确认门槛独立。
 # 有效接触须先通过手框置信度、接触位置及歧义判定；未累计满2帧前中断会清零重计。
 # 连续2帧有效接触后仅进入待确认，手离开后优先用YOLO确认；持续漏检时按已有空满基准推断变化。
 LOAD_HAND_CONTACT_SECONDS = 0.0       # 单位：秒；0.0表示取消最低接触时长，仅检查下方连续帧数
