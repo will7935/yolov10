@@ -28,7 +28,8 @@ from industrial_inspection.tools.slot_detection_policy import DetectionThreshold
 from industrial_inspection.tools.slot_operation_alarms import group_operation_alarms
 from industrial_inspection.tools.slot_two_point_contact import LOAD_CONTACT_DOMINANCE_MARGIN
 from industrial_inspection.tools.slot_local_redetection import (
-    LocalRedetectionPolicy, recover_missing_slots as recover_local_observations)
+    LocalRedetectionPolicy, recover_load_preview_support, recover_load_reach_hand,
+    recover_missing_slots as recover_local_observations)
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
 from industrial_inspection.tools.slot_roi import draw_roi, pixel_polygon, load_roi, select_roi
 from industrial_inspection.tools.slot_byte_tracker import SlotByteTracker
@@ -79,10 +80,10 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频6", REGRESSION_DATASET_ROOT / "测试视频6" / "camera_B_20260924_024720.avi",
      base.DEFAULT_SLOT_ROI_FILE),
-    # ("测试视频7", REGRESSION_DATASET_ROOT / "测试视频7" / "camera_B_20260924_052446.avi",
-    #  base.DEFAULT_SLOT_ROI_FILE),
-    # ("测试视频8", REGRESSION_DATASET_ROOT / "测试视频8" / "camera_B_20260924_054543.avi",
-    #  base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频7", REGRESSION_DATASET_ROOT / "测试视频7" / "camera_B_20260924_052446.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频8", REGRESSION_DATASET_ROOT / "测试视频8" / "camera_B_20260924_054543.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频9", REGRESSION_DATASET_ROOT / "测试视频9" / "camera_B_20260924_060103.avi",
     #  base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
@@ -559,6 +560,8 @@ def overlay_status(frame,snapshot,show_text=True,inspection=None,
             continue
         point = (round(x),round(y))
         is_prediction = slot.get("position_is_prediction")
+        if is_prediction and snapshot.get("three_point_preview") is not None:
+            continue
         if display_state != "unknown":
             cv2.circle(frame,point,POINT_RADIUS+1,(0,0,0),-1,cv2.LINE_AA)
             cv2.circle(frame,point,POINT_RADIUS,color,-1,cv2.LINE_AA)
@@ -640,14 +643,18 @@ def draw_all_detection_boxes(frame, detections, snapshot, sequence):
     return frame
 
 
-def draw_predicted_slot_boxes(frame, slots, roi_contour, *, color=(0, 220, 255), label_prefix="S", absolute=False):
+def draw_predicted_slot_boxes(frame, slots, roi_contour, *, color=(0, 220, 255), label_prefix="S",
+                              absolute=False, preview=False):
     """Show geometry-backed virtual slot tracks as dashed boxes inside the ROI."""
     for slot in slots:
         box = slot.get("tracking_box_xyxy")
         center = slot.get("center_xy")
         if box is None or center is None or cv2.pointPolygonTest(roi_contour, tuple(center), False) < 0:
             continue
+        contact = slot.get("hand_contact") if preview else None
         box_color = (160, 160, 160) if slot.get("position_is_held") else color
+        if contact and (contact["pending"] or contact["accepted"]):
+            box_color = (220, 60, 220)
         x1, y1, x2, y2 = (int(round(value)) for value in box)
         for x in range(x1, x2, 12):
             cv2.line(frame, (x, y1), (min(x+6, x2), y1), box_color, 1, cv2.LINE_AA)
@@ -655,9 +662,21 @@ def draw_predicted_slot_boxes(frame, slots, roi_contour, *, color=(0, 220, 255),
         for y in range(y1, y2, 12):
             cv2.line(frame, (x1, y), (x1, min(y+6, y2)), box_color, 1, cv2.LINE_AA)
             cv2.line(frame, (x2, y), (x2, min(y+6, y2)), box_color, 1, cv2.LINE_AA)
-        number = slot.get('display_slot_id')
-        slot_label = (str(number) if number is not None else "pending") if absolute else (f"{label_prefix}{slot['slot_id']}" if label_prefix else "slot")
-        label = f"G{slot['group_id']}-{slot_label} PRED"
+        if preview:
+            label = f"G{slot['group_id']} 3PT PREVIEW"
+            if support_box := slot.get("local_support_box_xyxy"):
+                sx1, sy1, sx2, sy2 = map(round, support_box)
+                cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), (255, 185, 0), 1, cv2.LINE_AA)
+                label += " +LOCAL"
+            if contact and contact["pending"]:
+                label += " WAIT" if contact["released_at"] is not None else " TOUCH"
+            elif contact and contact["accepted"]:
+                label += " TOUCH?"
+            cv2.circle(frame, tuple(map(round, center)), POINT_RADIUS+2, (0, 255, 255), 1, cv2.LINE_AA)
+        else:
+            number = slot.get('display_slot_id')
+            slot_label = (str(number) if number is not None else "pending") if absolute else (f"{label_prefix}{slot['slot_id']}" if label_prefix else "slot")
+            label = f"G{slot['group_id']}-{slot_label} PRED"
         cv2.putText(frame, label, (x1, max(14, y1-4)), cv2.FONT_HERSHEY_SIMPLEX,
                     .38, box_color, 1, cv2.LINE_AA)
     return frame
@@ -672,7 +691,10 @@ def draw_two_point_hand_contacts(frame, contacts):
                  "waiting_visual": "WAIT", "ambiguous": "AMBIGUOUS",
                  "visual_confirmed": "VERIFIED", "visual_observed": "OBSERVED"}[contact["status"]]
         slot_id = contact["slot_id"]
-        text = "2PT" if slot_id is None else f"2PT S{slot_id}"
+        preview_id = contact.get("reference_slot_id")
+        text = "2PT" if preview_id is None else f"2PT ~S{preview_id}"
+        if slot_id is not None:
+            text = f"2PT S{slot_id}"
         if contact.get("held"):
             text += " HOLD"
         if not contact.get("held") or contact["status"] != "prediction":
@@ -689,12 +711,21 @@ def draw_two_point_hand_contacts(frame, contacts):
 def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_polygon=None):
     """接口兼容现有UI7V：roi_polygon参数携带ROI及视频信息。"""
     thresholds = resolve_detection_thresholds(args)
+    local_policy = LocalRedetectionPolicy(LOCAL_REDETECT_ENABLED, LOCAL_REDETECT_CROP_SIZE, LOCAL_REDETECT_IMAGE_SIZE)
     context = prepare_context(args) if roi_polygon is None else roi_polygon
     polygon = context["polygon"]
     def log(message):
         print(message,flush=True)
         if on_log is not None:
             on_log(message)
+
+    def find_load_preview_support(tracker, anchors, hands, candidates):
+        support, attempt = recover_load_preview_support(
+            model, frame, tracker, anchors, hands, [*candidates, *retired_raw],
+            sequence, args, thresholds, local_policy)
+        if attempt is not None:
+            local_attempts.append(attempt)
+        return support
     group_completion = {}
     logged_sequences = {}
     display_slot_numbering = {}
@@ -733,6 +764,11 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
     def log_sequence_updates(snapshot, now):
         changed = dict.fromkeys((event["phase"], event["group_id"])
                                for event in snapshot["new_events"] if event["expected_action"])
+        for event in snapshot["new_events"]:
+            if (event["phase"] == "load" and event["slot_id"] == 4
+                    and event.get("reason") == "visual_after_s4_contact_lookback"):
+                log(f"{event['reported_at']:.2f}s G{event['group_id']} S4 上料核验通过"
+                    f"（回填动作时间 {event['time_upper']:.2f}s）")
         for event in snapshot.get("new_group_events", ()):
             if event["type"] == "s4_inferred_load_cancelled":
                 changed[(event["phase"], event["group_id"])] = None
@@ -925,8 +961,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "load_hand_contact_config": {"enabled": LOAD_HAND_CONTACT_ENABLED,
             "contact_seconds": LOAD_HAND_CONTACT_SECONDS,
             "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,
-            "overlap_ratio": LOAD_HAND_CONTACT_OVERLAP_RATIO, "default_target_slot_id": 4,
-            "target_slot_ids": [1, 2, 3, 4], "follow_inferred_slot_during_load": True,
+            "overlap_ratio": LOAD_HAND_CONTACT_OVERLAP_RATIO, "unload_target_slot_id": 4,
+            "target_slot_ids": [1, 2, 3, 4], "load_target_policy": "inferred_at_formal_numbering",
             "competing_slot": {
                 "enabled": LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
                 "slot_id": LOAD_HAND_CONTACT_COMPETING_SLOT_ID,
@@ -939,9 +975,11 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             "yolo_state_has_priority": True,"infer_after_unknown_grace": True},
         "match_distance_ratio": MATCH_DISTANCE_RATIO,"identity_lost_seconds": IDENTITY_LOST_SECONDS,
         "local_redetection_config": {"enabled": LOCAL_REDETECT_ENABLED, "slot_ids": [4],
+            "load_scope": "third_support_for_provisional_three_point_preview",
             "crop_size_wh": list(LOCAL_REDETECT_CROP_SIZE),"imgsz": LOCAL_REDETECT_IMAGE_SIZE,
             "conf": thresholds.slot_state,"hand_conf": thresholds.hand,"match_distance": "same_as_slot_tracker"},
         "two_point_hand_contact_config": {"extension_multiplier": TWO_POINT_EXTENSION_MULTIPLIER,
+            "load_geometry": "roi_upper_edge_projection_with_clockwise_roles",
             "hold_seconds": TWO_POINT_HAND_HOLD_SECONDS,
             "hold_timeout_basis": "last_reliable_anchor_near_prediction",
             "hand_roi_policy": "center_inside_slot_roi",
@@ -1167,8 +1205,11 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         for item in tracked_raw if item["class_name"] in SLOT_STATES
                         and item.get("track_id") is None
                         and item["tracking_confidence"] >= thresholds.tracking_low]
+                    reach_hand = (recover_load_reach_hand(model, frame, tracked_raw, sequence, args, thresholds,
+                                                         local_policy) if enabled and local_policy.enabled else None)
                     snapshot = sequence.update(objects,timestamp,observations_enabled=enabled,
-                        s4_position_candidates=s4_position_candidates)
+                        s4_position_candidates=s4_position_candidates, entry_load_reach_hand=reach_hand,
+                        load_support_resolver=find_load_preview_support if local_policy.enabled else None)
                     inspection_processed += 1
                 else:
                     local_attempts = []
@@ -1361,11 +1402,15 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                                              if item["tracking_confidence"] >= thresholds.display
                                              and not sequence.is_retired_track(item.get('track_id'))]
                             draw_slot_tracks(plotted, display_slots, snapshot, sequence.contour)
-                    draw_predicted_slot_boxes(plotted,
-                        [slot for slot in snapshot.get("slots", []) if slot.get("position_is_prediction")],
-                        sequence.contour,
-                        label_prefix="S" if snapshot.get("slot_numbering_status") == "final" else None,
-                        absolute=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
+                    preview = snapshot.get("three_point_preview")
+                    if preview is not None:
+                        draw_predicted_slot_boxes(plotted, (preview,), sequence.contour, preview=True)
+                    else:
+                        draw_predicted_slot_boxes(plotted,
+                            [slot for slot in snapshot.get("slots", []) if slot.get("position_is_prediction")],
+                            sequence.contour,
+                            label_prefix="S" if snapshot.get("slot_numbering_status") == "final" else None,
+                            absolute=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
                     draw_two_point_hand_contacts(plotted, snapshot.get("two_point_hand_contacts", ()))
                     if DRAW_SLOT_ROI:
                         draw_roi(plotted,polygon)
@@ -1418,6 +1463,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         "continuous_sequence": snapshot["continuous_sequence"],
                         "new_alarms": snapshot["new_alarms"],
                         "s4_load_contact_review": snapshot.get("s4_load_contact_review"),
+                        "three_point_preview": snapshot.get("three_point_preview"),
                         "track_states": snapshot.get('track_states', []),
                         "inspection": inspection.snapshot() if inspection is not None else None})
                 if inspection is not None and inspection.closed_at is not None:

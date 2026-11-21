@@ -80,7 +80,7 @@ CONFLICT_CONF_MARGIN = .15    # 同位置空/满分数差小于该值时，输�
 HAND_OVERLAP_RATIO = .2       # 手遮挡槽框达到此比例，或覆盖中心时，暂停该槽状态确认
 
 # 缺失槽手部接触补偿：只提供操作证据，由槽位状态机确认事件
-LOAD_HAND_CONTACT_ENABLED = True       # 三点上料跟随唯一缺失槽，其余场景沿用S4补偿
+LOAD_HAND_CONTACT_ENABLED = True       # 上料接触仅用于正式编号时由三点推算出的槽，下料沿用S4补偿
 # 接触门槛与MIN_CONFIRM_FRAMES的空满视觉确认门槛独立。
 # 有效接触须先通过手框置信度、接触位置及歧义判定；未累计满2帧前中断会清零重计。
 # 连续2帧有效接触后仅进入待确认，手离开后优先用YOLO确认；持续漏检时按已有空满基准推断变化。
@@ -100,10 +100,10 @@ ROI_TRACKING_MARGIN_PX = 40   # 已编号槽的ROI外跟踪距离
 ROI_EDGE_EVIDENCE_PX = 8.0   # 640×480下的ROI外视觉取证距离，0表示关闭
 
 # 局部补检：只补观测，不修改身份和工艺结论
-LOCAL_REDETECT_ENABLED = True # 下料阶段正式 S4 被整图漏检时，用同一模型局部补检
+LOCAL_REDETECT_ENABLED = True # 补检下料正式 S4，以及上料编号前的第三个预览支撑槽
 LOCAL_REDETECT_CROP_SIZE = (180, 140) # 原图裁剪宽、高（像素），保留槽周围背景
 LOCAL_REDETECT_IMAGE_SIZE = 320 # 局部图送入YOLO时的尺寸；分别沿用槽位/手部证据门槛
-TWO_POINT_EXTENSION_MULTIPLIER = 1.8 # 两点手接触预测向右延伸：中心到框边距离的均值乘此倍率；0关闭
+TWO_POINT_EXTENSION_MULTIPLIER = 1.5 # 双槽预测沿ROI上边向右外推，0关闭
 TWO_POINT_HAND_HOLD_SECONDS = .8     # 旧框等待新位置时可沿用；定位槽连续失联多久后清除，0关闭沿用
 ROTATION_INTERVALS = []       # 可选源视频秒数[(开始,结束),...]；期间跟踪位置、暂停空满确认
 SHOW_SLOT_TEXT = True         # 正式编号后在点旁标注S1-S4；初始化阶段在ByteTrack框上标状态

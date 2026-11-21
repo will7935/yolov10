@@ -80,6 +80,7 @@ class GroupSequenceTests(unittest.TestCase):
         self.assertEqual(sequence.tracker.phase, 'load')
         np.testing.assert_array_equal(sequence.tracker.s4_hand_region, region)
         sequence.tracker.reset_group(5, phase='load', centers=POINTS)
+        sequence.tracker.initialization['inferred_slot_ids'] = [4]
         sequence.tracker.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
                                  for j,i in enumerate((2,1,3))]
         hand = {'class_name':'hand', 'confidence':.9, 'xyxy':[255,185,280,195]}
@@ -120,6 +121,35 @@ class GroupSequenceTests(unittest.TestCase):
             self.step(sequence, initial[:2]+[filled_s3, replacement])
         sequence_events = [(event['slot_id'], event['action']) for event in tracker.events]
         self.assertEqual(sequence_events, [(4, 'load'), (3, 'load')])
+
+    def test_load_recovers_crossed_binding_before_confirming_either_slot(self):
+        tracker = SlotGroupTracker(POINTS, phase='load', confirm_seconds=0., minimum_frames=4)
+        sequence = RoiGroupSequence(tracker, ROI, reidentification_enabled=True)
+        initial = [dict(box, track_id=10+i) for i, box in enumerate(boxes())]
+        for _ in range(4):
+            self.step(sequence, initial)
+        self.assertEqual(tracker.byte_track_ids, [10, 11, 12, 13])
+
+        jumped = dict(initial[0], track_id=12, class_name='wafer_slot_filled')
+        replacement = dict(initial[2], track_id=20)
+        anchors = [initial[1], initial[3]]
+        self.step(sequence, [jumped, *anchors])
+        np.testing.assert_array_equal(tracker.reference_points[2], POINTS[2])
+        self.step(sequence, [jumped, replacement, *anchors])
+        self.assertEqual(tracker.byte_track_ids, [10, 11, 12, 13])
+        self.assertFalse(tracker.events)
+        self.step(sequence, [jumped, replacement, *anchors])
+        self.assertEqual(tracker.byte_track_ids, [12, 11, 20, 13])
+        self.assertEqual(tracker.slots[2].confirmed, 'empty')
+        self.assertEqual(sequence.track_store.archived_segments[12][0]['slot_id'], 3)
+
+        for _ in range(4):
+            self.step(sequence, [jumped, replacement, *anchors])
+        replacement = dict(replacement, class_name='wafer_slot_filled')
+        for _ in range(4):
+            self.step(sequence, [jumped, replacement, *anchors])
+        self.assertEqual([(e['slot_id'], e['byte_track_id'], e['action']) for e in tracker.events],
+                         [(1, 12, 'load'), (3, 20, 'load')])
 
     def test_load_hand_contact_without_filled_stays_unconfirmed_at_end(self):
         tracker = SlotGroupTracker(POINTS,phase='load',confirm_seconds=.1,minimum_frames=2,

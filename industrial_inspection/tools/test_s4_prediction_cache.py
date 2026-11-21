@@ -9,6 +9,96 @@ from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
 from industrial_inspection.tools.test_slot_group_tracker import CENTERS, detection
 
 
+class ThreePointPreviewTests(unittest.TestCase):
+    def test_preview_starts_before_stability_in_both_phases(self):
+        points = np.array([[100,100], [100,200], [200,100], [200,200]])
+        roi = np.float32([[0,0], [300,0], [300,300], [0,300]])
+        for phase in ("unload", "load"):
+            for incremental in (False, True):
+                with self.subTest(phase=phase, incremental=incremental):
+                    tracker = SlotGroupTracker(group_id=2, phase=phase,
+                        allow_three_point_initialization=True, initialization_frames=3,
+                        geometry_initialization_seconds=.3, slot2_below_slot3=True)
+                    if incremental:
+                        tracker.start_incremental_entry(40)
+                    state = "filled" if phase == "unload" else "empty"
+                    support = [detection(i, state, points, track_id=10+i) for i in (1, 2, 3)]
+                    fourth = detection(4, state, points, track_id=14)
+                    snapshot = tracker.update(support, 0., roi_contour=roi)
+                    self.assertEqual(snapshot["slot_numbering_status"], "provisional")
+                    self.assertEqual(snapshot["three_point_preview"]["center_xy"], [200., 200.])
+                    self.assertEqual(snapshot["three_point_preview"]["support_byte_track_ids"], [11, 12, 13])
+                    self.assertEqual("hand_contact" in snapshot["three_point_preview"], phase == "load")
+                    self.assertEqual(snapshot["new_events"], [])
+                    moved = [detection(i, state, points+[12, 4], track_id=10+i) for i in (1, 2, 3)]
+                    snapshot = tracker.update(moved, .05, roi_contour=roi)
+                    self.assertEqual(snapshot["three_point_preview"]["center_xy"], [212., 204.])
+                    hand = {"class_name": "hand", "confidence": .95, "xyxy": [95, 90, 125, 115]}
+                    snapshot = tracker.update([*moved, hand], .1, roi_contour=roi)
+                    self.assertIsNone(snapshot["three_point_preview"])
+                    snapshot = tracker.update(support[:2], .15, roi_contour=roi)
+                    self.assertIsNone(snapshot["three_point_preview"])
+                    snapshot = tracker.update([*support, fourth], .2, roi_contour=roi)
+                    self.assertIsNone(snapshot["three_point_preview"])
+
+    def test_live_load_preview_contact_waits_for_formal_slot_and_yolo_fill(self):
+        points = np.array([[100,100], [100,200], [200,100], [200,200]])
+        roi = np.float32([[0,0], [300,0], [300,300], [0,300]])
+        unload = SlotGroupTracker(points, group_id=2, allow_three_point_initialization=True,
+            confirm_seconds=0., minimum_frames=2, load_hand_contact_seconds=0., slot2_below_slot3=True)
+        sequence = RoiGroupSequence(unload, roi, entry_seconds=.3, use_previous_s4_layouts=True)
+        for slot in unload.slots:
+            slot.state = slot.confirmed = "empty"
+            slot.confirmation_source = "yolo"
+            slot.evidence_time = .1
+        sequence.closed_groups.append({"phase": "unload", "group_id": 2, "snapshot": unload.snapshot()})
+        sequence._unload_layouts[2] = [points]
+        sequence.tracker = sequence._new_tracker(2, entry=True, phase="load")
+        sequence.tracker.start_incremental_entry(40)
+        sequence.state = "entering"
+        support = [detection(i, "empty", points, track_id=10+i) for i in (1, 2, 3)]
+        hand = {"class_name": "hand", "xyxy": [188, 188, 212, 212], "confidence": .95}
+
+        result = sequence.update([*support, hand], 1.)
+        self.assertTrue(result["three_point_preview"]["hand_contact"]["accepted"])
+        self.assertFalse(result["three_point_preview"]["hand_contact"]["pending"])
+        result = sequence.update([*support, hand], 1.1)
+        self.assertTrue(result["three_point_preview"]["hand_contact"]["pending"])
+        self.assertEqual(result["new_events"], [])
+        result = sequence.update(support, 1.2)
+        self.assertEqual(result["three_point_preview"]["hand_contact"]["released_at"], 1.2)
+        result = sequence.update(support, 1.3)
+        self.assertEqual(result["initialization"]["inferred_slot_ids"], [4])
+        self.assertIsNotNone(result["slots"][3]["prediction_contact"])
+        self.assertEqual(result["new_events"], [])
+        for now in (1.4, 1.5, 1.6):
+            self.assertEqual(sequence.update(support, now)["new_events"], [])
+        filled = detection(4, "filled", points, track_id=14)
+        for now in (1.7, 1.8, 1.9, 2.):
+            sequence.update([*support, filled], now)
+        event, = sequence.all_events
+        self.assertEqual(event["reason"], "visual_after_three_point_preview_contact")
+        self.assertEqual((event["slot_id"], event["time_upper"], event["visual_time_upper"]), (4, 1.2, 1.7))
+        self.assertFalse(event.get("inferred"))
+
+    def test_load_preview_contact_rejects_changed_anchor_at_numbering(self):
+        points = np.array([[100,100], [100,200], [200,100], [200,200]], dtype=float)
+        tracker = SlotGroupTracker(points, phase="load", load_hand_contact_seconds=0.)
+        tracker.initialization["inferred_slot_ids"] = [4]
+        tracker._load_verified_empty_slots = {4}
+        target = tracker.slots[3]
+        target.confirmed, target.evidence_time = "empty", .1
+        support = (11, 12, 13)
+        hand = {"class_name": "hand", "xyxy": [188, 188, 212, 212], "confidence": .95}
+        for now in (1., 1.1):
+            tracker.last_time = now
+            result = tracker._observe_load_preview_contact(support, points, [(30,30)]*4, [hand], None)
+        self.assertTrue(result["pending"])
+        tracker.byte_track_ids = [11, 12, 14, None]
+        self.assertFalse(tracker.adopt_entry_load_preview_contact(1.2))
+        self.assertIsNone(target.prediction_contact)
+
+
 class EntryS4ContactTests(unittest.TestCase):
     centers = CENTERS[[0, 2, 1, 3]]
     roi = np.float32([[0, 0], [300, 0], [300, 300], [0, 300]])
@@ -540,6 +630,7 @@ class S4PositionRecoveryTests(unittest.TestCase):
             minimum_frames=2, load_hand_contact_seconds=.05, load_hand_contact_min_frames=2,
             s4_hand_region=np.float32([[175, 175], [225, 175], [225, 225], [175, 225]]))
         tracker._load_numbering_reference = CENTERS.copy()
+        tracker.initialization['inferred_slot_ids'] = [2]
         tracker.slots[1].geometry_inferred = True
         support = [detection(i, 'empty', track_id=i) for i in (1, 3, 4)]
         s2_hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [184, 81, 196, 98]}
@@ -561,10 +652,13 @@ class S4PositionRecoveryTests(unittest.TestCase):
         self.assertTrue(result['slots'][1]['load_contact_pending'])
         self.assertEqual(result['s4_contact_diagnostic']['target_slot_id'], 2)
         self.assertEqual(result['s4_contact_diagnostic']['source'], 'predicted_slot_box')
+        self.assertTrue(result['s4_contact_diagnostic']['visual_confirmation_required'])
         self.assertEqual(result['slots'][1]['temporary_contact_box_xyxy'], [180., 80., 220., 120.])
 
-        tracker.update(support, .4)
-        result = tracker.update(support, .9)
+        result = tracker.update(support+[s2_hand], .4)
+        self.assertFalse(result['s4_contact_diagnostic']['visual_confirmation_required'])
+        tracker.update(support, .45)
+        result = tracker.update(support, .95)
         event, = result['new_events']
         self.assertEqual((event['slot_id'], event['action'], event['reason']),
                          (2, 'load', 'hand_contact_inferred_load'))
@@ -587,10 +681,16 @@ class S4PositionRecoveryTests(unittest.TestCase):
             self.assertEqual(slot['tracking_box_xyxy'], slot['temporary_contact_box_xyxy'])
 
     def test_load_resumes_prediction_when_an_observed_slot_goes_missing(self):
+        for inferred_slot_id in (2, 4):
+            with self.subTest(inferred_slot_id=inferred_slot_id):
+                self.check_load_prediction_after_binding(inferred_slot_id)
+
+    def check_load_prediction_after_binding(self, inferred_slot_id):
         tracker = SlotGroupTracker(CENTERS, phase='load', s4_contact_prediction_seconds=.8,
             confirm_seconds=0., minimum_frames=2, load_hand_contact_seconds=0.)
         tracker._load_numbering_reference = CENTERS.copy()
         tracker._load_verified_empty_slots = {2}
+        tracker.initialization['inferred_slot_ids'] = [inferred_slot_id]
         all_slots = [detection(i, 'empty', track_id=i) for i in range(1, 5)]
         for now in (0., .05):
             slot = tracker.update(all_slots, now)['slots'][1]
@@ -612,8 +712,11 @@ class S4PositionRecoveryTests(unittest.TestCase):
         hand = {'class_name': 'hand', 'confidence': .95, 'xyxy': [193, 89, 223, 119]}
         for now in (.25, .3):
             result = tracker.update(support+[hand], now)
-        self.assertEqual(result['s4_contact_diagnostic']['target_slot_id'], 2)
-        self.assertTrue(result['slots'][1]['prediction_contact']['pending'])
+        if inferred_slot_id == 2:
+            self.assertEqual(result['s4_contact_diagnostic']['target_slot_id'], 2)
+            self.assertTrue(result['slots'][1]['prediction_contact']['pending'])
+        else:
+            self.assertIsNone(result['slots'][1]['prediction_contact'])
         self.assertFalse(result['slots'][1]['load_contact_pending'])
         tracker.update(support, .35)
         expired = tracker.update(support, 1.)['slots'][1]
@@ -630,8 +733,13 @@ class S4PositionRecoveryTests(unittest.TestCase):
         self.assertEqual(observed['byte_track_id'], 2)
         self.assertIsNone(observed['temporary_contact_box_xyxy'])
         event, = result['new_events']
-        self.assertEqual((event['slot_id'], event['reason']), (2, 'visual_after_prediction_contact'))
-        self.assertEqual((event['time_upper'], event['visual_time_upper']), (.35, 1.05))
+        self.assertEqual(event['slot_id'], 2)
+        if inferred_slot_id == 2:
+            self.assertEqual(event['reason'], 'visual_after_prediction_contact')
+            self.assertEqual((event['time_upper'], event['visual_time_upper']), (.35, 1.05))
+        else:
+            self.assertEqual(event['time_upper'], 1.05)
+            self.assertNotIn('hand_contact_frames', event)
 
     def test_real_s4_takes_priority_over_gray_box(self):
         for now in (0., .05, .1):
@@ -696,9 +804,26 @@ class S4MeasuredLayoutTests(unittest.TestCase):
         tracker = SlotGroupTracker(phase='load', slot2_below_slot3=True,
             machine_center=(637, 266), initialization_seconds=.05, initialization_frames=2,
             allow_three_point_initialization=True)
-        tracker._load_numbering_reference = self.layout.copy()
-        tracker.start_incremental_entry(40)
         load = np.array([[463, 308], [573, 331], [434, 244], [547, 270]], dtype=float)
+        tracker._load_numbering_reference = load*[.88, 1.08]-[14., 45.]
+        tracker.start_incremental_entry(40)
+        visible = [detection(i, 'empty', centers=load, track_id=i+100) for i in (1, 3, 4)]
+        for now in (0., .05, .1, .15, .2, .25, .3):
+            result = tracker.update(visible, now)
+        self.assertEqual(result['slot_numbering_status'], 'final')
+        self.assertEqual(result['initialization']['inferred_slot_ids'], [2])
+        self.assertEqual(result['initialization']['machine_center_numbering']['status'],
+                         'matched_unload_layout')
+        self.assertEqual([s['byte_track_id'] for s in result['slots']], [101, None, 103, 104])
+
+    def test_load_keeps_supported_machine_anchor_when_image_edge_directions_change(self):
+        tracker = SlotGroupTracker(phase='load', slot2_below_slot3=True,
+            machine_center=(637, 266), initialization_seconds=.05, initialization_frames=2,
+            allow_three_point_initialization=True)
+        tracker._load_numbering_reference = np.array(
+            [[382.78, 220.09], [503.20, 272.08], [425.48, 194.56], [529.05, 236.84]])
+        load = np.array([[508.99, 339.24], [613.06, 356.72], [462.44, 271.34], [565.96, 287.49]])
+        tracker.start_incremental_entry(40)
         visible = [detection(i, 'empty', centers=load, track_id=i+100) for i in (1, 3, 4)]
         for now in (0., .05, .1, .15, .2, .25, .3):
             result = tracker.update(visible, now)

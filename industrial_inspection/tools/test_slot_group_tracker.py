@@ -26,8 +26,11 @@ def detection(index,state="empty",centers=CENTERS,score=.9,track_id=None):
     return result
 
 
-def tracker(**kwargs):
-    return SlotGroupTracker(CENTERS,confirm_seconds=.1,minimum_frames=2,**kwargs)
+def tracker(*, inferred_s4=False, **kwargs):
+    result = SlotGroupTracker(CENTERS,confirm_seconds=.1,minimum_frames=2,**kwargs)
+    if inferred_s4:
+        result.initialization['inferred_slot_ids'] = [4]
+    return result
 
 
 def g5_recovered_load_events():
@@ -371,7 +374,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(t.order_result(),'pending')
 
     def test_recovered_g5_order_allows_region_contact_to_detect_s4_load(self):
-        t=tracker(phase='load',load_hand_contact_seconds=.15,load_hand_contact_min_frames=3)
+        t=tracker(inferred_s4=True, phase='load',load_hand_contact_seconds=.15,load_hand_contact_min_frames=3)
         other_slots=[detection(i,'filled') for i in (1,2,3)]
         for now in (161.,161.1):
             t.update(other_slots+[detection(4,'empty')],now)
@@ -394,7 +397,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(result['order_result'],'pass')
 
     def test_empty_to_unknown_after_contact_infers_hidden_s4_load(self):
-        t=tracker(phase='load',load_hand_contact_seconds=.15)
+        t=tracker(inferred_s4=True, phase='load',load_hand_contact_seconds=.15)
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
         full=[detection(i,'empty') for i in range(1,5)]
         for now in (0.,.1):
@@ -410,7 +413,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(result['slots'][3]['last_confirmed_state'],'filled')
 
     def test_load_hand_contact_prefers_later_filled_detection(self):
-        t=tracker(phase='load',load_hand_contact_seconds=.15)
+        t=tracker(inferred_s4=True, phase='load',load_hand_contact_seconds=.15)
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
         for now in (0.,.1):
             t.update([detection(i,'empty') for i in range(1,5)],now)
@@ -423,7 +426,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(result['slots'][3]['last_confirmed_state'],'filled')
 
     def test_unknown_slot_contact_then_filled_infers_load(self):
-        t=tracker(phase='load')
+        t=tracker(inferred_s4=True, phase='load')
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
         for now in (0.,.1,.2):
             t.update([detection(i) for i in (1,2,3)]+[hand],now)
@@ -472,7 +475,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(result['new_events'][0]['reason'],'hand_contact_inferred_unload')
 
     def test_empty_to_unknown_after_hand_contact_infers_load(self):
-        t=tracker(phase='load')
+        t=tracker(inferred_s4=True, phase='load')
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
         for now in (0.,.1):
             t.update([detection(4,'empty')],now)
@@ -489,7 +492,7 @@ class TrackingTests(unittest.TestCase):
         cases=(('unload','empty','filled','load'),('load','filled','empty','unload'))
         for phase,prior,target,action in cases:
             with self.subTest(phase=phase,prior=prior):
-                t=tracker(phase=phase)
+                t=tracker(phase=phase, inferred_s4=(phase == 'load'))
                 hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
                 for now in (0.,.1):
                     t.update([detection(4,prior)],now)
@@ -555,7 +558,7 @@ class TrackingTests(unittest.TestCase):
         self.assertIsNone(result['slots'][3]['load_contact_released_at'])
 
     def test_s2_dominant_hand_overlap_suppresses_s4_contact(self):
-        t=tracker(phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
+        t=tracker(inferred_s4=True, phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
                   load_hand_contact_competing_margin=.10,
                   load_hand_contact_competing_ratio=2.0)
         full=[detection(i,'empty') for i in range(1,5)]
@@ -569,7 +572,7 @@ class TrackingTests(unittest.TestCase):
         self.assertFalse(result['slots'][3]['load_contact_pending'])
 
     def test_s4_center_coverage_overrides_competing_overlap(self):
-        t=tracker(phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
+        t=tracker(inferred_s4=True, phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
                   load_hand_contact_competing_margin=.10,
                   load_hand_contact_competing_ratio=2.0)
         full=[detection(i,'empty') for i in range(1,5)]
@@ -598,14 +601,14 @@ class TrackingTests(unittest.TestCase):
                             for e in events))
 
     def test_original_retained_box_size_remains_usable(self):
-        t=tracker(phase='load')
+        t=tracker(inferred_s4=True, phase='load')
         t.slots[3].geometry_inferred=True
         t.slots[3].box_size_wh=(40.,40.)
         hand={'class_name':'hand','confidence':.95,'xyxy':[180,180,193,198]}
         self.assertTrue(t._hand_contact(3,[hand]))
 
     def test_region_candidate_cannot_suppress_original_center_contact(self):
-        t=tracker(phase='load')
+        t=tracker(inferred_s4=True, phase='load')
         t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
         t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
                   for j,i in enumerate((2,1,3))]
@@ -616,7 +619,7 @@ class TrackingTests(unittest.TestCase):
         self.assertTrue(t._hand_contact(3,[center,region]))
 
     def test_enabling_region_never_rejects_an_original_contact(self):
-        t=tracker(phase='load')
+        t=tracker(inferred_s4=True, phase='load')
         t.update([detection(i,'empty') for i in range(1,5)], 0.)
         t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
                   for j,i in enumerate((2,1,3))]
@@ -635,7 +638,7 @@ class TrackingTests(unittest.TestCase):
             self.assertFalse(original and not t._hand_contact(3,hands))
 
     def test_high_confidence_s2_hand_wins_over_lower_confidence_s4_hand(self):
-        t=tracker(phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
+        t=tracker(inferred_s4=True, phase='load',load_hand_contact_seconds=0.,load_hand_contact_min_frames=1,
                   load_hand_contact_competing_margin=.10,
                   load_hand_contact_competing_ratio=2.0)
         full=[detection(i,'empty') for i in range(1,5)]
@@ -649,7 +652,7 @@ class TrackingTests(unittest.TestCase):
         self.assertFalse(t._hand_contact(3,[high_s2,low_s4]))
 
     def test_s4_hand_region_contact_and_competing_slot(self):
-        t=tracker(phase='load', load_hand_contact_seconds=0., load_hand_contact_min_frames=1)
+        t=tracker(inferred_s4=True, phase='load', load_hand_contact_seconds=0., load_hand_contact_min_frames=1)
         t.update([detection(i,'empty') for i in range(1,5)],0.)
         t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
         region_hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[290,185,320,195]}
@@ -666,7 +669,7 @@ class TrackingTests(unittest.TestCase):
         self.assertFalse(t._hand_contact(3,[s2_hand]))
 
     def test_s4_region_requires_unambiguous_formal_order(self):
-        t=tracker(phase='load')
+        t=tracker(inferred_s4=True, phase='load')
         t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
         hand={'class_name':'hand','confidence':.9,'xyxy':[300,185,320,195]}
         t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
@@ -681,7 +684,7 @@ class TrackingTests(unittest.TestCase):
         self.assertFalse(t._s4_region_expected())
 
     def test_s4_region_can_be_expected_before_final_slot(self):
-        t=tracker(phase='load', clockwise=(2,1,4,3))
+        t=tracker(inferred_s4=True, phase='load', clockwise=(2,1,4,3))
         t.s4_hand_region=np.asarray([[300,180],[350,180],[350,220],[300,220]], dtype=np.float32)
         hand={'class_name':'hand','confidence':.9,'xyxy':[300,185,320,195]}
         t.events=[{'slot_id':i,'expected_action':True,'time_lower':j,'time_upper':j+.1}
@@ -735,7 +738,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(t.events,[])
 
     def test_short_load_hand_pass_does_not_fill_slot(self):
-        t=tracker(phase='load',load_hand_contact_seconds=.15)
+        t=tracker(inferred_s4=True, phase='load',load_hand_contact_seconds=.15)
         hand={'class_name':'hand','class_id':0,'confidence':.9,'xyxy':[185,185,215,215]}
         for now in (0.,.1):
             t.update([detection(i,'empty') for i in range(1,5)],now)

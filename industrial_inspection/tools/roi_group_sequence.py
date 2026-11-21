@@ -167,6 +167,8 @@ class RoiGroupSequence:
         self._outside_mapping_quarantine_track_ids = set()
         self._outside_mapping_quarantine_group = (tracker.phase, tracker.group_id)
         self._reused_id_candidates = {}
+        self._load_rebind_pose = None
+        self._pending_load_rebind = None
         self.use_previous_s4_layouts = bool(use_previous_s4_layouts)
         self._unload_layouts = {}
         self._layout_samples = deque(maxlen=3)
@@ -703,6 +705,79 @@ class RoiGroupSequence:
         for obj in tracker.geometry_rejected:
             self._reject_track(obj, obj['reason'])
 
+    def _recover_crossed_load_binding(self, objects, now):
+        """Hold a jumping ID until a second track confirms both physical positions."""
+        tracker = self.tracker
+        pending, self._pending_load_rebind = self._pending_load_rebind, None
+        pose = self._load_rebind_pose
+        if (pose is None or now-pose[0] > .5 or self.state != "active"
+                or not self.track_store.reidentification_enabled or tracker.identity_lost
+                or (tracker.phase, tracker.group_id) != pose[1]):
+            return objects
+        _, identity, points, support = pose
+        gate = min(self.entry_match_distance_px, self.track_store.reidentification_max_distance_px)
+        bound_ids = tracker.byte_track_ids
+        detected_ids = {obj["track_id"] for obj in objects
+                        if obj["class_name"] in SLOT_STATES and obj.get("track_id") is not None}
+        observations = {}
+        for obj in tracker._candidates(objects):
+            track_id = obj.get("track_id")
+            if (track_id is not None and not obj["conflict"]
+                    and obj.get("detection_source", "full_frame") == "full_frame"
+                    and self._distance(obj["center"]) >= self.margin
+                    and track_id not in self._outside_mapping_quarantine_track_ids
+                    and track_id not in self._transition_quarantine_track_ids
+                    and not tracker._occluded(obj, self._hands)):
+                observations[track_id] = None if track_id in observations else obj
+        visible = {i: observations[track_id] for i, track_id in enumerate(bound_ids)
+                   if observations.get(track_id) is not None}
+        jumps = []
+        for old in support:
+            track_id = bound_ids[old]
+            if old not in visible or self.track_store.owner(track_id) != identity:
+                continue
+            obj = visible[old]
+            distances = np.linalg.norm(points-obj["center"], axis=1)
+            nearest = np.argsort(distances)
+            target = int(nearest[0])
+            if (target == old or target not in support or bound_ids[target] in detected_ids
+                    or distances[old] <= gate or distances[target] > gate
+                    or distances[nearest[1]]-distances[target] < gate*.15
+                    or any(tracker.slots[i].pending_visual_event is not None for i in (old, target))):
+                continue
+            anchors = [np.linalg.norm(points[i]-other["center"])
+                       for i, other in visible.items() if i != old]
+            if anchors and max(anchors) <= gate*.3:
+                jumps.append((old, target, obj))
+        if len(jumps) != 1:
+            return objects
+        old, target, obj = jumps[0]
+        track_id = obj["track_id"]
+        replacements = []
+        for new_id, candidate in observations.items():
+            record = self.track_store.tracks.get(new_id)
+            if (candidate is None or new_id in bound_ids or self.is_retired_track(new_id)
+                    or (record is not None and (record["owner"] not in (None, identity)
+                                                or record["slot_id"] is not None))):
+                continue
+            distances = np.linalg.norm(points-candidate["center"], axis=1)
+            if (distances[old] <= gate*.5
+                    and np.min(np.delete(distances, old))-distances[old] >= gate*.15):
+                replacements.append(new_id)
+        if len(replacements) == 1:
+            new_id, = replacements
+            pair = (old, target, track_id, new_id)
+            if pending is not None and pair == pending[0] and now-pending[1] <= .25:
+                self.track_store.split_reused_id(track_id, self.track_store.tracks[track_id],
+                    target+1, now, pending[1], method="crossed_load_slot_binding")
+                bound_ids[old], bound_ids[target] = new_id, track_id
+                return objects
+            self._pending_load_rebind = (pair, now)
+        held_ids = {track_id, *replacements}
+        for held_id in held_ids:
+            self._reject_track(observations[held_id], "crossed_load_binding_pending")
+        return [item for item in objects if item.get("track_id") not in held_ids]
+
     def _split_reused_track_ids(self, objects, now):
         """Split a reused BT ID after its old and new slot are unambiguous."""
         tracker = self.tracker
@@ -928,23 +1003,36 @@ class RoiGroupSequence:
                     "recovered_before_initialization":True,"reason":"detected_after_unload_baseline"}
                 tracker.events.append(event)
                 new_events.append(event)
+        preview_contact = tracker.adopt_entry_load_preview_contact(now)
         contact_tracker = tracker.two_point_hand_contact
-        baseline = previous["snapshot"]["slots"][3]
-        slot = tracker.slots[3]
-        if (tracker.transition_load_track_id is not None and slot.geometry_inferred
-                and baseline["last_confirmed_state"] == "empty" and baseline.get("confirmation_source") == "yolo"
-                and baseline["last_confirmed_at"] is not None and slot.confirmed == "empty"):
-            tracker.s4_load_contact_lookback = self._s4_load_lookback.resolve(
-                tracker, now, baseline["last_confirmed_at"])
-        if (contact_tracker is not None and tracker.load_hand_contact_enabled
-                and baseline["last_confirmed_state"] == "empty" and baseline.get("confirmation_source") == "yolo"
-                and baseline["last_confirmed_at"] is not None and slot.confirmed == "empty"
-                and slot.pending_visual_event is None and not any(e["slot_id"] == 4 for e in tracker.events)):
-            contact = contact_tracker.take_s4_load(tracker, baseline["last_confirmed_at"], now)
-            if contact is not None and (slot.confirmation_source == "previous_unload_yolo"
-                    or slot.evidence_time < contact.released_at):
-                event = tracker.infer_entry_s4_load(contact, now)
-                new_events.append(event)
+        inferred_index = tracker.inferred_load_contact_index()
+        if not preview_contact and inferred_index is not None and inferred_index+1 in tracker._load_verified_empty_slots:
+            slot = tracker.slots[inferred_index]
+            empty_at = previous["snapshot"]["slots"][inferred_index]["last_confirmed_at"]
+            if slot.confirmed == "empty":
+                if (inferred_index == 3 and (tracker.transition_load_track_id is not None
+                                             or tracker._load_numbering_reference is not None)):
+                    tracker.s4_load_contact_lookback = self._s4_load_lookback.resolve(
+                        tracker, now, empty_at, require_bound_visual=tracker.transition_load_track_id is None)
+                if (contact_tracker is not None and slot.pending_visual_event is None
+                        and not any(e["slot_id"] == slot.slot_id for e in tracker.events)):
+                    contact = contact_tracker.take_inferred_load(tracker, inferred_index, empty_at, now)
+                    if contact is not None and slot.evidence_time is not None:
+                        if contact.requires_visual_load:
+                            if slot.evidence_time <= contact.since:
+                                tracker.review_entry_two_point_load(slot, contact)
+                                tracker.s4_load_contact_lookback = None
+                        elif (slot.confirmation_source == "previous_unload_yolo"
+                              or slot.evidence_time < contact.released_at):
+                            new_events.append(tracker.infer_entry_s4_load(contact, now))
+        s4 = tracker.slots[3]
+        if (not preview_contact and tracker._region_formal_numbering and 4 in tracker._load_verified_empty_slots
+                and s4.confirmed == "empty" and s4.evidence_time is not None
+                and s4.prediction_contact is None and s4.pending_visual_event is None
+                and tracker.s4_load_contact_lookback is None
+                and not any(e["slot_id"] == 4 and e["action"] == "load" for e in tracker.events)):
+            tracker.s4_load_contact_lookback = self._s4_load_lookback.resolve_reach(
+                tracker, now, s4.evidence_time)
         return {**tracker.snapshot(),"new_events":new_events}
 
     def _arm(self, now):
@@ -1624,7 +1712,7 @@ class RoiGroupSequence:
         tracker.events.append(event)
         return {**tracker.snapshot(), "new_events": [*new_events, event]}
 
-    def _update_immediate_entry(self, objects, now, enabled):
+    def _update_immediate_entry(self, objects, now, enabled, *, load_support_resolver=None):
         objects, recovered = self._entry_objects(
             objects, now, review_quarantined=enabled)
         candidate = self._transition_entry_track
@@ -1633,8 +1721,9 @@ class RoiGroupSequence:
         self._entry_count = len(self.tracker._candidates(objects))
         two_anchor_track_id = candidate[0] if candidate is not None and len(candidate[1]) == 2 else None
         self.tracker.transition_load_track_id = two_anchor_track_id
-        self._record_entry_s4_load_contact(now, enabled)
-        result = self.tracker.update(objects, now, observations_enabled=enabled, roi_contour=self.contour)
+        self._record_entry_s4_load_contact(self.tracker, objects, now, enabled)
+        result = self.tracker.update(objects, now, observations_enabled=enabled, roi_contour=self.contour,
+                                     load_support_resolver=load_support_resolver)
         if recovered is not None:
             track_id = recovered['track_id']
             if track_id in self.tracker._entry_track_ids or track_id in self.tracker.byte_track_ids:
@@ -1667,19 +1756,26 @@ class RoiGroupSequence:
             self.crossed.clear()
         return result
 
-    def _record_entry_s4_load_contact(self, now, enabled):
-        tracker = self.tracker
+    def _record_entry_s4_load_contact(self, tracker, objects, now, enabled):
         if (not enabled or tracker.phase != "load" or not tracker.load_hand_contact_enabled
-                or self._transition_quarantine_until is not None or not self._transition_recheck_ids):
+                or tracker.identity_lost or self._transition_quarantine_until is not None
+                or (not self._transition_recheck_ids and tracker._load_numbering_reference is None)):
             self._s4_load_lookback.clear()
             self._s4_load_hint = False
             return
         identity = (tracker.phase, tracker.group_id)
+        admitted = {obj["track_id"]: obj for obj in tracker._candidates(objects)
+                    if obj.get("track_id") is not None and obj.get("detection_source") != "local_crop"}
         tracks = {}
-        for track_id in set(tracker._entry_track_ids) | self._transition_recheck_ids:
+        for track_id in admitted.keys() | set(tracker._entry_track_ids) | self._transition_recheck_ids:
             record = self.track_store.tracks.get(track_id)
             if record is not None and record["owner"] in (None, identity):
-                tracks[track_id] = record
+                obj = admitted.get(track_id)
+                if track_id in self._transition_recheck_ids or (obj is not None and not obj["conflict"]
+                        and not tracker._occluded(obj, self._hands)):
+                    tracks[track_id] = record
+                elif track_id in tracker._entry_track_ids:
+                    tracks[track_id] = {**record, "reliable_since": None}
         previous = self.closed_groups[-1] if self.closed_groups else None
         reference = None
         if previous is not None and previous["phase"] == "load":
@@ -1687,26 +1783,32 @@ class RoiGroupSequence:
             if centers is not None and slot_layout_error(centers) is not None:
                 reference = np.asarray(centers)
         self._s4_load_hint = self._s4_load_lookback.record(
-            tracker, now, self._hands, tracks, reference, self._transition_recheck_ids)
+            tracker, now, self._hands, tracks, reference, self._transition_recheck_ids,
+            reach_hand=self._entry_load_reach_hand)
 
-    def _update_entry(self, objects, now, enabled):
+    def _update_entry(self, objects, now, enabled, *, load_support_resolver=None):
         objects, _ = self._entry_objects(objects,now)
         t = self.pending_tracker
         candidates = t._candidates(objects)
         self._entry_count = len(candidates)
-        result = t.update(objects,now,observations_enabled=enabled,initialization_objects=objects,roi_contour=self.contour)
+        self._record_entry_s4_load_contact(t, objects, now, enabled)
+        result = t.update(objects,now,observations_enabled=enabled,initialization_objects=objects,roi_contour=self.contour,
+                          load_support_resolver=load_support_resolver)
         # 停稳计时只确认几何身份；候选跟踪器独立缓存各槽空满和取放事件。
         self.state = "stabilizing_next" if t.initialization["stable_frames"] else "waiting_next"
         if t.points is not None:
             self.tracker = t
             result = self._restore_load_baseline(result, now)
+            self._s4_load_lookback.clear()
+            self._s4_load_hint = False
             self.pending_tracker = None
             self._arm(now)
             self._group_events.append({"type": "group_started","group_id": t.group_id,"phase": t.phase,"at": now})
             return result
         return None
 
-    def update(self, objects, now, *, observations_enabled=True, s4_position_candidates=()):
+    def update(self, objects, now, *, observations_enabled=True, s4_position_candidates=(),
+               load_support_resolver=None, entry_load_reach_hand=None):
         if self.last_time is not None and now <= self.last_time:
             raise ValueError("分组时间必须严格递增")
         self.last_time = float(now)
@@ -1716,6 +1818,12 @@ class RoiGroupSequence:
         self._track_rejections = {}
         self._observations_enabled = observations_enabled
         self._hands = [o for o in objects if o["class_name"] == "hand"]
+        self._entry_load_reach_hand = entry_load_reach_hand
+        audit_objects = objects
+        if observations_enabled:
+            objects = self._recover_crossed_load_binding(objects, now)
+        else:
+            self._load_rebind_pose = self._pending_load_rebind = None
         self._record_group_roi_tracks(objects, now)
         self._record_outside_mapping_quarantine(objects, now)
         edge_tracker = self.pending_tracker or self.tracker
@@ -1737,9 +1845,11 @@ class RoiGroupSequence:
                     or self._entry_progress(center) <= self.entry_birth_fraction))
         self._review_departing_unloads(objects, now, observations_enabled)
         if not discarded_initial_candidate and self.state == "entering":
-            result = self._update_immediate_entry(objects, now, observations_enabled)
+            result = self._update_immediate_entry(objects, now, observations_enabled,
+                                                  load_support_resolver=load_support_resolver)
         elif not discarded_initial_candidate and self.state in ("waiting_next","stabilizing_next"):
-            result = self._update_entry(objects, now, observations_enabled)
+            result = self._update_entry(objects, now, observations_enabled,
+                                        load_support_resolver=load_support_resolver)
         elif not discarded_initial_candidate and self.state == "sequence_complete":
             self._exclude_departing(objects, now)
         elif not discarded_initial_candidate:
@@ -1760,7 +1870,8 @@ class RoiGroupSequence:
                 before_observe=self._observe_motion,
                 translation_direction=self.direction if self.state == "exiting" else None,
                 s4_position_candidates=position_candidates,
-                recheck_initial_unload=self._g1_waiting_event)
+                recheck_initial_unload=self._g1_waiting_event,
+                load_support_resolver=load_support_resolver)
             if observations_enabled:
                 result = self._review_transition_load(result, now)
             self._record_s4_inferred_load_cancellation(self.tracker, now)
@@ -1778,7 +1889,8 @@ class RoiGroupSequence:
                 if self.exit_min_slots == 1 and self.state != "sequence_complete":
                     closing_events = result["new_events"]
                     self._start_immediate_next(now, objects)
-                    result = self._update_immediate_entry(objects, now, observations_enabled)
+                    result = self._update_immediate_entry(objects, now, observations_enabled,
+                                                          load_support_resolver=load_support_resolver)
                     result["new_events"] = closing_events + result["new_events"]
         if result is None:
             result = {**self.tracker.snapshot(),"new_events": []}
@@ -1795,6 +1907,11 @@ class RoiGroupSequence:
             result["new_events"] = []
             result = self._mask_initial_g1_result(result)
         self._sync_track_bindings(result, now)
+        tracker = self.tracker
+        if (observations_enabled and self.state == "active" and tracker.phase == "load"
+                and result["slot_numbering_status"] == "final" and tracker.transform_valid_this_frame):
+            self._load_rebind_pose = (now, (tracker.phase, tracker.group_id), tracker.reference_points.copy(),
+                                      tuple(i-1 for i in tracker.transform_support_slot_ids))
         if observations_enabled and self.state == 'active' and result['slot_numbering_status'] == 'final':
             edge_events = self.track_store.restore_roi_edge_events(self.tracker, now)
             if edge_events:
@@ -1812,7 +1929,7 @@ class RoiGroupSequence:
                                 and slot.get("tracking_box_xyxy") is not None))
             result["current_target_count"] = 0
             result["all_four_currently_confirmed"] = False
-        return {**result,**self.metadata(),"track_states": self._track_metadata(objects, result),
+        return {**result,**self.metadata(),"track_states": self._track_metadata(audit_objects, result),
                 "new_group_events": deepcopy(self._group_events)}
 
     def finish(self):
@@ -1834,11 +1951,14 @@ class RoiGroupSequence:
                 "new_group_events": deepcopy(self._group_events)}
 
     def metadata(self):
+        preview_tracker = self.pending_tracker or self.tracker
         return {"group_assignment": "roi_exit_sequence" if self.enabled else "configured",
                 "group_status": self.state,"pending_group_id": self.pending_tracker.group_id
                     if self.pending_tracker is not None else None,
                 "s4_load_contact_review": ("suspected" if self._s4_load_hint else
                     "waiting_for_visual" if self.tracker.s4_load_contact_lookback is not None else None),
+                "three_point_preview": (preview_tracker.three_point_preview
+                                        if preview_tracker.points is None else None),
                 "pending_phase": self.pending_tracker.phase if self.pending_tracker is not None else None,
                 "closed_group_count": len(self.closed_groups),
                 "crossed_slot_ids": [i+1 for i in sorted(self.crossed)],

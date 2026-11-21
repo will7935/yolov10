@@ -105,6 +105,19 @@ class EntryIdentityTests(unittest.TestCase):
         self.assertEqual(result["initialization"]["machine_center_numbering"]["status"],
                          "insufficient_distance_evidence")
 
+    def test_unload_near_tie_uses_legacy_numbering_at_actual_slot_spacing(self):
+        points = np.array([[413., 192.], [392., 228.], [525., 233.], [517., 275.]])
+        tracker = SlotGroupTracker(group_id=3, phase="unload", initialization_seconds=.10,
+            initialization_frames=2, minimum_frames=2, confirm_seconds=0,
+            slot2_below_slot3=True, unload_entry_numbering_seconds=.20, machine_center=(637., 266.))
+        tracker.start_incremental_entry(40)
+        detections = [dict(obj, track_id=i+1) for i, obj in enumerate(boxes(points))]
+        for frame in range(6):
+            result = tracker.update(detections, frame*.05)
+        self.assertEqual(tracker.byte_track_ids, [1, 2, 3, 4])
+        self.assertEqual(result["initialization"]["machine_center_numbering"]["status"],
+                         "insufficient_distance_evidence")
+
     def test_live_entry_tracks_keep_early_events_until_late_numbering(self):
         tracker = SlotGroupTracker(group_id=1, phase='load', confirm_seconds=.1,
             minimum_frames=2, initialization_seconds=.3, initialization_frames=2,

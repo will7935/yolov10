@@ -22,7 +22,9 @@ HAND = {"class_name":"hand","confidence":.95,"xyxy":[185,185,215,215]}
 
 
 def tracker(**kwargs):
-    return SlotGroupTracker(POINTS,phase="load",confirm_seconds=.1,minimum_frames=2,**kwargs)
+    result = SlotGroupTracker(POINTS,phase="load",confirm_seconds=.1,minimum_frames=2,**kwargs)
+    result.initialization["inferred_slot_ids"] = [4]
+    return result
 
 
 def contact(t):
