@@ -62,6 +62,48 @@ class EntryIdentityTests(unittest.TestCase):
         np.testing.assert_allclose(result['slots'][1]['center_xy'], points[1], atol=.01)
         np.testing.assert_allclose(result['slots'][2]['center_xy'], points[2], atol=.01)
 
+    def test_late_quartet_reviews_load_numbering_across_short_detection_gaps(self):
+        points = np.array([[423.4, 273.19], [532.48, 331.31],
+                           [471.97, 242.86], [571.95, 300.65]])
+        unload_layout = np.array([[378.90, 221.88], [488.91, 287.08],
+                                  [459.69, 213.71], [542.42, 261.06]])
+        tracks = [565, 572, 564, 568]
+        detections = [dict(obj, track_id=tid) for obj, tid in zip(boxes(points), tracks)]
+        three = [detections[i] for i in (0, 2, 3)]
+        for last_frame in ("full", "geometry_only", "missing"):
+            with self.subTest(last_frame=last_frame):
+                tracker = SlotGroupTracker(group_id=3, phase="load", confirm_seconds=0.,
+                    minimum_frames=4, initialization_seconds=.1, initialization_frames=2,
+                    slot2_below_slot3=True, allow_three_point_initialization=True,
+                    machine_center=(637., 266.))
+                tracker._load_numbering_reference = unload_layout
+                tracker.start_incremental_entry(40)
+                for now in (0., .05, .1):
+                    result = tracker.update(three, now)
+                self.assertTrue(result["initialization"]["inferred_slot_ids"])
+                weak = [dict(detections[1], confidence=.055)]
+                for now, objects in ((.15, detections), (.20, three), (.25, three), (.30, detections)):
+                    result = tracker.update(objects, now, entry_position_candidates=weak)
+                    self.assertEqual(result["slot_numbering_status"], "provisional")
+                result = tracker.update(detections if last_frame == "full" else three,
+                    .51 if last_frame == "missing" else .35,
+                    entry_position_candidates=weak if last_frame == "geometry_only" else ())
+                self.assertEqual(result["slot_numbering_status"], "final")
+                review = result["initialization"]["load_entry_quartet_review"]
+                if last_frame != "missing":
+                    self.assertEqual((review["status"], review["frames"]), ("confirmed", 3))
+                    self.assertEqual(tracker.byte_track_ids, tracks)
+                    self.assertEqual(result["initialization"]["inferred_slot_ids"], [])
+                    self.assertFalse(any(slot["position_is_prediction"] for slot in result["slots"]))
+                    if last_frame == "geometry_only":
+                        self.assertTrue(review["geometry_only_last_frame"])
+                        self.assertEqual(result["slots"][1]["observation"], "unknown")
+                        self.assertEqual(result["slots"][1]["last_confirmed_state"], "unknown")
+                else:
+                    self.assertEqual((review["status"], review["frames"]), ("expired", 2))
+                    self.assertNotIn(572, tracker.byte_track_ids)
+                    self.assertEqual(result["initialization"]["inferred_slot_ids"], [4])
+
     def test_settled_unload_entry_keeps_the_same_slot_order_as_load(self):
         points = np.array([[418.62, 195.73], [388.84, 230.07],
                            [532.00, 238.99], [521.03, 283.46]])
@@ -117,6 +159,42 @@ class EntryIdentityTests(unittest.TestCase):
         self.assertEqual(tracker.byte_track_ids, [1, 2, 3, 4])
         self.assertEqual(result["initialization"]["machine_center_numbering"]["status"],
                          "insufficient_distance_evidence")
+
+    def test_stable_g1_layout_checks_the_machine_candidate_before_unload_numbering(self):
+        points = np.array([[410.82, 201.08], [402.13, 244.89],
+                           [535.65, 237.92], [524.21, 285.28]])
+        reference = np.array([[401.1, 208.], [423.4, 260.8],
+                              [512.3, 235.], [534., 293.2]])
+        tracker = SlotGroupTracker(group_id=3, phase="unload", initialization_seconds=.1,
+            initialization_frames=2, minimum_frames=2, confirm_seconds=0,
+            slot2_below_slot3=True, unload_entry_numbering_seconds=.2, machine_center=(637., 266.))
+        tracker._s4_reference_layouts = ((1, reference),)
+        tracker.start_incremental_entry(40)
+        track_ids = [313, 320, 321, 328]
+        detections = [dict(obj, track_id=tid) for obj, tid in zip(boxes(points), track_ids)]
+        for frame in range(7):
+            result = tracker.update(detections, frame*.05)
+        self.assertEqual(result["slot_numbering_status"], "final")
+        self.assertEqual(tracker.byte_track_ids, track_ids)
+        decision = result["initialization"]["machine_center_numbering"]
+        self.assertEqual(decision["status"], "matched_g1_stable_layout")
+        self.assertEqual((decision["machine_s4_byte_track_id"], decision["s4_byte_track_id"]), (321, 328))
+
+    def test_ambiguous_g1_layout_waits_when_machine_candidate_is_also_unclear(self):
+        for center, expected in (((200., 150.), "provisional"), ((210., 220.), "final")):
+            with self.subTest(center=center):
+                tracker = SlotGroupTracker(group_id=3, phase="unload", initialization_seconds=.1,
+                    initialization_frames=2, minimum_frames=2, confirm_seconds=0,
+                    slot2_below_slot3=True, unload_entry_numbering_seconds=.2, machine_center=center)
+                tracker._s4_reference_layouts = ((1, rotated(45)),)
+                tracker.start_incremental_entry(40)
+                detections = [dict(obj, track_id=i+1) for i, obj in enumerate(boxes(PHYSICAL))]
+                for frame in range(7):
+                    result = tracker.update(detections, frame*.05)
+                self.assertEqual(result["slot_numbering_status"], expected)
+                decision = result["initialization"]["machine_center_numbering"]
+                self.assertEqual(decision["status"],
+                                 "waiting_for_g1_layout_match" if expected == "provisional" else "confirmed")
 
     def test_live_entry_tracks_keep_early_events_until_late_numbering(self):
         tracker = SlotGroupTracker(group_id=1, phase='load', confirm_seconds=.1,

@@ -1712,7 +1712,8 @@ class RoiGroupSequence:
         tracker.events.append(event)
         return {**tracker.snapshot(), "new_events": [*new_events, event]}
 
-    def _update_immediate_entry(self, objects, now, enabled, *, load_support_resolver=None):
+    def _update_immediate_entry(self, objects, now, enabled, *, load_support_resolver=None,
+                                entry_position_candidates=()):
         objects, recovered = self._entry_objects(
             objects, now, review_quarantined=enabled)
         candidate = self._transition_entry_track
@@ -1723,6 +1724,7 @@ class RoiGroupSequence:
         self.tracker.transition_load_track_id = two_anchor_track_id
         self._record_entry_s4_load_contact(self.tracker, objects, now, enabled)
         result = self.tracker.update(objects, now, observations_enabled=enabled, roi_contour=self.contour,
+                                     entry_position_candidates=entry_position_candidates,
                                      load_support_resolver=load_support_resolver)
         if recovered is not None:
             track_id = recovered['track_id']
@@ -1786,13 +1788,14 @@ class RoiGroupSequence:
             tracker, now, self._hands, tracks, reference, self._transition_recheck_ids,
             reach_hand=self._entry_load_reach_hand)
 
-    def _update_entry(self, objects, now, enabled, *, load_support_resolver=None):
+    def _update_entry(self, objects, now, enabled, *, load_support_resolver=None, entry_position_candidates=()):
         objects, _ = self._entry_objects(objects,now)
         t = self.pending_tracker
         candidates = t._candidates(objects)
         self._entry_count = len(candidates)
         self._record_entry_s4_load_contact(t, objects, now, enabled)
         result = t.update(objects,now,observations_enabled=enabled,initialization_objects=objects,roi_contour=self.contour,
+                          entry_position_candidates=entry_position_candidates,
                           load_support_resolver=load_support_resolver)
         # 停稳计时只确认几何身份；候选跟踪器独立缓存各槽空满和取放事件。
         self.state = "stabilizing_next" if t.initialization["stable_frames"] else "waiting_next"
@@ -1808,7 +1811,7 @@ class RoiGroupSequence:
         return None
 
     def update(self, objects, now, *, observations_enabled=True, s4_position_candidates=(),
-               load_support_resolver=None, entry_load_reach_hand=None):
+               load_support_resolver=None, entry_load_reach_hand=None, entry_position_candidates=()):
         if self.last_time is not None and now <= self.last_time:
             raise ValueError("分组时间必须严格递增")
         self.last_time = float(now)
@@ -1846,9 +1849,11 @@ class RoiGroupSequence:
         self._review_departing_unloads(objects, now, observations_enabled)
         if not discarded_initial_candidate and self.state == "entering":
             result = self._update_immediate_entry(objects, now, observations_enabled,
+                                                  entry_position_candidates=entry_position_candidates,
                                                   load_support_resolver=load_support_resolver)
         elif not discarded_initial_candidate and self.state in ("waiting_next","stabilizing_next"):
             result = self._update_entry(objects, now, observations_enabled,
+                                        entry_position_candidates=entry_position_candidates,
                                         load_support_resolver=load_support_resolver)
         elif not discarded_initial_candidate and self.state == "sequence_complete":
             self._exclude_departing(objects, now)

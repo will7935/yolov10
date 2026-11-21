@@ -84,10 +84,10 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频8", REGRESSION_DATASET_ROOT / "测试视频8" / "camera_B_20260924_054543.avi",
      base.DEFAULT_SLOT_ROI_FILE),
-    # ("测试视频9", REGRESSION_DATASET_ROOT / "测试视频9" / "camera_B_20260924_060103.avi",
-    #  base.DEFAULT_SLOT_ROI_FILE),
-    # ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
-    #  base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频9", REGRESSION_DATASET_ROOT / "测试视频9" / "camera_B_20260924_060103.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
     #  base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
@@ -122,7 +122,8 @@ from industrial_inspection.tools.slot_process_config import (
     MIN_INITIALIZATION_FRAMES, INITIAL_GROUP_STABLE_SECONDS, INITIALIZATION_HISTORY_SECONDS,
     THREE_POINT_GROUP_INITIALIZATION, REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1, S4_USE_PREVIOUS_GROUP_LAYOUTS,
     MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
-    MIN_CONFIRM_FRAMES, VISUAL_REVERSAL_REVIEW_SECONDS, IDENTITY_LOST_SECONDS, CONFLICT_CONF_MARGIN,
+    MIN_CONFIRM_FRAMES, LOAD_POST_CONTACT_CONFIRM_FRAMES, VISUAL_REVERSAL_REVIEW_SECONDS,
+    IDENTITY_LOST_SECONDS, CONFLICT_CONF_MARGIN,
     HAND_OVERLAP_RATIO, LOAD_HAND_CONTACT_ENABLED, LOAD_HAND_CONTACT_SECONDS,
     LOAD_HAND_CONTACT_MIN_FRAMES, LOAD_HAND_CONTACT_OVERLAP_RATIO, LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
     LOAD_HAND_CONTACT_COMPETING_SLOT_ID, LOAD_HAND_CONTACT_COMPETING_MARGIN, LOAD_HAND_CONTACT_COMPETING_RATIO,
@@ -961,6 +962,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "load_hand_contact_config": {"enabled": LOAD_HAND_CONTACT_ENABLED,
             "contact_seconds": LOAD_HAND_CONTACT_SECONDS,
             "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,
+            "post_contact_visual_confirm_frames": LOAD_POST_CONTACT_CONFIRM_FRAMES,
             "overlap_ratio": LOAD_HAND_CONTACT_OVERLAP_RATIO, "unload_target_slot_id": 4,
             "target_slot_ids": [1, 2, 3, 4], "load_target_policy": "inferred_at_formal_numbering",
             "competing_slot": {
@@ -1205,10 +1207,15 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         for item in tracked_raw if item["class_name"] in SLOT_STATES
                         and item.get("track_id") is None
                         and item["tracking_confidence"] >= thresholds.tracking_low]
+                    entry_position_candidates = [item for item in slot_track_detections
+                        if item.get("track_id") is not None
+                        and item["tracking_confidence"] < thresholds.slot_state
+                        and not sequence.is_retired_track(item["track_id"])]
                     reach_hand = (recover_load_reach_hand(model, frame, tracked_raw, sequence, args, thresholds,
                                                          local_policy) if enabled and local_policy.enabled else None)
                     snapshot = sequence.update(objects,timestamp,observations_enabled=enabled,
                         s4_position_candidates=s4_position_candidates, entry_load_reach_hand=reach_hand,
+                        entry_position_candidates=entry_position_candidates,
                         load_support_resolver=find_load_preview_support if local_policy.enabled else None)
                     inspection_processed += 1
                 else:

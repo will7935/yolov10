@@ -65,6 +65,8 @@ MIN_INITIALIZATION_FRAMES = 2 # 同时满足最少帧数；编号后不再按x�
 INITIAL_GROUP_STABLE_SECONDS = .3  # G1正式建立S号前的独立几何稳定时间
 INITIALIZATION_HISTORY_SECONDS = 5.0 # 基线及可靠临时轨迹有效期；未获多帧支持的点按IDENTITY_LOST_SECONDS清理
 THREE_POINT_GROUP_INITIALIZATION = True  # 三个真实槽位可推算缺失S4后建立组几何
+LOAD_ENTRY_QUARTET_REVIEW_SECONDS = .35  # 上料正式编号前，第四个真实框触发的复核窗口
+LOAD_ENTRY_QUARTET_REVIEW_FRAMES = 3     # 窗口内一致的四实框映射次数，允许短时漏检
 S4_USE_PREVIOUS_GROUP_LAYOUTS = True  # 下料逐点换组时，优先采用一致的前组实测四槽布局推算S4
 # G1下料在首个可信下料事件前只作为候选；若候选先离开ROI则自动释放，不占用G1。
 REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1 = True
@@ -86,6 +88,7 @@ LOAD_HAND_CONTACT_ENABLED = True       # 上料接触仅用于正式编号时由
 # 连续2帧有效接触后仅进入待确认，手离开后优先用YOLO确认；持续漏检时按已有空满基准推断变化。
 LOAD_HAND_CONTACT_SECONDS = 0.0       # 单位：秒；0.0表示取消最低接触时长，仅检查下方连续帧数
 LOAD_HAND_CONTACT_MIN_FRAMES = 2      # 单位：处理帧；连续2帧有效接触即可，不要求额外持续0.1秒
+LOAD_POST_CONTACT_CONFIRM_FRAMES = 2  # 推算槽的有效接触结束后，连续满槽观测的核验帧数
 LOAD_HAND_CONTACT_OVERLAP_RATIO = .03  # 手框覆盖S4检测框面积比例；中心覆盖仍优先
 LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED = False  # 启用竞争槽位抑制：其他槽位明显占优时不触发S4手接触
 LOAD_HAND_CONTACT_COMPETING_SLOT_ID = 2          # 竞争槽位编号；当前使用S2作为与S4比较的槽位

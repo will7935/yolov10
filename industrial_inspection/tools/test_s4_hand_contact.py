@@ -60,7 +60,7 @@ class ContactDiagnosticsTests(unittest.TestCase):
         result = tracker.update(visible+[hand],.2)
         self.assertFalse(result['s4_contact_diagnostic']['evidence_ready'])
 
-    def test_inferred_s4_load_requires_visual_empty_to_reverse(self):
+    def test_inferred_s4_load_stays_locked_after_contact_and_visual_empty(self):
         tracker = self.tracker()
         tracker.minimum_frames = 4
         visible = [detection(i, 'filled') for i in (1, 2, 3)]
@@ -71,27 +71,54 @@ class ContactDiagnosticsTests(unittest.TestCase):
         result = tracker.update(visible, .8)
         load, = result['new_events']
         self.assertEqual((load['action'], load['reason']), ('load', 'hand_contact_inferred_load'))
+        self.assertTrue(result['slots'][3]['load_state_locked'])
 
-        for now in (.85, .9):
+        for now in (.85, .9, .95):
             result = tracker.update(visible+[hand], now)
-        self.assertTrue(result['slots'][3]['load_contact_pending'])
-        tracker.update(visible, .95)
+            self.assertFalse(result['slots'][3]['load_contact_pending'])
         result = tracker.update(visible, 1.5)
         self.assertEqual(result['new_events'], [])
-        self.assertEqual(result['slots'][3]['last_confirmed_state'], 'filled')
-        self.assertFalse(result['slots'][3]['load_contact_pending'])
 
-        for now in (1.55, 1.6, 1.65):
+        for now in (1.55, 1.6, 1.65, 1.7, 1.75):
             result = tracker.update(visible+[detection(4, 'empty')], now)
             self.assertEqual(result['new_events'], [])
-        result = tracker.update(visible+[detection(4, 'empty')], 1.7)
-        unload, = result['new_events']
-        self.assertEqual((unload['slot_id'], unload['action'], unload['expected_action']), (4, 'unload', False))
-        self.assertFalse(unload.get('inferred', False))
-        self.assertEqual(result['order_result'], 'fail')
+            self.assertEqual(result['slots'][3]['observation'], 'empty')
+            self.assertEqual(result['slots'][3]['last_confirmed_state'], 'filled')
+            self.assertTrue(result['slots'][3]['load_state_locked'])
+
+    def test_visual_load_locks_a_predicted_s2_during_review_and_resets_next_group(self):
+        tracker = SlotGroupTracker(CENTERS, phase='load', confirm_seconds=0.,
+                                  minimum_frames=2, visual_reversal_review_seconds=.5)
+        tracker.initialization['inferred_slot_ids'] = [2]
+
+        def observed(filled=()):
+            return [detection(i, 'filled' if i in filled else 'empty') for i in range(1, 5)]
+
+        for now in (0., .1):
+            tracker.update(observed(), now)
+        for now in (.2, .3):
+            result = tracker.update(observed((2, 4)), now)
+        self.assertTrue(result['slots'][1]['visual_reversal_review_pending'])
+        self.assertTrue(result['slots'][1]['load_state_locked'])
+        events = []
+        for now in (.4, .5, .9):
+            events.extend(tracker.update(observed((4,)), now)['new_events'])
+        self.assertCountEqual([(e['slot_id'], e['action']) for e in events], [(2, 'load'), (4, 'load')])
+
+        for now in (1., 1.1, 1.7):
+            result = tracker.update(observed(), now)
+        reversal, = result['new_events']
+        self.assertEqual((reversal['slot_id'], reversal['action']), (4, 'unload'))
+        self.assertEqual(result['slots'][1]['last_confirmed_state'], 'filled')
+        tracker.reset_group(2, phase='load', centers=CENTERS)
+        for now in (2., 2.1):
+            result = tracker.update(observed(), now)
+        self.assertFalse(result['slots'][1]['load_state_locked'])
+        self.assertEqual(result['slots'][1]['last_confirmed_state'], 'empty')
 
     def test_box_edge_contact_waits_for_filled_detection(self):
         tracker = self.tracker()
+        tracker.minimum_frames = 4
         visible = [detection(i, 'filled') for i in (1, 2, 3)]
         hand = {'class_name': 'hand', 'confidence': .9, 'xyxy': [200, 180, 220, 198]}
         for now in (.1, .15):
@@ -104,12 +131,41 @@ class ContactDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result['new_events'], [])
         self.assertEqual(result['slots'][3]['last_confirmed_state'], 'empty')
 
-        for now in (.85, .9):
-            result = tracker.update(visible+[detection(4, 'filled')], now)
+        filled = visible+[detection(4, 'filled')]
+        for objects, now in ((filled, .85), (visible, .9), (filled, .95)):
+            result = tracker.update(objects, now)
+            self.assertEqual(result['new_events'], [])
+            self.assertEqual(result['slots'][3]['last_confirmed_state'], 'empty')
+        result = tracker.update(filled, 1.)
         event, = result['new_events']
         self.assertEqual(event['reason'], 'detected_after_hand_contact')
         self.assertFalse(event['inferred'])
-        self.assertEqual(event['time_upper'], .85)
+        self.assertEqual(event['time_upper'], .95)
+        self.assertTrue(result['slots'][3]['load_state_locked'])
+
+    def test_predicted_slot_without_contact_uses_standard_visual_frames(self):
+        tracker = self.tracker()
+        tracker.minimum_frames = 4
+        filled = [detection(i, 'filled') for i in range(1, 5)]
+        for now in (.1, .15, .2):
+            result = tracker.update(filled, now)
+            self.assertEqual(result['new_events'], [])
+        event, = tracker.update(filled, .25)['new_events']
+        self.assertEqual((event['slot_id'], event['action']), (4, 'load'))
+
+    def test_fast_visual_confirmation_preserves_eligible_s4_contact_time(self):
+        tracker = self.tracker()
+        tracker.minimum_frames = 4
+        visible = [detection(i, 'filled') for i in (1, 2, 3)]
+        hand = {'class_name': 'hand', 'confidence': .9, 'xyxy': [300, 185, 320, 195]}
+        for now in (.1, .15):
+            tracker.update(visible+[hand], now)
+        tracker.update(visible, .2)
+        filled = visible+[detection(4, 'filled')]
+        self.assertEqual(tracker.update(filled, .3)['new_events'], [])
+        event, = tracker.update(filled, .35)['new_events']
+        self.assertEqual((event['time_upper'], event['visual_time_upper'], event['confirmed_at']),
+                         (.2, .3, .35))
 
     def test_measured_s4_does_not_use_box_or_fixed_region_contact(self):
         tracker = self.tracker(inferred=False)

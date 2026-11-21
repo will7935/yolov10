@@ -432,21 +432,22 @@ class TwoPointContactTests(unittest.TestCase):
         self.assertEqual(mapped["slot_numbering_status"], "final")
         return sequence, mapped, slots
 
-    def test_late_mapping_recovers_s4_contact_and_cancels_after_stable_empty(self):
+    def test_late_mapping_recovers_s4_contact_and_locks_its_filled_state(self):
         sequence, mapped, slots = self._enter_load_with_two_prediction_contacts()
         event, = mapped["new_events"]
         self.assertEqual((event["slot_id"], event["reason"]), (4, "two_point_hand_contact_inferred_load"))
         self.assertEqual((event["hand_contact_since"], event["time_upper"]), (.4, .6))
         self.assertTrue(event["inferred"])
         self.assertEqual(mapped["confirmed_event_sequence"], [4])
+        self.assertTrue(mapped["slots"][3]["load_state_locked"])
         first = sequence.update(slots, 1.2)
         self.assertEqual(first["confirmed_event_sequence"], [4])
         second = sequence.update(slots, 1.3)
-        self.assertEqual(second["confirmed_event_sequence"], [])
+        self.assertEqual(second["confirmed_event_sequence"], [4])
+        self.assertEqual(second["slots"][3]["last_confirmed_state"], "filled")
         self.assertEqual(second["new_events"], [])
-        self.assertFalse(sequence.all_events)
-        cancellation, = second["new_group_events"]
-        self.assertEqual(cancellation["type"], "s4_inferred_load_cancelled")
+        self.assertEqual(sequence.all_events, [event])
+        self.assertFalse(second["new_group_events"])
 
     def test_late_mapping_does_not_infer_s4_from_s2_contact_or_without_empty_baseline(self):
         for contact_s4, empty_baseline in ((False, True), (True, False)):

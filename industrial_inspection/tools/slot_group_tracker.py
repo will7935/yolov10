@@ -11,6 +11,8 @@ from scipy.optimize import linear_sum_assignment
 
 from industrial_inspection.tools.s4_hand_contact import (
     HandContactPolicy, box_overlap_ratio, centered_box, evaluate_s4_contact)
+from industrial_inspection.tools.slot_process_config import (
+    LOAD_ENTRY_QUARTET_REVIEW_FRAMES, LOAD_ENTRY_QUARTET_REVIEW_SECONDS, LOAD_POST_CONTACT_CONFIRM_FRAMES)
 
 SLOT_STATES = {"wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}
 S4_UNLOAD_REVIEW_SECONDS = .8
@@ -718,10 +720,10 @@ class SlotGroupTracker:
             return self._load_three_point_order(points, self._entry_inferred_indices)
         return self._numbering_order_with_predicted_s4(points)
 
-    def _load_reference_order(self, points):
-        """Match the directed edges of the same group's measured unload layout."""
-        reference = self._load_numbering_reference
-        if reference is None or not valid_slot_geometry(points):
+    @staticmethod
+    def _match_layout_order(reference, points, *, minimum_score, minimum_gap):
+        """Match measured quadrilaterals by the directions of their clockwise edges."""
+        if reference is None or not valid_slot_geometry(reference) or not valid_slot_geometry(points):
             return None
         reference_offsets = reference-reference.mean(axis=0)
         current_offsets = points-points.mean(axis=0)
@@ -735,10 +737,19 @@ class SlotGroupTracker:
         scores = [float(np.sum(reference_edges*np.roll(current_edges, shift, axis=0))/4)
                   for shift in range(4)]
         runner_up, best = np.argsort(scores)[-2:]
-        if scores[best] < .65 or scores[best]-scores[runner_up] < .12:
+        if scores[best] < minimum_score or scores[best]-scores[runner_up] < minimum_gap:
             return None
         order = np.empty(4, dtype=int)
         order[reference_ring] = np.roll(current_ring, int(best))
+        return order, scores[best]
+
+    def _load_reference_order(self, points):
+        """Match the directed edges of the same group's measured unload layout."""
+        reference = self._load_numbering_reference
+        matched = self._match_layout_order(reference, points, minimum_score=.65, minimum_gap=.12)
+        if matched is None:
+            return None
+        order, _ = matched
         if self.machine_center is not None:
             unloaded_anchor, _ = self._machine_anchor(reference, use_slot_spacing=True)
             loading_anchor, _ = self._machine_anchor(points, use_slot_spacing=True)
@@ -973,6 +984,41 @@ class SlotGroupTracker:
             minimum_gap = max(minimum_gap, .10*spacing)
         return (int(first) if gap >= minimum_gap else None), gap
 
+    @staticmethod
+    def _numbering_conflicts_with_s4_contact(s4, slots, events):
+        return (any(slot.load_contact_pending and i != s4 for i, slot in enumerate(slots))
+                or any(e.get("inferred") and e["slot_id"] != s4+1 for e in events))
+
+    def _final_numbering_order(self, points, track_ids, legacy, now, *, inferred, slots, events):
+        order = self._machine_numbering_order(points, track_ids, legacy, now,
+                                               inferred=inferred, slots=slots, events=events)
+        if self.phase != "unload" or self.group_id == 1 or inferred or len(set(track_ids)-{None}) != 4:
+            return order
+        reference = next((layout for group_id, layout in self._s4_reference_layouts if group_id == 1), None)
+        if reference is None:
+            return order
+        diagnostic = self.initialization.get("machine_center_numbering", {})
+        matched = self._match_layout_order(reference, points, minimum_score=.8, minimum_gap=.2)
+        if matched is not None:
+            proposed, score = matched
+            spacing = np.min(np.linalg.norm(points[:, None]-points[None, :], axis=2)
+                             [np.triu_indices(4, 1)])
+            if not self.slot2_below_slot3 or points[proposed[1], 1]-points[proposed[2], 1] >= -.2*spacing:
+                s4 = int(proposed[3])
+                if not self._numbering_conflicts_with_s4_contact(s4, slots, events):
+                    self.initialization["machine_center_numbering"] = {
+                        "status": "matched_g1_stable_layout", "reference_group_id": 1,
+                        "s4_byte_track_id": track_ids[s4], "layout_score": score,
+                        "machine_s4_byte_track_id": diagnostic.get("s4_byte_track_id"),
+                    }
+                    return proposed
+        if diagnostic.get("status") in ("confirmed", "contact_evidence_fallback") or self.machine_center is None:
+            return order
+        self.initialization["machine_center_numbering"] = {
+            **diagnostic, "status": "waiting_for_g1_layout_match", "reference_group_id": 1,
+        }
+        return None
+
     def _machine_numbering_order(self, points, track_ids, legacy, now, *, inferred, slots, events):
         if self.machine_center is None:
             return legacy
@@ -993,8 +1039,7 @@ class SlotGroupTracker:
         if self.slot2_below_slot3 and points[order[1], 1]-points[order[2], 1] < -.2*spacing:
             diagnostic["status"] = "position_constraint_fallback"
             return legacy
-        if any(slot.load_contact_pending and i != s4 for i, slot in enumerate(slots)) or any(
-                e.get("inferred") and e["slot_id"] != s4+1 for e in events):
+        if self._numbering_conflicts_with_s4_contact(s4, slots, events):
             diagnostic["status"] = "contact_evidence_fallback"
             return legacy
         diagnostic.update(status="confirmed", s4_byte_track_id=track_ids[s4],
@@ -1011,6 +1056,17 @@ class SlotGroupTracker:
             return None
         inferred = self.initialization["inferred_slot_ids"]
         return inferred[0]-1 if len(inferred) == 1 else None
+
+    def _predicted_load_is_locked(self, slot):
+        """Use the formal inferred role even after the slot acquires a real track."""
+        if (self.phase != "load" or self.points is None or not self._region_formal_numbering
+                or slot.slot_id not in self.initialization["inferred_slot_ids"]
+                or slot.confirmed != "filled"):
+            return False
+        pending = slot.pending_visual_event
+        return ((pending is not None and pending["action"] == "load")
+                or any(event["slot_id"] == slot.slot_id and event.get("action") == "load"
+                       for event in self.events))
 
     def _hand_contact_index(self):
         if self.phase != "load":
@@ -1171,7 +1227,8 @@ class SlotGroupTracker:
                 matches[int(row)] = int(col)
         return matches
 
-    def _update_incremental_entry(self, objects, now, enabled, roi_contour, *, load_support_resolver=None):
+    def _update_incremental_entry(self, objects, now, enabled, roi_contour, *, load_support_resolver=None,
+                                  entry_position_candidates=()):
         numbering_seconds = self.unload_entry_numbering_seconds if self.phase == "unload" else None
         self._predicted_indices.clear()
         self._expire_entry_tracks(now)
@@ -1179,7 +1236,13 @@ class SlotGroupTracker:
         candidates = self._candidates(objects)
         all_candidates = candidates
         hands = [o for o in objects if o["class_name"] == "hand"]
-        if enabled:
+        quartet, waiting_for_quartet = self._review_load_entry_quartet(
+            candidates, hands, now, enabled, entry_position_candidates)
+        if quartet is not None:
+            self._rebuild_entry_geometry(quartet, now)
+            self._initial_seen.update(range(4))
+            self._entry_load_preview_contact = None
+        elif enabled and not waiting_for_quartet:
             candidates = self._reconcile_entry_geometry(candidates, hands, now)
         matches = {}
         # 只按上一帧真实中心作一对一距离匹配；新点按首次建立顺序编号，
@@ -1188,6 +1251,8 @@ class SlotGroupTracker:
             distances = np.linalg.norm(np.asarray(self._entry_points)[:, None]
                 -np.asarray([c["center"] for c in candidates])[None, :], axis=2)
             matches = self._associate_entry_distances(distances, candidates)
+            if waiting_for_quartet:
+                matches = {i: j for i, j in matches.items() if i not in self._entry_inferred_indices}
         new_indices = [j for j in range(len(candidates)) if j not in matches.values()]
         # 一个已知点附近的重复/歧义框不能另开一个点号；多于四槽时也不选高分四框。
         new_indices = [j for j in new_indices if not self._entry_points or
@@ -1195,7 +1260,8 @@ class SlotGroupTracker:
                 for point in self._entry_points) > self._entry_gate]
         # 三点推算只是S4暂时不可见时的中心估计。若后续出现落在该估计附近、
         # 且能形成有效四槽几何的真实框，用它逐帧校正推算点，而非把组判成超额候选。
-        if self.allow_three_point_initialization and len(self._entry_points) == 4 and self._entry_inferred_indices:
+        if (not waiting_for_quartet and self.allow_three_point_initialization
+                and len(self._entry_points) == 4 and self._entry_inferred_indices):
             for i in sorted(self._entry_inferred_indices):
                 for j in sorted(new_indices):
                     center = np.asarray(candidates[j]["center"], dtype=float)
@@ -1378,8 +1444,9 @@ class SlotGroupTracker:
             self._initial_count += 1
         else:
             self._initial_points, self._initial_since, self._initial_count = None, None, 0
-        stable = (self._initial_count >= self.initialization_frames and self._initial_since is not None
-                  and now-self._initial_since+1e-9 >= self.geometry_initialization_seconds)
+        stable = (quartet is not None or
+                  (self._initial_count >= self.initialization_frames and self._initial_since is not None
+                   and now-self._initial_since+1e-9 >= self.geometry_initialization_seconds))
         if numbering_seconds is not None and enabled and inferred_now:
             # 先用推算的 S4 记录接触，正式编号从当前姿态重新计时。
             self._initial_since, self._initial_count = float(now), 1
@@ -1424,6 +1491,9 @@ class SlotGroupTracker:
         recovered = []
         required_seen = 3 if self._entry_inferred_indices else 4
         if len(self._entry_points) == 4 and len(self._initial_seen) >= required_seen and not overflow:
+            if waiting_for_quartet:
+                self.initialization["reason"] = "reviewing_four_real_slots"
+                return {**self.snapshot(), "new_events": []}
             # 临时点号可以按任意顺序出现；状态和事件随点一起映射，不丢掉早期满槽基线。
             try:
                 points = validate_centers(self._entry_points)
@@ -1472,9 +1542,12 @@ class SlotGroupTracker:
             elif self._load_numbering_reference is not None and self._entry_inferred_indices:
                 self.initialization["machine_center_numbering"] = {"status": "load_three_point_anchor"}
             elif stable:
-                order = self._machine_numbering_order(
+                order = self._final_numbering_order(
                     points, self._entry_track_ids, order, now, inferred=bool(self._entry_inferred_indices),
                     slots=self.slots, events=self._entry_events)
+                if order is None:
+                    self.initialization.update(reason="waiting_for_numbering_pose")
+                    return {**self.snapshot(), "new_events": []}
             elif self.machine_center is not None:
                 self.initialization["machine_center_numbering"] = {"status": "current_pose_not_stable"}
             if self.slot2_below_slot3 and (not valid_slot_geometry(numbering_points)
@@ -1527,8 +1600,9 @@ class SlotGroupTracker:
             self._entry_inferred_indices = set()
             self._entry_canonical_points = None
             self._clear_entry_s4_lock("formal_numbering")
-            self.initialization.update(status="ready",
-                reason="four_slot_tracks_stable" if stable else "stable_reference_numbering",
+            reason = ("load_entry_four_real_slots_verified" if quartet is not None
+                      else "four_slot_tracks_stable" if stable else "stable_reference_numbering")
+            self.initialization.update(status="ready", reason=reason,
                 initialized_at=float(now), initial_centers_xy=self.points.tolist(),
                 numbering_reference_centers_xy=numbering_points[order].tolist(),
                 geometry_seen_slot_ids=sorted(int(mapping[i+1]) for i in self._initial_seen),
@@ -1572,11 +1646,70 @@ class SlotGroupTracker:
                                  for obj in candidates if obj.get('track_id') not in ids]
         return chosen
 
+    def _review_load_entry_quartet(self, candidates, hands, now, enabled, position_candidates):
+        """Verify a late fourth track against the measured unload layout before numbering."""
+        if (self.phase != "load" or self._load_numbering_reference is None
+                or len(self._entry_points) != 4 or len(self._entry_inferred_indices) != 1):
+            return None, False
+        review = self.initialization.get("load_entry_quartet_review")
+        if review is not None:
+            if review["status"] != "collecting":
+                return None, False
+            if now-review["started_at"] > LOAD_ENTRY_QUARTET_REVIEW_SECONDS+1e-9:
+                self.initialization["load_entry_quartet_review"] = dict(review, status="expired")
+                return None, False
+        waiting = review is not None
+        if not enabled or len(candidates) not in (3, 4):
+            return None, waiting
+        measured_ids = {track_id for i, track_id in enumerate(self._entry_track_ids)
+                        if i not in self._entry_inferred_indices and track_id is not None}
+        candidate_ids = [obj.get("track_id") for obj in candidates]
+        if (len(measured_ids) != 3 or None in candidate_ids or len(set(candidate_ids)) != len(candidates)
+                or not measured_ids.issubset(candidate_ids)):
+            return None, waiting
+        geometry_only = len(candidates) == 3
+        if geometry_only:
+            # A weak ByteTrack continuation may finish an already supported
+            # layout. It never starts a review or enters slot observation.
+            if not waiting or review["frames"] != LOAD_ENTRY_QUARTET_REVIEW_FRAMES-1:
+                return None, waiting
+            fourth_id = review["fourth_track_id"]
+            continuation = self._candidates(obj for obj in position_candidates if obj.get("track_id") == fourth_id)
+            if (len(continuation) != 1 or np.linalg.norm(np.asarray(continuation[0]["center"])
+                    -review["fourth_center_xy"]) > self._entry_gate*.5):
+                return None, waiting
+            candidates = [*candidates, continuation[0]]
+            candidate_ids.append(fourth_id)
+        if any(obj.get("detection_source") == "local_crop" or obj["conflict"] or self._occluded(obj, hands)
+               for obj in candidates):
+            return None, waiting
+        points = np.asarray([obj["center"] for obj in candidates])
+        order = self._load_reference_order(points) if slot_layout_error(points) is not None else None
+        if order is None:
+            return None, waiting
+        ordered_ids = [candidate_ids[i] for i in order]
+        same = waiting and review["track_ids_in_slot_order"] == ordered_ids
+        if geometry_only and not same:
+            return None, waiting
+        count = review["frames"]+1 if same else 1
+        confirmed = count >= LOAD_ENTRY_QUARTET_REVIEW_FRAMES
+        fourth_id, = set(candidate_ids)-measured_ids
+        self.initialization["load_entry_quartet_review"] = {
+            "status": "confirmed" if confirmed else "collecting",
+            "started_at": review["started_at"] if waiting else now, "last_matched_at": now,
+            "frames": count, "track_ids_in_slot_order": ordered_ids, "fourth_track_id": fourth_id,
+            "fourth_center_xy": points[candidate_ids.index(fourth_id)].tolist(),
+            "geometry_only_last_frame": geometry_only}
+        return (candidates, False) if confirmed else (None, True)
+
     def _reconcile_entry_geometry(self, candidates, hands, now):
         """A late clear quartet may replace an incorrect provisional candidate."""
         chosen = self._select_track_geometry(candidates, hands, now)
         if chosen is None:
             return candidates
+        return self._rebuild_entry_geometry(chosen, now)
+
+    def _rebuild_entry_geometry(self, chosen, now):
         old_ids = set(self._entry_track_ids)-{None}
         new_ids = {obj['track_id'] for obj in chosen}
         if (len(self._entry_points) == 4 and not self._entry_inferred_indices
@@ -2086,9 +2219,12 @@ class SlotGroupTracker:
             order = reference_order
             self.initialization["machine_center_numbering"] = {"status": "matched_unload_layout"}
         else:
-            order = self._machine_numbering_order(
+            order = self._final_numbering_order(
                 numbering_points, p.byte_track_ids, order, now, inferred=bool(self._provisional_inferred_slot_ids),
                 slots=p.slots, events=p.events)
+            if order is None:
+                self.initialization.update(reason="waiting_for_numbering_pose")
+                return []
         self.points = p.points[order].copy()
         # 正式编号时以当帧位置建立参考，避免继承候选阶段的旧参考点。
         self.reference_points = self.points.copy()
@@ -2878,7 +3014,8 @@ class SlotGroupTracker:
 
     def update(self, objects, now, *, observations_enabled=True, initialization_objects=None,
                roi_contour=None, before_observe=None, translation_direction=None,
-               s4_position_candidates=(), recheck_initial_unload=False, load_support_resolver=None):
+               s4_position_candidates=(), recheck_initial_unload=False, load_support_resolver=None,
+               entry_position_candidates=()):
         """先关联几何，再确认状态；回调可在转位开始的同一帧暂停取放事件。"""
         if self.last_time is not None and now <= self.last_time:
             raise ValueError("源视频时间必须严格递增")
@@ -2898,6 +3035,7 @@ class SlotGroupTracker:
         if self._entry_points is not None:
             initial_objects = objects if initialization_objects is None else initialization_objects
             return self._update_incremental_entry(initial_objects, now, observations_enabled, roi_contour,
+                                                  entry_position_candidates=entry_position_candidates,
                                                   load_support_resolver=load_support_resolver)
         self._predicted_indices.clear()
         self.transform_valid_this_frame = False
@@ -3343,7 +3481,7 @@ class SlotGroupTracker:
             "hand_contact_since": contact.since, "hand_contact_released_at": contact.released_at,
             "hand_contact_frames": contact.frames}
         self.events.append(event)
-        self.s4_inferred_load = event
+        self.s4_inferred_load = None if self._predicted_load_is_locked(slot) else event
         return event
 
     def verify_departing_load(self, matches, hands, now, *, enabled=True):
@@ -3366,13 +3504,30 @@ class SlotGroupTracker:
         self.events.extend(events)
         return events
 
+    def _slot_observation(self, obj, hands, enabled, roi_contour, *, contact=False):
+        if self.identity_lost:
+            return "unknown", None, "identity_lost"
+        if obj is None:
+            return "unknown", None, "not_detected"
+        confidence = obj["confidence"]
+        if not enabled:
+            return "unknown", confidence, "rotation_or_transition"
+        if roi_contour is not None and cv2.pointPolygonTest(roi_contour, tuple(obj["center"]), False) < 0:
+            return "unknown", confidence, "outside_roi"
+        if obj["conflict"]:
+            return "unknown", confidence, "empty_filled_conflict"
+        if self._occluded(obj, hands) or contact:
+            return "unknown", confidence, "hand_occlusion"
+        return SLOT_STATES[obj["class_name"]], confidence, "detected"
+
     def _observe_slot(self, slot, obj, hands, now, enabled, roi_contour, *,
                       record_load_contact=True, restore_track_events=True):
         """正式槽与进入中的临时点共用同一套空满确认规则。"""
         slot_index = slot.slot_id-1
+        load_locked = self._predicted_load_is_locked(slot)
         self._unlock_lost_entry_s4(slot, slot_index, obj, now)
         recovered = []
-        if enabled and obj is not None and self.track_store is not None:
+        if not load_locked and enabled and obj is not None and self.track_store is not None:
             recovered = self.track_store.restore(slot, obj.get('track_id'),
                 (self.phase, self.group_id), now, include_events=restore_track_events and (
                     self.transition_load_track_id is None or obj.get('track_id') != self.transition_load_track_id))
@@ -3395,6 +3550,16 @@ class SlotGroupTracker:
             self._seed_formal_s4_detection_cache(now)
         temporary_contact_box = (None if has_box else
                                  self._temporary_s4_contact_box(slot, slot_index, now))
+        if load_locked:
+            # Preserve raw observations and geometry for diagnostics and group tracking.
+            slot.observation, slot.confidence, _ = self._slot_observation(obj, hands, enabled, roi_contour)
+            if slot.observation != "unknown":
+                slot.last_seen = float(now)
+            if slot.load_contact_count or slot.load_contact_pending:
+                self._clear_load_contact(slot)
+            slot.prediction_contact = None
+            slot.state, slot.reason = "filled", "predicted_load_state_locked"
+            return None, []
         contact = self._hand_contact(slot_index, hands)
         resumed_box = (slot.temporary_contact_box_xyxy if self.phase == "load" and slot_index != 3
                        and not slot.geometry_inferred else None)
@@ -3478,21 +3643,7 @@ class SlotGroupTracker:
             contact_evidence = {"since": slot.load_contact_since,
                                 "released_at": slot.load_contact_released_at,
                                 "count": slot.load_contact_count}
-        state, confidence, reason = "unknown", None, "not_detected"
-        if self.identity_lost:
-            reason = "identity_lost"
-        elif obj is not None:
-            confidence = obj["confidence"]
-            if not enabled:
-                reason = "rotation_or_transition"
-            elif roi_contour is not None and cv2.pointPolygonTest(roi_contour, tuple(obj["center"]), False) < 0:
-                reason = "outside_roi"
-            elif obj["conflict"]:
-                reason = "empty_filled_conflict"
-            elif self._occluded(obj, hands) or contact:
-                reason = "hand_occlusion"
-            else:
-                state, reason = SLOT_STATES[obj["class_name"]], "detected"
+        state, confidence, reason = self._slot_observation(obj, hands, enabled, roi_contour, contact=contact)
         verify_entry_full = (self._entry_points is not None and pending_contact
                              and slot.confirmed == "filled" and slot.entry_contact_center is not None)
         if verify_entry_full:
@@ -3555,8 +3706,16 @@ class SlotGroupTracker:
                 and not any(e["slot_id"] == slot.slot_id and e["action"] == self.phase
                             for e in (self._entry_events if self._entry_points is not None else self.events))):
             contact_evidence = two_point_evidence
+        minimum_frames = self.minimum_frames
+        if (self.phase == "load" and contact_enabled and not contact
+                and prior_confirmed == "empty" and state == "filled"):
+            prediction = slot.prediction_contact
+            if ((pending_contact and slot.load_contact_released_at is not None)
+                    or (prediction is not None and prediction.pending and prediction.released_at is not None)
+                    or (two_point_evidence is not None and two_point_evidence["released_at"] is not None)):
+                minimum_frames = min(minimum_frames, LOAD_POST_CONTACT_CONFIRM_FRAMES)
         event = slot.observe(state, now, confidence, reason, self.confirm_seconds,
-                             self.minimum_frames, contact_evidence=contact_evidence,
+                             minimum_frames, contact_evidence=contact_evidence,
                              visual_track_id=None if obj is None or local_crop else obj.get("track_id"))
         if (slot.slot_id == 4 and self.s4_inferred_load is not None
                 and slot.state in ("filled", "empty")):
@@ -3594,6 +3753,17 @@ class SlotGroupTracker:
         elif event is not None:
             if pending_contact and event["action"] == self.phase and not event.get("inferred", False):
                 event.update(reason="detected_after_hand_contact", inferred=False)
+                if (minimum_frames < self.minimum_frames and formal_s4
+                        and slot.load_contact_can_infer and slot.load_contact_released_at is not None
+                        and slot.load_contact_released_at <= event["time_upper"]
+                        and self._s4_region_expected()):
+                    # Preserve the eligible S4 operation time when vision confirms before the contact fallback.
+                    event.update(visual_time_upper=event["time_upper"],
+                                 time_lower=slot.load_contact_since,
+                                 time_upper=slot.load_contact_released_at,
+                                 hand_contact_since=slot.load_contact_since,
+                                 hand_contact_released_at=slot.load_contact_released_at,
+                                 hand_contact_frames=slot.load_contact_count)
             if pending_contact or event.get("inferred"):
                 self._clear_load_contact(slot)
         elif (pending_contact and slot.load_contact_can_infer and not contact
@@ -3798,6 +3968,7 @@ class SlotGroupTracker:
                 "reason": "visual_reversal_review_pending" if pending else s.reason,
                 "confirmation_source": None if pending else s.confirmation_source,
                 "visual_reversal_review_pending": pending is not None,
+                "load_state_locked": self._predicted_load_is_locked(s),
                 "geometry_inferred": s.geometry_inferred,
                 "position_is_prediction": is_prediction,
                 "position_is_held": held_position,
