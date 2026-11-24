@@ -1,0 +1,102 @@
+{
+  "image_size": [
+    640,
+    480
+  ],
+  "output_size": [
+    300,
+    600
+  ],
+  "reference_frame": 509,
+  "reference_source": "I:\\youyan\\test_dataset\\测试视频11\\camera_B_20260924_064032.avi",
+  "source_points_xy": [
+    [
+      358.0,
+      95.0
+    ],
+    [
+      623.0,
+      171.0
+    ],
+    [
+      553.0,
+      399.0
+    ],
+    [
+      277.0,
+      315.0
+    ]
+  ],
+  "homography": [
+    [
+      1.0655562673148264,
+      0.392318443875004,
+      -418.7393958668332
+    ],
+    [
+      -0.7574455087655229,
+      2.6410928924060997,
+      20.261667359477684
+    ],
+    [
+      1.0119409649892017e-05,
+      0.00022107999963966507,
+      1.0
+    ]
+  ],
+  "calibration_source_name": "camera_B_20260924_064032.avi",
+  "application_scope": "all_videos",
+  "unload_to_load_clockwise_degrees": -31.826155829995148,
+  "angle_tolerance_degrees": 25.0,
+  "maximum_error_ratio": 0.45,
+  "anchor": {
+    "unload_frame": 509,
+    "load_frame": 1685,
+    "user_confirmed_unload_s4_to_previous_load_slot": 3,
+    "load_point_indices_in_physical_slot_order": [
+      1,
+      3,
+      0,
+      2
+    ],
+    "unload_centers_xy": [
+      [
+        382.11,
+        191.19
+      ],
+      [
+        491.14,
+        240.7
+      ],
+      [
+        435.36,
+        177.54
+      ],
+      [
+        526.09,
+        220.46
+      ]
+    ],
+    "load_centers_xy_before_correction": [
+      [
+        418.85,
+        223.79
+      ],
+      [
+        433.07,
+        277.63
+      ],
+      [
+        529.72,
+        253.63
+      ],
+      [
+        536.04,
+        301.79
+      ]
+    ],
+    "fit_error_top_down_px": 21.702392633361164,
+    "fit_scale": 1.0722520983843522,
+    "angle_definition": "clockwise positive in the calibrated image plane; not a measured machine angle"
+  }
+}

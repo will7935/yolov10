@@ -142,7 +142,8 @@ class _ContactPose:
 class TwoPointHandContact:
     """Own temporary predictions separately from real slot identity and state."""
 
-    def __init__(self, multiplier, upper_roi_edges, roi, *, hold_seconds=.8):
+    def __init__(self, multiplier, upper_roi_edges, roi, *, hold_seconds=.8, upper_slot_three=False,
+                 orbit_degrees=None):
         if not np.isfinite(multiplier) or multiplier < 0:
             raise ValueError("TWO_POINT_EXTENSION_MULTIPLIER 必须是非负有限数")
         if not np.isfinite(hold_seconds) or hold_seconds < 0:
@@ -150,6 +151,10 @@ class TwoPointHandContact:
         self.multiplier = float(multiplier)
         self.hold_seconds = float(hold_seconds)
         self.roi = roi
+        self.upper_slot_three = bool(upper_slot_three)
+        if orbit_degrees is not None and (not np.isfinite(orbit_degrees) or not 0 < abs(orbit_degrees) <= 360):
+            raise ValueError("Orbit angle must be finite and within (0, 360] degrees")
+        self.orbit_degrees = orbit_degrees
         self.direction = None
         if upper_roi_edges:
             start, end = max(upper_roi_edges, key=lambda edge: abs(edge[1][0]-edge[0][0]))
@@ -167,6 +172,12 @@ class TwoPointHandContact:
         self.visual = {}
         self.diagnostics = []
         self.formal_slot_ids = None
+        self.numbering_order = None
+        self.numbering_diagnostic = None
+        self._numbering_key = self._numbering_anchor = self._numbering_since = None
+        self._numbering_frames = 0
+        self.orbit_roles = None
+        self.accepted_slot_ids = set()
         if not keep_released_loads:
             self.released_loads = []
         self._clear_prediction()
@@ -174,13 +185,27 @@ class TwoPointHandContact:
     def _clear_prediction(self):
         self.prediction = self.prediction_supported_at = self.coherent_shift = None
 
+    def uses_orbit(self, tracker):
+        # Later groups use the established G1 loading template: their unloading
+        # samples need not have the same stopped pose as the first group.
+        if self.orbit_degrees is None or tracker.phase != "load" or tracker.group_id != 1:
+            return False
+        if tracker.points is not None and tracker._region_formal_numbering:
+            return tracker.initialization.get("two_point_numbering", {}).get("reference") == "unload_orbit_rotation"
+        return True
+
     def prepare(self, tracker, objects, now, enabled):
         if self.last_update == now:
             return
         self.visual.clear()
         self.diagnostics = []
         self.formal_slot_ids = None
-        use_reference = tracker.phase == "load" and tracker._load_numbering_reference is not None
+        self.numbering_order = None
+        self.accepted_slot_ids.clear()
+        orbit = self.uses_orbit(tracker)
+        formal = tracker.points is not None and tracker._region_formal_numbering
+        use_reference = tracker.phase == "load" and (tracker._load_numbering_reference is not None
+                                                     or tracker._load_perspective_numbering is not None)
         if self.direction is None or tracker.identity_lost:
             self.reset(now)
             return
@@ -191,6 +216,8 @@ class TwoPointHandContact:
                         if item.released_at is None
                         or now-item.released_at <= tracker.initialization_history_seconds}
         if not enabled:
+            self._numbering_key = self._numbering_anchor = self._numbering_since = None
+            self._numbering_frames = 0
             self._clear_prediction()
             self.pending = {i: item for i, item in self.pending.items() if item.ready}
             return
@@ -207,12 +234,15 @@ class TwoPointHandContact:
                       if cv2.pointPolygonTest(self.roi, tuple(obj["center"]), False) >= 0]
         usable = {obj["track_id"]: obj for obj in candidates if obj.get("track_id") is not None
                   and not obj["conflict"] and not tracker._occluded(obj, hands)}
-        if len(candidates) > 2:
+        if len(candidates) > 2 and not (orbit and formal):
             self.pending = {i: item for i, item in self.pending.items() if item.ready}
             if not self.pending:
                 self.reset(now, keep_released_loads=True)
                 return
-        if len(candidates) == len(usable) == 2 and (self.pair is None or not self.pending):
+        bound_pair = (tracker.byte_track_ids[0], tracker.byte_track_ids[2]) if orbit and formal else ()
+        if bound_pair and all(track_id is not None and track_id in usable for track_id in bound_pair):
+            pair = tuple(sorted(bound_pair))
+        elif len(candidates) == len(usable) == 2 and (self.pair is None or not self.pending):
             pair = tuple(sorted(usable))
         else:
             pair = self.pair
@@ -224,14 +254,20 @@ class TwoPointHandContact:
                 and now-self.last_support > tracker.lost_seconds):
             self.reset(now, keep_released_loads=True)
             self.pair = pair
-        can_start = len(candidates) <= 2 and all(track_id in (pair or ()) for track_id in usable)
+        can_start = (len(candidates) <= 2 and all(track_id in (pair or ()) for track_id in usable)) \
+                    or (orbit and formal and len(candidates) <= 4 and all(tid in usable for tid in pair or ()))
         if pair is None or len(candidates) > 4 or not all(track_id in usable for track_id in pair):
+            self._numbering_key = self._numbering_anchor = self._numbering_since = None
+            self._numbering_frames = 0
             self._use_previous_pose(tracker, hands, now, can_start=can_start)
             return
         support = [usable[track_id] for track_id in pair]
-        projected = two_point_slot_layout(support, self.direction, self.multiplier, self.roi,
-                                          require_transverse=not use_reference)
+        projected = (self._orbit_projection(tracker, support, formal=formal) if orbit else
+                     two_point_slot_layout(support, self.direction, self.multiplier, self.roi,
+                                           require_transverse=not use_reference))
         if projected is None:
+            self._numbering_key = self._numbering_anchor = self._numbering_since = None
+            self._numbering_frames = 0
             self.anchor = self.since = None
             self.frames = 0
             self.sizes.clear()
@@ -239,17 +275,20 @@ class TwoPointHandContact:
             return
         layout, extension = projected
         spacing = min(extension, float(np.linalg.norm(layout[0]-layout[1])))
-        formal = tracker.points is not None and tracker._region_formal_numbering
         if use_reference:
-            roles = self._load_reference_roles(tracker, support, layout, formal=formal)
+            roles = self.orbit_roles if orbit else self._load_reference_roles(tracker, support, layout, formal=formal)
             if formal and roles is None:
                 self.reset(now, keep_released_loads=True)
                 self.pair = pair
                 return
             if self.reference_roles is not None and roles is not None and self.reference_roles != roles:
+                diagnostic = self.numbering_diagnostic
                 self.reset(now, keep_released_loads=True)
                 self.pair = pair
+                self.numbering_diagnostic = diagnostic
             self.reference_roles = roles
+        if tracker._load_perspective_numbering is not None and not formal:
+            self._update_numbering_stability(tracker, layout, now, can_start)
         if (self.anchor is None or self.last_support is None
                 or now-self.last_support > max(.25, tracker.geometry_initialization_seconds)
                 or np.max(np.linalg.norm(layout-self.anchor, axis=1)) >
@@ -264,6 +303,8 @@ class TwoPointHandContact:
         if (self.frames < tracker.initialization_frames
                 or now-self.since+1e-9 < tracker.geometry_initialization_seconds):
             self._use_previous_pose(tracker, hands, now, can_start=can_start)
+            if self.prediction is None and tracker._load_perspective_numbering is not None:
+                self._show_live_preview(layout, support, hands, now)
             return
         if tracker.points is not None and (not use_reference or formal):
             self.formal_slot_ids = ([slot_index+1 for slot_index in self.reference_roles[2:]]
@@ -278,20 +319,145 @@ class TwoPointHandContact:
         boxes = np.hstack((layout[2:]-half_size, layout[2:]+half_size))
         prediction = _Prediction(layout, boxes, half_size, spacing, self.formal_slot_ids, now, self.reference_roles)
         other_slots = [obj for track_id, obj in usable.items() if track_id not in pair]
-        self._evaluate(tracker, prediction, hands, now, can_start=len(candidates) == len(usable) == 2,
+        self._evaluate(tracker, prediction, hands, now, can_start=can_start,
                        other_slots=other_slots)
+
+    def _orbit_projection(self, tracker, support, *, formal):
+        self.orbit_roles = None
+        info = {"reference": "unload_orbit_rotation", "clockwise_degrees": self.orbit_degrees,
+                "measured_support": 2, "status": "waiting_for_unload_orbit_reference"}
+        self.numbering_diagnostic = info
+        if (tracker._load_perspective_numbering is None or tracker._orbit_unload_reference is None
+                or tracker.machine_center is None):
+            return None
+        predicted = tracker._load_perspective_numbering.rotate_about_machine(
+            tracker._orbit_unload_reference, tracker.machine_center, self.orbit_degrees)
+        observed = np.asarray([obj['center'] for obj in support])
+        if formal:
+            if not all(obj['track_id'] in tracker.byte_track_ids for obj in support):
+                return None
+            anchors = tuple(tracker.byte_track_ids.index(obj['track_id']) for obj in support)
+        else:
+            upper = int(np.argmin(observed[:, 1]))
+            anchors = (2, 0) if upper == 0 else (0, 2)
+        spacing = np.min(np.linalg.norm(predicted[:, None]-predicted[None, :], axis=2)[np.triu_indices(4, 1)])
+        gate = min(40., spacing*tracker.match_distance_ratio)
+        errors = np.linalg.norm(observed-predicted[list(anchors)], axis=1)
+        # The explicit S3/S1 rule supplies identity even when the calibrated
+        # projection is biased. Once numbered, stop contact inference if the
+        # real anchors move away from that initial loading pose.
+        explicit = self.upper_slot_three and tracker.group_id == 1
+        pose_errors = (np.linalg.norm(observed-tracker.reference_points[list(anchors)], axis=1)
+                       if formal else errors)
+        if set(anchors) != {0, 2} or (pose_errors.max() > gate and (formal or not explicit)):
+            self.numbering_diagnostic = dict(info, status="orbit_anchor_mismatch",
+                anchor_errors_px=errors.tolist(), pose_errors_px=pose_errors.tolist(),
+                maximum_anchor_error_px=float(gate))
+            return None
+        missing = sorted(set(range(4))-set(anchors), key=lambda i: predicted[i, 1])
+        roles = (*anchors, *missing)
+        layout = np.vstack((observed, predicted[missing]))
+        if (slot_layout_error(layout) is None
+                or any(cv2.pointPolygonTest(self.roi, tuple(point), False) < 0 for point in layout[2:])
+                or _clockwise_roles(tracker, layout, anchors[0]) != roles):
+            self.numbering_diagnostic = dict(info, status="orbit_geometry_mismatch")
+            return None
+        self.orbit_roles = roles
+        self.numbering_diagnostic = dict(info, status="matched", candidate_count=1,
+            anchor_errors_px=errors.tolist(), pose_errors_px=pose_errors.tolist(),
+            maximum_pose_error_px=float(gate), pose_error_gate_applied=formal or not explicit,
+            anchor_identity="configured_upper_s3_lower_s1" if explicit else "orbit_reference",
+            reference_centers_xy=np.asarray(tracker._orbit_unload_reference).tolist(),
+            machine_center_xy=np.asarray(tracker.machine_center).tolist(),
+            slot_ids_in_preview_order=[i+1 for i in roles], predicted_centers_xy=predicted.tolist())
+        return layout, float(spacing)
+
+    def orbit_contact(self, slot_id, now):
+        if self.orbit_degrees is None or now != self.last_update:
+            return None
+        return next((item for item in self.diagnostics if item.get('slot_id') == slot_id), None)
 
     def _load_reference_roles(self, tracker, support, layout, *, formal):
         if not formal:
+            if self.upper_slot_three and tracker.phase == "load" and tracker.group_id == 1:
+                upper = int(np.argmin(layout[:2, 1]))
+                lower = 1-upper
+                roles = _clockwise_roles(tracker, layout, 2 if upper == 0 else 0)
+                valid = (abs(layout[0, 1]-layout[1, 1]) >= 2.
+                         and roles[upper] == 2 and roles[lower] == 0
+                         and set(roles[2:]) == {1, 3})
+                self.numbering_diagnostic = {
+                    "status": "matched" if valid else "explicit_anchor_geometry_mismatch",
+                    "reference": "configured_upper_s3_lower_s1", "measured_support": 2,
+                    "candidate_count": int(valid), "upper_anchor_track_id": support[upper]["track_id"],
+                    "lower_anchor_track_id": support[lower]["track_id"],
+                    "slot_ids_in_preview_order": [i+1 for i in roles] if valid else None}
+                return roles if valid else None
+            if tracker._load_perspective_numbering is not None:
+                subsequent = tracker.group_id != 1
+                reference = (tracker._g1_load_numbering_reference if subsequent
+                             else tracker._load_numbering_reference)
+                roles, diagnostic = tracker._load_perspective_numbering.match_pair(
+                    reference, layout, self.direction, self.roi, same_load_pose=subsequent)
+                self.numbering_diagnostic = diagnostic
+                return roles
             return _load_preview_roles(tracker, layout, self.direction)
         track_ids = [obj["track_id"] for obj in support]
         if not all(track_id in tracker.byte_track_ids for track_id in track_ids):
             return None
         anchors = tuple(tracker.byte_track_ids.index(track_id) for track_id in track_ids)
-        if set(anchors) != LOAD_CLOCKWISE_ANCHORS:
+        if tracker._load_perspective_numbering is None and set(anchors) != LOAD_CLOCKWISE_ANCHORS:
             return None
         roles = _clockwise_roles(tracker, layout, anchors[0])
         return roles if roles[:2] == anchors else None
+
+    def _update_numbering_stability(self, tracker, layout, now, enabled):
+        roles = self.reference_roles
+        info = dict(self.numbering_diagnostic or {"status": "waiting_for_reference"})
+        if roles is None or not enabled:
+            self._numbering_key = self._numbering_anchor = self._numbering_since = None
+            self._numbering_frames = 0
+        else:
+            key = (self.pair, roles)
+            spacing = np.min(np.linalg.norm(layout[:, None]-layout[None, :], axis=2)[np.triu_indices(4, 1)])
+            if (key != self._numbering_key or self._numbering_anchor is None
+                    or self.last_support is None
+                    or now-self.last_support > max(.25, tracker.geometry_initialization_seconds)
+                    or np.max(np.linalg.norm(layout-self._numbering_anchor, axis=1))
+                       > spacing*tracker.initialization_stability_ratio):
+                self._numbering_key, self._numbering_anchor = key, layout.copy()
+                self._numbering_since, self._numbering_frames = now, 0
+            self._numbering_frames += 1
+            if (self._numbering_frames >= max(3, tracker.minimum_frames, tracker.initialization_frames)
+                    and now-self._numbering_since+1e-9 >= tracker.geometry_initialization_seconds):
+                self.numbering_order = roles
+        info.update(stable_frames=self._numbering_frames, ready=self.numbering_order is not None)
+        self.numbering_diagnostic = info
+        tracker.initialization["two_point_numbering"] = info
+
+    def _show_live_preview(self, layout, support, hands, now):
+        """Display the current two-point geometry while contact evidence warms up."""
+        size = np.median([np.subtract(obj['xyxy'][2:], obj['xyxy'][:2]) for obj in support], axis=0)/2
+        boxes = np.hstack((layout[2:]-size, layout[2:]+size))
+        scores = _contact_areas(boxes, layout[2:], hands) or [0., 0.]
+        self.diagnostics = [{"center_xy": center.tolist(), "box_xyxy": box.tolist(),
+            "coverage": score, "anchor_track_ids": list(self.pair), "slot_id": None,
+            "reference_slot_id": None if self.reference_roles is None else self.reference_roles[i+2]+1,
+            "reference_anchor_slot_ids": (None if self.reference_roles is None
+                                          else [j+1 for j in self.reference_roles[:2]]),
+            "held": False, "prediction_age_seconds": 0., "prediction_support_age_seconds": 0.,
+            "status": "prediction", "contact_enabled": False, "contact_since": None,
+            "released_at": None, "track_id": None}
+            for i, (center, box, score) in enumerate(zip(layout[2:], boxes, scores))]
+
+    def confirm_numbering(self):
+        """Publish the verified predicted roles together with the group's formal numbering."""
+        if self.numbering_order is None or self.prediction is None:
+            return
+        self.formal_slot_ids = [i+1 for i in self.numbering_order[2:]]
+        self.prediction = replace(self.prediction, slot_ids=self.formal_slot_ids)
+        for entry, slot_id in zip(self.diagnostics, self.formal_slot_ids):
+            entry['slot_id'] = slot_id
 
     def _check_previous_pose(self, tracker, usable, now):
         prediction = self.prediction
@@ -349,7 +515,8 @@ class TwoPointHandContact:
         touched = [i for i, score in enumerate(scores) if score >= threshold]
         provisional_load = (tracker.phase == "load" and tracker.load_hand_contact_enabled
                             and (tracker.points is None or not tracker._region_formal_numbering))
-        ring_load = tracker.phase == "load" and tracker._load_numbering_reference is not None
+        ring_load = tracker.phase == "load" and (tracker._load_numbering_reference is not None
+                                                 or tracker._load_perspective_numbering is not None)
         winner = touched[0] if len(touched) == 1 else None
         if provisional_load and len(touched) == 2 and abs(scores[0]-scores[1]) >= LOAD_CONTACT_DOMINANCE_MARGIN:
             winner = 0 if scores[0] > scores[1] else 1
@@ -366,11 +533,13 @@ class TwoPointHandContact:
         ambiguous_load = tracker.phase == "load" and len(touched) == 2 and winner is None
         center_breaks_tie = winner is not None and winner != coverage_winner
         if tracker.phase == "load" and not provisional_load:
-            target = tracker.inferred_load_contact_index()
-            eligible = [i for i, slot_id in enumerate(prediction.slot_ids or ()) if slot_id-1 == target]
+            targets = tracker.inferred_load_contact_indices()
+            eligible = [i for i, slot_id in enumerate(prediction.slot_ids or ()) if slot_id-1 in targets]
             winner = winner if winner in eligible else None
             touched = [i for i in touched if i in eligible]
             self.pending = {i: item for i, item in self.pending.items() if i in eligible}
+        if self.uses_orbit(tracker) and can_start and winner is not None and prediction.slot_ids is not None:
+            self.accepted_slot_ids.add(prediction.slot_ids[winner])
         for index, (box, score) in enumerate(zip(boxes, scores)):
             contact = self.pending.get(index)
             if contact is None and winner == index and can_start:
@@ -426,12 +595,15 @@ class TwoPointHandContact:
 
     def take_inferred_load(self, tracker, target, empty_at, now):
         """Consume a released contact only when it matches the final inferred slot."""
-        candidates, self.released_loads = self.released_loads, []
+        candidates = self.released_loads
         matched = [contact for index, contact in candidates if empty_at <= contact.since
                    and now-contact.released_at <= tracker.initialization_history_seconds
                    and (target == 3 or contact.requires_visual_load)
                    and self._matches_formal_load(tracker, index, contact.load_pose, target)]
-        return matched[0] if len(matched) == 1 else None
+        if len(matched) != 1:
+            return None
+        self.released_loads = [(index, contact) for index, contact in candidates if contact is not matched[0]]
+        return matched[0]
 
     def _matches_formal_load(self, tracker, index, pose, target):
         anchors = []
@@ -454,7 +626,8 @@ class TwoPointHandContact:
         predicted = pose.layout[2:] @ matrix[:, :2].T + matrix[:, 2]
         if tracker._load_numbering_reference is not None:
             roles = _clockwise_roles(tracker, pose.layout, anchors[0])
-            if (set(anchors) != LOAD_CLOCKWISE_ANCHORS or roles[:2] != tuple(anchors) or roles[index+2] != target
+            if ((tracker._load_perspective_numbering is None and set(anchors) != LOAD_CLOCKWISE_ANCHORS)
+                    or roles[:2] != tuple(anchors) or roles[index+2] != target
                     or _clockwise_roles(tracker, points, 0) != tuple(range(4))):
                 return False
             separation = np.linalg.norm(points[roles[2]]-points[roles[3]])

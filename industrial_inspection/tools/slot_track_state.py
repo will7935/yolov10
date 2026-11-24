@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from math import dist
 
 import cv2
+import numpy as np
 
-from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, SlotState
+from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, SlotState, slot_layout_error
 
 
 @dataclass
@@ -52,6 +53,92 @@ class RoiEdgeTrack:
 
     def miss(self, now):
         self.state.observe('unknown', now, None, 'not_detected', 0, 1)
+
+
+@dataclass
+class InitialEdgeSlot:
+    """Hold one geometrically supported G1 edge slot across a ByteTrack gap."""
+
+    center: np.ndarray
+    peers: dict
+    last_seen: float
+    frames: int = 0
+    track_ids: set = field(default_factory=set)
+    state: SlotState = field(default_factory=lambda: SlotState(0))
+    filled_at: float | None = None
+    first_empty_at: float | None = None
+
+    @classmethod
+    def review(cls, previous, objects, untracked, now, tracker, contour, in_edge_strip, distance_limit):
+        hands = [obj for obj in objects if obj['class_name'] == 'hand']
+
+        def reliable(candidates):
+            return [obj for obj in tracker._candidates(candidates)
+                    if not obj['conflict'] and obj.get('detection_source') != 'local_crop'
+                    and not tracker._occluded(obj, hands)]
+
+        tracked = reliable(obj for obj in objects if obj.get('track_id') is not None)
+        inside = [obj for obj in tracked if cv2.pointPolygonTest(contour, tuple(obj['center']), False) >= 0]
+        peers = {obj['track_id']: np.asarray(obj['center']) for obj in inside}
+        if previous is not None and now-previous.last_seen > tracker.initialization_history_seconds:
+            previous = None
+        expected = None
+        if previous is not None:
+            common = peers.keys() & previous.peers.keys()
+            if len(common) >= 2:
+                motion = np.array([peers[tid]-previous.peers[tid] for tid in common])
+                shift = np.median(motion, axis=0)
+                if (np.linalg.norm(shift) <= distance_limit
+                        and np.count_nonzero(np.linalg.norm(motion-shift, axis=1) <= distance_limit/2) >= 2):
+                    expected = previous.center+shift
+
+        has_three_peers = len(inside) == len(peers) == 3
+        verified_position = previous is not None and previous.frames >= max(3, tracker.initialization_frames)
+
+        def fits(obj):
+            if (not in_edge_strip(obj['center']) or (previous is not None and
+                    (expected is None or np.linalg.norm(obj['center']-expected) > distance_limit))):
+                return False
+            # Two consistent peers can maintain an established ID. A new or
+            # missing ID must still have three measured peers and a valid layout.
+            if verified_position and obj.get('track_id') in previous.track_ids:
+                return True
+            return has_three_peers and slot_layout_error([*peers.values(), obj['center']]) is not None
+
+        candidates = [obj for obj in tracked if fits(obj)] if 2 <= len(inside) <= 3 else []
+        if not candidates and has_three_peers and previous is not None and previous.filled_at is not None:
+            candidates = [obj for obj in reliable(untracked) if obj.get('track_id') is None and fits(obj)]
+        if len(candidates) != 1:
+            if previous is not None:
+                previous.state.observe('unknown', now, None, 'not_detected', 0, 1)
+            return previous, None
+
+        obj, = candidates
+        center = np.asarray(obj['center'])
+        evidence = previous if previous is not None else cls(center, peers, now)
+        track_id = obj.get('track_id')
+        observation = SLOT_STATES[obj['class_name']]
+        if observation == 'filled':
+            evidence.first_empty_at = None
+        elif evidence.filled_at is not None and evidence.first_empty_at is None:
+            evidence.first_empty_at = now
+        if track_id is None:
+            evidence.state.observe('unknown', now, None, 'not_detected', 0, 1)
+            return evidence, None
+
+        if now-evidence.last_seen > .25 and evidence.filled_at is None:
+            evidence.frames = 0
+        evidence.frames += 1
+        evidence.track_ids.add(track_id)
+        evidence.center, evidence.peers, evidence.last_seen = center, peers, now
+        evidence.state.observe(observation, now, obj['confidence'], 'detected',
+                               tracker.confirm_seconds, tracker.minimum_frames)
+        if observation == evidence.state.confirmed == 'filled':
+            evidence.filled_at = now
+        if evidence.frames < max(3, tracker.initialization_frames):
+            return evidence, None
+        return evidence, dict(obj, initial_edge_slot=True, edge_filled_at=evidence.filled_at,
+                              edge_first_empty_at=evidence.first_empty_at)
 
 
 class SlotTrackStateStore:
@@ -124,7 +211,7 @@ class SlotTrackStateStore:
             state, reason = 'unknown', 'not_detected'
             if not enabled:
                 reason = 'inspection_paused'
-            elif not inside:
+            elif not inside and not obj.get('initial_edge_slot'):
                 reason = 'outside_roi'
             elif obj['conflict']:
                 reason = 'empty_filled_conflict'

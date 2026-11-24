@@ -711,6 +711,35 @@ class GroupSequenceTests(unittest.TestCase):
                     self.assertGreater(event['reported_at'], event['confirmed_at'])
                     self.assertEqual(result['slots'][event['slot_id']-1]['last_confirmed_state'], 'empty')
 
+    def test_initial_edge_slot_keeps_visual_evidence_across_track_ids(self):
+        roi = np.array([[0, 100], [300, 100], [300, 300], [0, 300]], dtype=np.float32)
+        points = np.array([[100, 94], [200, 110], [100, 200], [200, 200]], dtype=float)
+        tracker = SlotGroupTracker(confirm_seconds=0., minimum_frames=4,
+            initialization_seconds=.1, initialization_frames=2, allow_three_point_initialization=True,
+            require_unload_event_before_numbering=True)
+        sequence = RoiGroupSequence(tracker, roi, edge_evidence_px=8, require_first_unload_event_for_g1=True)
+        peers = [dict(obj, track_id=i) for i, obj in zip((2, 3, 4), boxes(
+            points, visible=(1, 2, 3), filled=(1, 2, 3)))]
+        filled = dict(boxes(points, visible=(0,), filled=(0,))[0], track_id=10)
+        empty = boxes(points, visible=(0,))[0]
+        for frame in range(5):
+            visible_peers = peers[:2] if frame == 3 else peers
+            result = sequence.update([*visible_peers, filled], frame/10)
+        self.assertIn(10, [slot['byte_track_id'] for slot in result['slots']])
+        self.assertFalse(sequence.all_events)
+
+        sequence.update(peers[:2], .5, initial_edge_candidates=(empty,))
+        sequence.update(peers, .6, initial_edge_candidates=(empty,))
+        self.assertFalse(sequence.all_events)
+        for frame in range(7, 12):
+            result = sequence.update([*peers, dict(empty, track_id=20)], frame/10)
+        event, = sequence.all_events
+        self.assertEqual((event['byte_track_id'], event['reason']), (20, 'roi_edge_visual_confirmation'))
+        self.assertEqual(event['time_upper'], .6)
+        self.assertGreater(event['confirmed_at'], event['time_upper'])
+        self.assertEqual(result['slots'][event['slot_id']-1]['last_confirmed_state'], 'empty')
+        np.testing.assert_array_equal(sequence.contour, roi)
+
     def test_non_monotonic_time_is_rejected(self):
         s=self.make()
         self.step(s,boxes())

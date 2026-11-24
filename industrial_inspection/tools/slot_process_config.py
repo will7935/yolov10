@@ -68,6 +68,8 @@ THREE_POINT_GROUP_INITIALIZATION = True  # 三个真实槽位可推算缺失S4�
 LOAD_ENTRY_QUARTET_REVIEW_SECONDS = .35  # 上料正式编号前，第四个真实框触发的复核窗口
 LOAD_ENTRY_QUARTET_REVIEW_FRAMES = 3     # 窗口内一致的四实框映射次数，允许短时漏检
 S4_USE_PREVIOUS_GROUP_LAYOUTS = True  # 下料逐点换组时，优先采用一致的前组实测四槽布局推算S4
+# 所有视频共用俯视变换和相对转角；下料布局、G1上料模板由每次运行独立采集。None关闭。
+LOAD_NUMBERING_CALIBRATION_FILE = ROOT / "industrial_inspection" / "configs" / "slot_numbering_perspective.json"
 # G1下料在首个可信下料事件前只作为候选；若候选先离开ROI则自动释放，不占用G1。
 REQUIRE_FIRST_UNLOAD_EVENT_FOR_G1 = True
 
@@ -107,6 +109,9 @@ LOCAL_REDETECT_ENABLED = True # 补检下料正式 S4，以及上料编号前的
 LOCAL_REDETECT_CROP_SIZE = (180, 140) # 原图裁剪宽、高（像素），保留槽周围背景
 LOCAL_REDETECT_IMAGE_SIZE = 320 # 局部图送入YOLO时的尺寸；分别沿用槽位/手部证据门槛
 TWO_POINT_EXTENSION_MULTIPLIER = 1.5 # 双槽预测沿ROI上边向右外推，0关闭
+TWO_POINT_UPPER_S3_SOURCES = ("camera_B_20260924_062208.avi",)  # 已人工确认的G1上料两实槽：上S3、下S1
+LOAD_ORBIT_ROTATION_SOURCES = ("camera_B_20260924_062208.avi",)  # 试验：这些视频的G1两槽上料使用绕机心预测，后续组匹配G1上料模板。
+LOAD_ORBIT_ROTATION_DEGREES = -40.0  # 俯视图中顺时针为正，-40表示下料到上料逆时针40°。
 TWO_POINT_HAND_HOLD_SECONDS = .8     # 旧框等待新位置时可沿用；定位槽连续失联多久后清除，0关闭沿用
 ROTATION_INTERVALS = []       # 可选源视频秒数[(开始,结束),...]；期间跟踪位置、暂停空满确认
 SHOW_SLOT_TEXT = True         # 正式编号后在点旁标注S1-S4；初始化阶段在ByteTrack框上标状态

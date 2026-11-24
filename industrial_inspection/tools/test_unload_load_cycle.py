@@ -311,6 +311,9 @@ class CycleSequenceTests(unittest.TestCase):
 
 class CyclePipelineTests(unittest.TestCase):
     def setUp(self):
+        calibration = patch.object(predict, 'LOAD_NUMBERING_CALIBRATION_FILE', None)
+        calibration.start()
+        self.addCleanup(calibration.stop)
         hatch_control = patch.object(predict, 'HATCH_CONTROL_ENABLED', False)
         hatch_control.start()
         self.addCleanup(hatch_control.stop)

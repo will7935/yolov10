@@ -31,6 +31,10 @@ from industrial_inspection.tools.slot_local_redetection import (
     LocalRedetectionPolicy, recover_load_preview_support, recover_load_reach_hand,
     recover_missing_slots as recover_local_observations)
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
+from industrial_inspection.tools.slot_perspective_numbering import SlotPerspectiveNumbering
+from industrial_inspection.tools.slot_process_config import LOAD_NUMBERING_CALIBRATION_FILE
+from industrial_inspection.tools.slot_process_config import TWO_POINT_UPPER_S3_SOURCES
+from industrial_inspection.tools.slot_process_config import LOAD_ORBIT_ROTATION_SOURCES, LOAD_ORBIT_ROTATION_DEGREES
 from industrial_inspection.tools.slot_roi import draw_roi, pixel_polygon, load_roi, select_roi
 from industrial_inspection.tools.slot_byte_tracker import SlotByteTracker
 from industrial_inspection.tools.hatch_loading_inspection import (
@@ -274,7 +278,10 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
                       np.asarray(MACHINE_CENTER_NORMALIZED, dtype=float)*size)
     tracker = make_tracker(region_px, unload_entry_numbering_seconds=numbering_seconds,
                            machine_center=machine_center)
+    calibration = SlotPerspectiveNumbering.for_source(LOAD_NUMBERING_CALIBRATION_FILE,
+        getattr(args, "source", None), size)
     return RoiGroupSequence(tracker,pixel_polygon(polygon,size),enabled=AUTO_GROUP_SWITCH,
+        load_numbering_calibration=calibration,
         buffer_px=ROI_TRACKING_MARGIN_PX,boundary_margin_px=EXIT_BOUNDARY_MARGIN_PX,
         edge_evidence_px=ROI_EDGE_EVIDENCE_PX*min(size[0]/640, size[1]/480),
         exit_seconds=EXIT_CONFIRM_SECONDS,exit_min_slots=EXIT_MIN_SLOTS,
@@ -284,6 +291,11 @@ def make_sequence(polygon,size,hand_region=None,*,args=None):
         exit_direction=EXIT_DIRECTION,auto_load_after_unload=AUTO_LOAD_AFTER_UNLOAD,
         entry_birth_fraction=NEXT_GROUP_ENTRY_FRACTION,
         two_point_extension_multiplier=TWO_POINT_EXTENSION_MULTIPLIER,
+        two_point_upper_s3=(getattr(args, "source", None) is not None
+            and Path(args.source).name in TWO_POINT_UPPER_S3_SOURCES),
+        load_orbit_rotation_degrees=(LOAD_ORBIT_ROTATION_DEGREES
+            if getattr(args, "source", None) is not None and Path(args.source).name in LOAD_ORBIT_ROTATION_SOURCES
+            else None),
         two_point_hand_hold_seconds=TWO_POINT_HAND_HOLD_SECONDS,
         unload_entry_upper_right_band=(UNLOAD_ENTRY_UPPER_RIGHT_MIN_X_RATIO*size[0],
             UNLOAD_ENTRY_UPPER_RIGHT_BAND_PX*min(size[0]/640, size[1]/480)),
@@ -857,6 +869,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "architecture": architecture,"conf": args.conf,"audit_conf": audit_confidence,
         "effective_detection_thresholds": thresholds.snapshot(),
         "algorithm_configuration": snapshot_algorithm_config(globals()),
+        "load_numbering_calibration": (sequence.load_numbering_calibration.snapshot()
+            if sequence.load_numbering_calibration is not None else None),
         "imgsz": args.imgsz,"stride": args.stride,
         "detection_confidence_csv": "detection_confidences.csv",
         "slot_tracking": {"enabled": False, "backend": None,
@@ -981,6 +995,13 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
             "crop_size_wh": list(LOCAL_REDETECT_CROP_SIZE),"imgsz": LOCAL_REDETECT_IMAGE_SIZE,
             "conf": thresholds.slot_state,"hand_conf": thresholds.hand,"match_distance": "same_as_slot_tracker"},
         "two_point_hand_contact_config": {"extension_multiplier": TWO_POINT_EXTENSION_MULTIPLIER,
+            "orbit_clockwise_degrees": (tracker.two_point_hand_contact.orbit_degrees
+                if tracker.two_point_hand_contact is not None else None),
+            "orbit_scope": "g1_loading_two_point_prediction",
+            "later_load_groups_reference": "g1_loading_template",
+            "g1_explicit_anchor_slots": ({"upper": 3, "lower": 1}
+                if tracker.two_point_hand_contact is not None
+                and tracker.two_point_hand_contact.upper_slot_three else None),
             "load_geometry": "roi_upper_edge_projection_with_clockwise_roles",
             "hold_seconds": TWO_POINT_HAND_HOLD_SECONDS,
             "hold_timeout_basis": "last_reliable_anchor_near_prediction",
@@ -1216,6 +1237,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     snapshot = sequence.update(objects,timestamp,observations_enabled=enabled,
                         s4_position_candidates=s4_position_candidates, entry_load_reach_hand=reach_hand,
                         entry_position_candidates=entry_position_candidates,
+                        initial_edge_candidates=[obj for obj in s4_position_candidates
+                                                 if obj["confidence"] >= thresholds.slot_state],
                         load_support_resolver=find_load_preview_support if local_policy.enabled else None)
                     inspection_processed += 1
                 else:

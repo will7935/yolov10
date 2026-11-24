@@ -218,6 +218,8 @@ class HatchPipelineTests(unittest.TestCase):
         args = argparse.Namespace(source=source,weights=root/'model.pt',output_dir=root/'results',
             conf=.35,imgsz=640,device='cpu',stride=1,show=False,max_frames=0,nms_iou=.7)
         configuration = {'HATCH_CONTROL_ENABLED':True,'HATCH_CONFIRM_SECONDS':.1,
+            # Synthetic square coordinates use their own geometry, outside the camera calibration.
+            'LOAD_NUMBERING_CALIBRATION_FILE':None,
             'HATCH_MIN_CONFIRM_FRAMES':2,'LOCAL_REDETECT_ENABLED':False,
             'CONFIRM_SECONDS':.1,'MIN_CONFIRM_FRAMES':2,**configuration}
         from contextlib import ExitStack

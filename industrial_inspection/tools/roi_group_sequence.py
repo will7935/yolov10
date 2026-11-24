@@ -11,7 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from industrial_inspection.tools.slot_group_tracker import (
     SLOT_STATES, box_containment, box_iou, slot_layout_error, valid_slot_geometry)
 from industrial_inspection.tools.slot_s4_load_lookback import S4LoadLookback
-from industrial_inspection.tools.slot_track_state import SlotTrackStateStore
+from industrial_inspection.tools.slot_track_state import InitialEdgeSlot, SlotTrackStateStore
 from industrial_inspection.tools.slot_two_point_contact import TwoPointHandContact
 
 
@@ -36,7 +36,8 @@ class RoiGroupSequence:
                  outside_mapping_quarantine_seconds=3.0,
                  use_previous_s4_layouts=False, edge_evidence_px=0.0,
                  unload_entry_upper_right_band=(0., 0.), two_point_extension_multiplier=0.,
-                 two_point_hand_hold_seconds=.8):
+                 two_point_hand_hold_seconds=.8, load_numbering_calibration=None, two_point_upper_s3=False,
+                 load_orbit_rotation_degrees=None):
         self.tracker = tracker
         self.contour = np.asarray(contour,dtype=np.float32)
         if self.contour.ndim != 2 or self.contour.shape[1] != 2 or not cv2.isContourConvex(self.contour):
@@ -77,7 +78,8 @@ class RoiGroupSequence:
         if two_point_extension_multiplier:
             tracker.two_point_hand_contact = TwoPointHandContact(
                 two_point_extension_multiplier, self._upper_roi_edges, self.contour,
-                hold_seconds=two_point_hand_hold_seconds)
+                hold_seconds=two_point_hand_hold_seconds, upper_slot_three=two_point_upper_s3,
+                orbit_degrees=load_orbit_rotation_degrees)
         self.reject_transition_roi_detections = bool(reject_transition_roi_detections)
         self.transition_quarantine_min_frames = int(transition_quarantine_min_frames)
         self.unload_to_load_quarantine_min_frames = int(unload_to_load_quarantine_min_frames)
@@ -161,6 +163,9 @@ class RoiGroupSequence:
             self.require_first_unload_event_for_g1
             and tracker.phase == "unload" and tracker.group_id == 1)
         self._g1_pending_events = []
+        self._g1_edge_slot = None
+        self._g1_interior_quartet_review = None
+        self._g1_rejected_edge_ids = set()
         # IDs observed outside the ROI during the short handoff window are
         # permanently rejected for this group.  The set is group-scoped and
         # is cleared when the next group is armed.
@@ -171,8 +176,16 @@ class RoiGroupSequence:
         self._pending_load_rebind = None
         self.use_previous_s4_layouts = bool(use_previous_s4_layouts)
         self._unload_layouts = {}
+        self._unload_orbit_layouts = {}
         self._layout_samples = deque(maxlen=3)
         self._layout_sample_key = None
+        self.load_numbering_calibration = load_numbering_calibration
+        self._g1_load_layout_samples = deque(maxlen=3)
+        self._g1_load_layout_key = None
+        self._g1_load_layout = None
+        self._g1_load_layout_inferred_slot_ids = ()
+        if tracker.phase == "load":
+            tracker._load_perspective_numbering = load_numbering_calibration
 
     def _distance(self, point):
         return cv2.pointPolygonTest(self.contour,tuple(float(v) for v in point),True)
@@ -216,6 +229,105 @@ class RoiGroupSequence:
                 if -1e-6 <= distance <= width+1e-6:
                     return True
         return False
+
+    def _in_initial_edge_strip(self, center):
+        depth = self._distance(center)
+        if not -self.track_store.edge_evidence_px <= depth < 0:
+            return False
+        return any(min(start[0], end[0]) <= center[0] <= max(start[0], end[0])
+                   and (end[0]-start[0])*(center[1]-start[1]) <
+                       (end[1]-start[1])*(center[0]-start[0])
+                   for start, end in (sorted(edge, key=lambda point: point[0])
+                                      for edge in self._upper_roi_edges))
+
+    def _admit_initial_edge_slot(self, objects, untracked, now):
+        tracker = self.tracker
+        if (tracker.phase, tracker.group_id) == ('unload', 1) and self._g1_rejected_edge_ids:
+            retained = []
+            for obj in objects:
+                if obj['class_name'] in SLOT_STATES and obj.get('track_id') in self._g1_rejected_edge_ids:
+                    self._reject_track(obj, 'initial_edge_replaced_by_interior_quartet')
+                else:
+                    retained.append(obj)
+            objects = retained
+        if (not self._observations_enabled or not self.require_first_unload_event_for_g1
+                or (tracker.phase, tracker.group_id) != ('unload', 1)
+                or self.state not in ('initializing', 'active') or tracker.identity_lost
+                or not self.track_store.edge_evidence_px
+                or (tracker.points is not None and self._g1_edge_slot is None)):
+            self._g1_interior_quartet_review = None
+            return objects
+        identity = (tracker.phase, tracker.group_id)
+        eligible = [obj for obj in objects if obj['class_name'] not in SLOT_STATES
+                    or (self.track_store.owner(obj.get('track_id')) in (None, identity)
+                        and obj.get('track_id') not in self._transition_quarantine_track_ids)]
+        if self._prefer_initial_interior_quartet(eligible, now):
+            return self._admit_initial_edge_slot(objects, untracked, now)
+        self._g1_edge_slot, selected = InitialEdgeSlot.review(
+            self._g1_edge_slot, eligible, untracked, now, tracker, self.contour,
+            self._in_initial_edge_strip, 2*self.track_store.edge_evidence_px)
+        if selected is None:
+            return objects
+        return [selected if obj['class_name'] in SLOT_STATES and obj.get('track_id') == selected['track_id']
+                else obj for obj in objects]
+
+    def _prefer_initial_interior_quartet(self, objects, now):
+        """A stable real quartet sharing three IDs outranks an extra edge candidate."""
+        tracker, edge = self.tracker, self._g1_edge_slot
+        provisional = tracker._provisional
+        if tracker.points is not None or provisional is None or edge is None:
+            self._g1_interior_quartet_review = None
+            return False
+        hands = [obj for obj in objects if obj['class_name'] == 'hand']
+        inside = [obj for obj in tracker._candidates(objects)
+                  if obj.get('track_id') is not None and not obj['conflict']
+                  and obj.get('detection_source') != 'local_crop'
+                  and not tracker._occluded(obj, hands) and self._distance(obj['center']) >= 0]
+        ids = [obj['track_id'] for obj in inside]
+        inside_ids = set(ids)
+        bound_ids = set(provisional.byte_track_ids)-{None}
+        rows = [i for i, track_id in enumerate(provisional.byte_track_ids)
+                if track_id in edge.track_ids and track_id not in inside_ids]
+        if (len(inside) != 4 or len(inside_ids) != 4 or len(rows) != 1
+                or len(bound_ids & inside_ids) != 3
+                or len(set(edge.peers) & inside_ids) < 3
+                or slot_layout_error([obj['center'] for obj in inside]) is None):
+            self._g1_interior_quartet_review = None
+            return False
+        new_id, = inside_ids-bound_ids
+        row, = rows
+        by_id = {obj['track_id']: obj for obj in inside}
+        _, recovery_gate = tracker._provisional_recovery_limits(provisional)
+        previous_center = tracker._provisional_last_real_centers.get(row, provisional.points[row])
+        if np.linalg.norm(np.asarray(by_id[new_id]['center'])-previous_center) <= recovery_gate:
+            # A nearby new ID belongs to normal recovery, which retains the edge slot's history.
+            self._g1_interior_quartet_review = None
+            return False
+        key = (row, tuple(sorted(inside_ids)))
+        points = np.asarray([by_id[track_id]['center'] for track_id in sorted(inside_ids)])
+        spacing = float(np.min(np.linalg.norm(points[:, None]-points[None, :], axis=2)
+                               [np.triu_indices(4, 1)]))
+        review = self._g1_interior_quartet_review
+        if (review is None or review['key'] != key or now-review['last_seen'] > .25
+                or np.max(np.linalg.norm(points-review['points'], axis=1))
+                   > spacing*tracker.initialization_stability_ratio):
+            review = {'key': key, 'since': now, 'frames': 0, 'points': points.copy()}
+        review.update(last_seen=now, frames=review['frames']+1)
+        self._g1_interior_quartet_review = review
+        if (review['frames'] < max(3, tracker.initialization_frames)
+                or now-review['since']+1e-9 < tracker.geometry_initialization_seconds):
+            return False
+        if not tracker._replace_initial_edge_slot(row, by_id[new_id], now):
+            return False
+        self._g1_rejected_edge_ids.update(edge.track_ids-inside_ids)
+        self._g1_edge_slot = None
+        self._g1_interior_quartet_review = None
+        return True
+
+    def _is_supported_initial_edge(self, track_id, center):
+        edge = self._g1_edge_slot
+        return (edge is not None and edge.frames >= max(3, self.tracker.initialization_frames)
+                and track_id in edge.track_ids and self._in_initial_edge_strip(center))
 
     def _admit_entry_objects(self, objects, tracker, now):
         """已建立轨迹可走完整个ROI；新身份只能在入口侧建立。"""
@@ -281,12 +393,18 @@ class RoiGroupSequence:
                           for old_group, samples in self._unload_layouts.items() if old_group < group_id]
             result._s4_reference_layouts = tuple((old_group, layout)
                 for old_group, layout in references if valid_slot_geometry(layout))
-        elif result.phase == "load" and self.use_previous_s4_layouts:
+        elif result.phase == "load" and (self.use_previous_s4_layouts
+                                         or self.load_numbering_calibration is not None):
             samples = self._unload_layouts.get(group_id)
             if samples:
                 layout = np.median(samples, axis=0)
                 if valid_slot_geometry(layout):
                     result._load_numbering_reference = layout
+        if result.phase == "load":
+            result._load_perspective_numbering = self.load_numbering_calibration
+            result._g1_load_numbering_reference = self._g1_load_layout
+            result._g1_load_reference_inferred_slot_ids = self._g1_load_layout_inferred_slot_ids
+            result._orbit_unload_reference = self._unload_orbit_layouts.get(group_id)
         if entry:
             result.initialization_seconds = self.entry_seconds
             result.geometry_initialization_seconds = self.entry_seconds
@@ -314,12 +432,53 @@ class RoiGroupSequence:
         self._layout_sample_key = key
         self._layout_samples.append(points.copy())
         if len(self._layout_samples) == self._layout_samples.maxlen:
+            self._unload_orbit_layouts.setdefault(tracker.group_id, self._layout_samples[1].copy())
             samples = self._unload_layouts.setdefault(tracker.group_id, deque(maxlen=128))
             samples.append(points.copy())
 
     def _reject_track(self, obj, reason):
         if obj.get('track_id') is not None:
             self._track_rejections[int(obj['track_id'])] = reason
+
+    def _record_g1_load_layout(self, result, now):
+        """Record a stable G1 template, including uniquely verified two-point numbering."""
+        tracker = self.tracker
+        if (self.load_numbering_calibration is None or (self._g1_load_layout is not None
+                and not self._g1_load_layout_inferred_slot_ids)):
+            return
+        if (self.state != "active" or tracker.phase != "load" or tracker.group_id != 1
+                or result["slot_numbering_status"] != "final" or tracker.last_time != now
+                or not self._observations_enabled or tracker.identity_lost
+                or tracker.initialization.get("perspective_load_numbering", {}).get("status") != "matched"
+                or not valid_slot_geometry(tracker.points)):
+            self._g1_load_layout_samples.clear()
+            return
+        measured = [i for i, slot in enumerate(tracker.slots)
+                    if slot.geometry_observed and not slot.geometry_inferred
+                    and slot.observation in ("empty", "filled")]
+        predicted = sorted(set(range(4))-set(measured))
+        real_ids = [tracker.byte_track_ids[i] for i in measured]
+        minimum = 2 if tracker.initialization.get("reason") == "stable_two_point_template_numbering" else 3
+        if (len(measured) < minimum or None in real_ids or len(set(real_ids)) != len(real_ids)
+                or any(not tracker.slots[i].geometry_inferred
+                       or i+1 not in tracker.initialization.get("inferred_slot_ids", ()) for i in predicted)):
+            self._g1_load_layout_samples.clear()
+            return
+        # Keep stable templates until a layout with more measured support can upgrade them.
+        if self._g1_load_layout is not None and len(predicted) >= len(self._g1_load_layout_inferred_slot_ids):
+            return
+        key = (tuple((i, tracker.byte_track_ids[i]) for i in measured), tuple(predicted))
+        if key != self._g1_load_layout_key or (self._g1_load_layout_samples and np.max(
+                np.linalg.norm(tracker.points-self._g1_load_layout_samples[0], axis=1))
+                > tracker._spacing()*self.entry_stability_ratio):
+            self._g1_load_layout_samples.clear()
+        self._g1_load_layout_key = key
+        self._g1_load_layout_samples.append(tracker.points.copy())
+        if len(self._g1_load_layout_samples) == self._g1_load_layout_samples.maxlen:
+            self._g1_load_layout = np.median(self._g1_load_layout_samples, axis=0)
+            self._g1_load_layout_inferred_slot_ids = tuple(i+1 for i in predicted)
+            tracker.initialization["g1_load_template"] = {"recorded_at": float(now),
+                "measured_support": len(measured), "inferred_slot_ids": list(self._g1_load_layout_inferred_slot_ids)}
 
     def _record_outside_mapping_quarantine(self, objects, now):
         """Remember unbound ROI-outside IDs seen during this group's handoff."""
@@ -337,7 +496,7 @@ class RoiGroupSequence:
             if obj.get('class_name') not in SLOT_STATES:
                 continue
             track_id = obj.get('track_id')
-            if track_id is None or int(track_id) in formal_ids:
+            if track_id is None or int(track_id) in formal_ids or obj.get('initial_edge_slot'):
                 continue
             box = obj.get('xyxy')
             if box is None:
@@ -353,7 +512,7 @@ class RoiGroupSequence:
         result = []
         for obj in objects:
             track_id = obj.get('track_id')
-            if (obj.get('class_name') in SLOT_STATES and track_id is not None
+            if (obj.get('class_name') in SLOT_STATES and track_id is not None and not obj.get('initial_edge_slot')
                     and int(track_id) in self._outside_mapping_quarantine_track_ids):
                 self._reject_track(obj, 'outside_mapping_quarantine')
                 continue
@@ -546,6 +705,7 @@ class RoiGroupSequence:
             and not record.get("inside_roi", True)
             and record.get("center") is not None
             and self._distance(record["center"]) < -self.margin
+            and not self._is_supported_initial_edge(track_id, record["center"])
             and record.get('outside_since') is not None
             and now - float(record['outside_since']) + 1e-9 >= outside_seconds
             for track_id, record in history.items()))
@@ -570,7 +730,8 @@ class RoiGroupSequence:
                 if box is None:
                     continue
                 center = np.array([(box[0]+box[2])/2, (box[1]+box[3])/2], dtype=float)
-                if self._distance(center) >= -self.margin:
+                if (self._distance(center) >= -self.margin
+                        or self._is_supported_initial_edge(obj.get("track_id"), center)):
                     continue
                 near_known_point = (reference is not None and len(reference)
                                     and np.min(np.linalg.norm(reference-center, axis=1))
@@ -600,6 +761,7 @@ class RoiGroupSequence:
         self.direction = self.exit_since = self.return_since = None
         self._entry_count = 0
         self._g1_pending_events = []
+        # 边缘证据独立于临时编号，后续须再次通过同组支撑点和有效期核验。
         self.mapping_time = None
         self._outside_mapping_quarantine_track_ids.clear()
         self._outside_mapping_quarantine_group = identity
@@ -1005,8 +1167,9 @@ class RoiGroupSequence:
                 new_events.append(event)
         preview_contact = tracker.adopt_entry_load_preview_contact(now)
         contact_tracker = tracker.two_point_hand_contact
-        inferred_index = tracker.inferred_load_contact_index()
-        if not preview_contact and inferred_index is not None and inferred_index+1 in tracker._load_verified_empty_slots:
+        for inferred_index in tracker.inferred_load_contact_indices():
+            if preview_contact or inferred_index+1 not in tracker._load_verified_empty_slots:
+                continue
             slot = tracker.slots[inferred_index]
             empty_at = previous["snapshot"]["slots"][inferred_index]["last_confirmed_at"]
             if slot.confirmed == "empty":
@@ -1069,7 +1232,7 @@ class RoiGroupSequence:
                              and self.outside_mapping_quarantine_seconds > 0
                              and now - self.mapping_time < self.outside_mapping_quarantine_seconds)
         for obj in objects:
-            if obj["class_name"] not in SLOT_STATES:
+            if obj["class_name"] not in SLOT_STATES or obj.get('initial_edge_slot'):
                 result.append(obj)
                 continue
             a = obj["xyxy"]
@@ -1811,7 +1974,8 @@ class RoiGroupSequence:
         return None
 
     def update(self, objects, now, *, observations_enabled=True, s4_position_candidates=(),
-               load_support_resolver=None, entry_load_reach_hand=None, entry_position_candidates=()):
+               load_support_resolver=None, entry_load_reach_hand=None, entry_position_candidates=(),
+               initial_edge_candidates=()):
         if self.last_time is not None and now <= self.last_time:
             raise ValueError("分组时间必须严格递增")
         self.last_time = float(now)
@@ -1827,6 +1991,7 @@ class RoiGroupSequence:
             objects = self._recover_crossed_load_binding(objects, now)
         else:
             self._load_rebind_pose = self._pending_load_rebind = None
+        objects = self._admit_initial_edge_slot(objects, initial_edge_candidates, now)
         self._record_group_roi_tracks(objects, now)
         self._record_outside_mapping_quarantine(objects, now)
         edge_tracker = self.pending_tracker or self.tracker
@@ -1862,7 +2027,7 @@ class RoiGroupSequence:
             # 先让旧组尾部逻辑观察，再从当前组候选中移除。
             active = self._active_objects(self._exclude_transition_quarantine(
                 self._exclude_departing(objects, now), now), now)
-            initial = [o for o in active if o["class_name"] not in SLOT_STATES or self._distance(
+            initial = [o for o in active if o["class_name"] not in SLOT_STATES or o.get('initial_edge_slot') or self._distance(
                 ((o["xyxy"][0]+o["xyxy"][2])/2,(o["xyxy"][1]+o["xyxy"][3])/2)) >= 0]
             position_candidates = ()
             if s4_position_candidates and observations_enabled and self.state == "active":
@@ -1921,8 +2086,9 @@ class RoiGroupSequence:
             edge_events = self.track_store.restore_roi_edge_events(self.tracker, now)
             if edge_events:
                 result = {**result, **self.tracker.snapshot(), 'new_events': result['new_events'] + edge_events}
-        if self.use_previous_s4_layouts:
+        if self.use_previous_s4_layouts or self.load_numbering_calibration is not None:
             self._record_unload_layout(result, now)
+        self._record_g1_load_layout(result, now)
         result["new_events"] = list(result.get("new_events", [])) + deepcopy(self._deferred_new_events)
         self.all_events.extend(deepcopy(result["new_events"]))
         if self.state in ("waiting_next","stabilizing_next","sequence_complete"):
