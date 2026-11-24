@@ -292,6 +292,27 @@ class SlotState:
         return None
 
 
+def slot_event_order_result(events, clockwise):
+    """按时间上界检查环形顺序；同上界先后不明时不给通过结论。"""
+    if any(not e["expected_action"] for e in events):
+        return "fail"
+    sequence = [e["slot_id"] for e in events]
+    if len(sequence) != len(set(sequence)) or len(sequence) > 4:
+        return "fail"
+    if not sequence:
+        return "pending"
+    legal = [clockwise[i:]+clockwise[:i] for i in range(4)]
+    possible = []
+    for order in _event_slot_orders_by_time_upper(events):
+        # 不完整序列可能漏掉了遮挡槽的事件，按环形子序列检查，不能直接判漏操作。
+        possible.append(any(order == tuple(s for s in cycle if s in sequence) for cycle in legal))
+    if possible and not any(possible):
+        return "fail"
+    if len(sequence) == 4 and possible and all(possible):
+        return "pass"
+    return "pending"
+
+
 class SlotGroupTracker:
     """组建立时用几何一次性确定S1-S4，之后以ByteTrack ID为主维护槽位状态。
 
@@ -4063,24 +4084,7 @@ class SlotGroupTracker:
         return event
 
     def order_result(self):
-        """按时间上界检查环形顺序；同上界先后不明时不给通过结论。"""
-        if any(not e["expected_action"] for e in self.events):
-            return "fail"
-        sequence = [e["slot_id"] for e in self.events]
-        if len(sequence) != len(set(sequence)) or len(sequence) > 4:
-            return "fail"
-        if not sequence:
-            return "pending"
-        legal = [self.clockwise[i:]+self.clockwise[:i] for i in range(4)]
-        possible = []
-        for order in _event_slot_orders_by_time_upper(self.events):
-            # 不完整序列可能漏掉了遮挡槽的事件，按环形子序列检查，不能直接判漏操作。
-            possible.append(any(order == tuple(s for s in cycle if s in sequence) for cycle in legal))
-        if possible and not any(possible):
-            return "fail"
-        if len(sequence) == 4 and possible and all(possible):
-            return "pass"
-        return "pending"
+        return slot_event_order_result(self.events, self.clockwise)
 
     def snapshot(self):
         target = "filled" if self.phase == "load" else "empty"

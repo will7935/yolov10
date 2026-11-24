@@ -1,6 +1,6 @@
 """Turn confirmed slot evidence into order and group completion alarms."""
 
-from industrial_inspection.tools.slot_group_tracker import sort_events_by_time_upper
+from industrial_inspection.tools.slot_group_tracker import sort_events_by_time_upper, slot_event_order_result
 
 
 def _slot_label(slot_id, numbering):
@@ -8,15 +8,45 @@ def _slot_label(slot_id, numbering):
     return f"{number}（S{slot_id}）" if number is not None else f"S{slot_id}"
 
 
-def group_operation_alarms(snapshot, events, numbering, now, *, close_reason=None):
+def _entry_baseline_events(snapshot, events):
+    """Review only leading, pre-entry visual history in later unloading groups."""
+    entered_at = snapshot.get("initialization", {}).get("provisional_started_at")
+    if snapshot["phase"] != "unload" or snapshot["group_id"] <= 1 or entered_at is None:
+        return list(events), []
+    retained, ignored, seen_slots = [], [], set()
+    operation_started = False
+    for event in sort_events_by_time_upper(events):
+        baseline = (not operation_started and event["slot_id"] not in seen_slots
+            and not event["expected_action"] and not event.get("inferred")
+            and event.get("recovered_before_initialization")
+            and event.get("reason") == "track_history_before_slot_mapping"
+            and event.get("byte_track_id") is not None
+            and event.get("from") == "empty" and event.get("to") == "filled"
+            and event.get("action") == "load"
+            and event["time_lower"] < entered_at and event["time_upper"] < entered_at)
+        seen_slots.add(event["slot_id"])
+        if baseline:
+            ignored.append(dict(event, alarm_review_reason="pre_entry_filled_baseline"))
+        else:
+            retained.append(event)
+            operation_started = True
+    return retained, ignored
+
+
+def group_operation_alarms(snapshot, events, numbering, now, *, close_reason=None,
+                           clockwise=(1, 3, 4, 2)):
     phase, group_id = snapshot["phase"], snapshot["group_id"]
     action = "下料" if phase == "unload" else "上料"
     formal = snapshot["slot_numbering_status"] == "final"
     identity = {"at": float(now), "phase": phase, "group_id": group_id}
     alarms = []
-    if (formal and snapshot["order_result"] == "fail"
+    effective_events, ignored = _entry_baseline_events(snapshot, events)
+    result = slot_event_order_result(effective_events, tuple(clockwise)) if ignored else snapshot["order_result"]
+    snapshot["alarm_order_result"] = result
+    snapshot["alarm_ignored_entry_events"] = ignored
+    if (formal and result == "fail"
             and (close_reason is not None or not snapshot.get("s4_inferred_load_pending"))):
-        ordered = sort_events_by_time_upper(events)
+        ordered = sort_events_by_time_upper(effective_events)
         sequence = [event["slot_id"] for event in ordered]
         if any(not event["expected_action"] for event in ordered):
             reason, detail = "unexpected_action", "出现与当前工序相反的动作"

@@ -1102,7 +1102,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     group_id, phase = group_snapshot["group_id"], group_snapshot["phase"]
                     mapping = display_slot_numbering.get(group_id, {}).get("mapping", {})
                     for alarm in group_operation_alarms(group_snapshot, confirmed_events, mapping, now,
-                                                        close_reason=close_reason):
+                                                        close_reason=close_reason, clockwise=CLOCKWISE_ORDER):
                         key = (phase, group_id, alarm["type"])
                         if key in alarms:
                             continue
