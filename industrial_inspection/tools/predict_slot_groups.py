@@ -25,7 +25,7 @@ from industrial_inspection.tools.slot_group_tracker import (
     SLOT_STATES, SlotGroupTracker, sort_events_by_time_upper)
 from industrial_inspection.tools.slot_track_display import slot_track_label, slot_track_record
 from industrial_inspection.tools.slot_detection_policy import DetectionThresholds, prepare_business_detections
-from industrial_inspection.tools.slot_operation_alarms import group_operation_alarms
+from industrial_inspection.tools.slot_operation_alarms import group_operation_alarms, SlotMotionAlarmReview
 from industrial_inspection.tools.slot_two_point_contact import LOAD_CONTACT_DOMINANCE_MARGIN
 from industrial_inspection.tools.slot_local_redetection import (
     LocalRedetectionPolicy, recover_load_preview_support, recover_load_reach_hand,
@@ -92,10 +92,10 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频10", REGRESSION_DATASET_ROOT / "测试视频10" / "camera_B_20260924_062208.avi",
      base.DEFAULT_SLOT_ROI_FILE),
-    # ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
-    #  base.DEFAULT_SLOT_ROI_FILE),
-    # ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
-    #  base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频13", REGRESSION_DATASET_ROOT / "测试视频13" / "camera_B_20260924_071629.avi",
     #  base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频14", REGRESSION_DATASET_ROOT / "测试视频14" / "camera_B_20260924_085126.avi",
@@ -739,6 +739,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         if attempt is not None:
             local_attempts.append(attempt)
         return support
+
     group_completion = {}
     logged_sequences = {}
     display_slot_numbering = {}
@@ -845,6 +846,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
     if not 0 < audit_confidence <= args.conf:
         raise ValueError("检测框审计置信度必须满足 0 < audit-conf <= conf")
     sequence = make_sequence(polygon,context["size"],context.get("s4_hand_region"),args=args)
+    alarm_motion_review = SlotMotionAlarmReview()
     tracker = sequence.tracker
     inspection = HatchLoadingInspection(HatchHandleMonitor(HATCH_OPEN_POLYGON, HATCH_CLOSED_POLYGON,
         confirm_seconds=HATCH_CONFIRM_SECONDS, minimum_frames=HATCH_MIN_CONFIRM_FRAMES,
@@ -1102,7 +1104,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     group_id, phase = group_snapshot["group_id"], group_snapshot["phase"]
                     mapping = display_slot_numbering.get(group_id, {}).get("mapping", {})
                     for alarm in group_operation_alarms(group_snapshot, confirmed_events, mapping, now,
-                                                        close_reason=close_reason, clockwise=CLOCKWISE_ORDER):
+                                                        close_reason=close_reason, clockwise=CLOCKWISE_ORDER,
+                                                        motion_review=alarm_motion_review):
                         key = (phase, group_id, alarm["type"])
                         if key in alarms:
                             continue
@@ -1122,13 +1125,14 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                         continue
                     close_reason = None if key == pending_tail else group["close_reason"]
                     check(group["snapshot"], group["events"], close_reason)
-                    if close_reason is not None:
+                    if close_reason is not None and not alarm_motion_review.paused:
                         finalized_alarm_groups.add(key)
                 active = (snapshot["phase"], snapshot["group_id"])
                 if active not in archived:
                     seen = any(slot["center_xy"] is not None for slot in snapshot["slots"])
                     check(snapshot, sequence.tracker.events, "hatch_closed" if hatch_closed and seen else None)
-                if latest_alarm is not None and now-latest_alarm["at"] <= 3.:
+                if (latest_alarm is not None and now-latest_alarm["at"] <= 3.
+                        and not alarm_motion_review.paused):
                     snapshot["alarm_banner"] = latest_alarm
 
             csv_file = stack.enter_context((output/"slot_states.csv").open("w",encoding="utf-8-sig",newline=""))
@@ -1249,6 +1253,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     else:
                         snapshot = {**sequence.snapshot(),"new_events":[],"new_group_events":[]}
                 tracker = sequence.tracker
+                if inspection is None or inspection.active:
+                    alarm_motion_review.observe_group(snapshot, timestamp)
                 update_display_numbering(snapshot)
                 log_sequence_updates(snapshot, timestamp)
                 publish_operation_alarms(snapshot, timestamp,
@@ -1595,6 +1601,53 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
     return summary
 
 
+def compare_load_unload_sequences(reports):
+    """Compare original S numbers exactly, including completeness and duplicates."""
+    phases = {phase: {g["group_id"]: g for g in (reports or {}).get(phase, {}).get("groups", [])}
+              for phase in ("unload", "load")}
+    if not all(phases.values()):
+        return {"status": "incomplete", "reason": "缺少完整的上下料流程报告", "groups": []}
+    groups = []
+    for group_id in sorted(set(phases["unload"]) | set(phases["load"])):
+        pair = [phases[phase].get(group_id, {}) for phase in ("unload", "load")]
+        sequences = [list(g.get("sequence", [])) for g in pair]
+        reasons = []
+        for phase, group, sequence in zip(("下料", "上料"), pair, sequences):
+            if not group.get("observed"):
+                reasons.append(f"{phase}未识别到该组")
+            elif len(sequence) != 4 or set(sequence) != {1, 2, 3, 4}:
+                reasons.append(f"{phase}存在漏槽或重复槽")
+            elif not group.get("completed"):
+                reasons.append(f"{phase}未完成")
+        if sequences[0] != sequences[1]:
+            reasons.append("上下料原槽号顺序不一致")
+        groups.append({"group_id": group_id, "unload_sequence": sequences[0],
+                       "load_sequence": sequences[1], "status": "fail" if reasons else "pass",
+                       "reasons": reasons})
+    return {"status": "fail" if any(g["status"] == "fail" for g in groups) else "pass",
+            "groups": groups}
+
+
+def _log_regression_sequence_results(results, log):
+    log("\n回归上下料顺序核验汇总（逐组比较原槽号，要求顺序完全相同）：")
+    for record in results:
+        if record.get("status") not in {"end_of_stream", "hatch_closed"}:
+            check = {"status": "incomplete", "reason": "视频未完整处理，无法核验", "groups": []}
+        else:
+            check = compare_load_unload_sequences(record.get("group_process_reports"))
+        record["sequence_check"] = check
+        label = {"pass": "通过：上下料顺序完全一致", "fail": "识别异常",
+                 "incomplete": "未完成核验"}[check["status"]]
+        log(f"{record['name']}：{label}" + (f"；{check['reason']}" if check.get("reason") else ""))
+        for group in check["groups"]:
+            if group["status"] != "fail":
+                continue
+            def sequence_text(values):
+                return " → ".join(f"S{value}" for value in values) or "未记录"
+            log(f"  G{group['group_id']}：下料 {sequence_text(group['unload_sequence'])}；"
+                f"上料 {sequence_text(group['load_sequence'])}；{'；'.join(group['reasons'])}")
+
+
 def _run_regression_tests(primary_args, primary_summary, *, on_log=None, should_stop=None):
     """Run the configured raw-video regression set after the main video."""
     def log(message):
@@ -1614,7 +1667,8 @@ def _run_regression_tests(primary_args, primary_summary, *, on_log=None, should_
         record = {"name": name, "source": str(source.resolve()),
                   "roi_file": str(roi_file.resolve()), "status": "skipped"}
         primary_roi = Path(primary_args.roi_file).resolve() if primary_args.roi_file else None
-        if source.resolve() == primary_source and roi_file.resolve() == primary_roi:
+        if (primary_summary.get("status") != "regression_only"
+                and source.resolve() == primary_source and roi_file.resolve() == primary_roi):
             record.update(status=primary_summary["status"], reused_primary_result=True,
                           output_dir=primary_summary["output_dir"],
                           processed_frames=primary_summary.get("processed_frames"),
@@ -1670,6 +1724,7 @@ def _run_regression_tests(primary_args, primary_summary, *, on_log=None, should_
             record.update(status="failed", error=str(exc))
             log(f"回归验证 {name}：失败：{exc}")
         results.append(record)
+    _log_regression_sequence_results(results, log)
     return results
 
 
@@ -1718,12 +1773,18 @@ def run_regression_suite(extra_args=None, *, on_log=None, should_stop=None,
     skipped = [record for record in results if record.get("status") == "skipped"]
     completed = [record for record in results
                  if record.get("status") not in {"failed", "skipped"}]
-    report = {"status": "failed" if failed else "completed",
+    sequence_counts = {status: sum(r.get("sequence_check", {}).get("status") == status for r in results)
+                       for status in ("pass", "fail", "incomplete")}
+    report = {"status": ("failed" if failed or sequence_counts["fail"] else
+                         "incomplete" if skipped or sequence_counts["incomplete"] else "completed"),
               "suite_output_dir": str(report_dir.resolve()),
               "video_count": len(results),
               "completed_count": len(completed),
               "failed_count": len(failed),
               "skipped_count": len(skipped),
+              "sequence_pass_count": sequence_counts["pass"],
+              "sequence_fail_count": sequence_counts["fail"],
+              "sequence_incomplete_count": sequence_counts["incomplete"],
               "results": results}
     report_path = report_dir / "regression_suite_report.json"
     report["report_path"] = str(report_path.resolve())

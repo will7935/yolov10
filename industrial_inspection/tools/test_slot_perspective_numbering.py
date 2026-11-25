@@ -146,7 +146,7 @@ class PerspectiveNumberingTests(unittest.TestCase):
         for now in range(3):
             tracker.last_time = now
             sequence._record_g1_load_layout(snapshot, now)
-        np.testing.assert_array_equal(sequence._g1_load_layout, tracker.points)
+        np.testing.assert_allclose(sequence._g1_load_layout, tracker.points, atol=1e-9)
         self.assertEqual(sequence._g1_load_layout_inferred_slot_ids, (2,))
         self.assertEqual(tracker.slots[1].confirmed, "unknown")
         self.assertEqual(tracker.events, [])
@@ -165,7 +165,7 @@ class PerspectiveNumberingTests(unittest.TestCase):
         for now in range(3, 6):
             tracker.last_time = now
             sequence._record_g1_load_layout(snapshot, now)
-        np.testing.assert_array_equal(sequence._g1_load_layout, tracker.points)
+        np.testing.assert_allclose(sequence._g1_load_layout, tracker.points, atol=1e-9)
         self.assertEqual(sequence._g1_load_layout_inferred_slot_ids, ())
         third = sequence._new_tracker(3, phase="load")
         np.testing.assert_array_equal(third._entry_numbering_order(self.load), self.expected)

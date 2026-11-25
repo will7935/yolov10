@@ -1,4 +1,4 @@
-"""Run the five configured slot-group regression videos.
+"""Run the configured slot-group regression videos.
 
 Examples (from the repository root)::
 

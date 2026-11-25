@@ -109,6 +109,80 @@ class SlotPerspectiveNumbering:
             return None, dict(diagnostic, status="layout_mismatch")
         return order, dict(diagnostic, status="matched", point_indices_in_slot_order=order.tolist())
 
+    def align_load_layout(self, reference, current, anchor_indices):
+        """Express a later measured layout in the original loading pose."""
+        anchors = list(anchor_indices)
+        if len(anchors) < 2:
+            return None, {"status": "insufficient_measured_support"}
+        try:
+            reference, current = self.project(reference), self.project(current)
+        except ValueError:
+            return None, {"status": "invalid_projection"}
+        spacing = float(np.min(np.linalg.norm(reference[anchors, None]-reference[None, anchors], axis=2)
+                               [np.triu_indices(len(anchors), 1)]))
+        if spacing < 1e-6:
+            return None, {"status": "invalid_geometry"}
+        angle, scale, residual = self.fit_rotation(reference[anchors], current[anchors])
+        error = residual/(spacing*max(scale, 1e-9))
+        info = {"status": "aligned", "clockwise_degrees": angle, "scale": scale,
+                "error_ratio": error, "measured_support": len(anchors)}
+        if not .5 <= scale <= 2 or error > self.maximum_error_ratio:
+            return None, dict(info, status="layout_mismatch")
+        radians = np.radians(angle)
+        rotation = np.array([[np.cos(radians), np.sin(radians)],
+                             [-np.sin(radians), np.cos(radians)]])
+        aligned = ((current-current[anchors].mean(0)) @ rotation.T/scale
+                   + reference[anchors].mean(0))
+        homogeneous = np.column_stack((aligned, np.ones(4))) @ np.linalg.inv(self.homography).T
+        if not np.isfinite(homogeneous).all() or np.any(np.abs(homogeneous[:, 2]) < 1e-9):
+            return None, dict(info, status="invalid_projection")
+        return homogeneous[:, :2]/homogeneous[:, 2:]*self.image_size/self.calibration_size, info
+
+    def missing_load_point(self, reference, observed, roi, *, same_load_pose=True,
+                           preferred_slot_ids=None):
+        """Select a corner from measured support and the reference phase's rotation."""
+        from industrial_inspection.tools.slot_group_tracker import infer_fourth_parallelogram_candidates
+
+        info = {"status": "waiting_for_reference",
+                "reference": "g1_load" if same_load_pose else "same_group_unload",
+                "expected_clockwise_degrees": 0. if same_load_pose else self.rotation_degrees,
+                "measured_support": 3}
+        if reference is None:
+            return None, info
+        observed = np.asarray(observed, dtype=float)
+        accepted, reviewed = [], []
+        for point in infer_fourth_parallelogram_candidates(observed):
+            if roi is not None and cv2.pointPolygonTest(roi, tuple(point), False) < 0:
+                reviewed.append({"center_xy": point.tolist(), "status": "outside_roi"})
+                continue
+            order, match = self.match(reference, np.vstack((observed, point)),
+                                     inferred_indices=(3,), same_load_pose=same_load_pose)
+            reviewed.append({**match, "center_xy": point.tolist()})
+            if order is not None:
+                # Rotation is an admission gate in match(), not a competing score:
+                # a smaller angle must not outweigh a better measured triangle.
+                score = match["error_ratio"]
+                accepted.append((score, point, order, match))
+        info["candidates"] = reviewed
+        if not accepted:
+            return None, dict(info, status="no_compatible_corner")
+        accepted.sort(key=lambda item: (item[0], item[3]["angle_error_degrees"]))
+        chosen = accepted[0]
+        selection = "lowest_shape_error"
+        if len(accepted) > 1 and accepted[1][0]-accepted[0][0] < .05:
+            compatible = [item for item in accepted if item[0]-accepted[0][0] < .05
+                          and preferred_slot_ids is not None
+                          and (np.argsort(item[2])+1)[:3].tolist() == list(preferred_slot_ids)]
+            if len(compatible) != 1:
+                return None, dict(info, status="ambiguous_corner", candidate_count=len(accepted))
+            chosen, selection = compatible[0], "previous_verified_roles"
+        _, point, order, match = chosen
+        roles = np.argsort(order)+1
+        return point, dict(info, status="matched", candidate_count=len(accepted),
+            slot_ids_in_observation_order=roles[:3].tolist(), missing_slot_id=int(roles[3]),
+            center_xy=point.tolist(), clockwise_degrees=match["clockwise_degrees"],
+            error_ratio=match["error_ratio"], scale=match["scale"], selection=selection)
+
     def snapshot(self):
         return {**self.config, "runtime_image_size": self.image_size.tolist()}
 

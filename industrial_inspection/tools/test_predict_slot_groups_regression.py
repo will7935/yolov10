@@ -72,6 +72,21 @@ class RegressionDispatchTests(TestCase):
             self.assertTrue(results[0]["reused_primary_result"])
             self.assertEqual(results[0]["output_dir"], str(root / "primary"))
 
+    def test_regression_only_placeholder_never_skips_the_configured_primary_source(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            args = self.args(root)
+            args.source.write_bytes(b"video")
+            args.roi_file.write_text("{}", encoding="utf-8")
+            with patch.object(prediction, "REGRESSION_TEST_VIDEOS", (("测试", args.source, args.roi_file),)), \
+                 patch.object(prediction, "S4_HAND_REGION_ENABLED", False), \
+                 patch.object(prediction, "prepare_context", return_value={}), \
+                 patch.object(prediction, "_run_prediction_once", return_value={
+                     "status": "hatch_closed", "output_dir": "run", "processed_frames": 10}) as run:
+                results = prediction._run_regression_tests(args, {"status": "regression_only"})
+            run.assert_called_once()
+            self.assertNotIn("reused_primary_result", results[0])
+
     def test_one_video_failure_does_not_skip_the_next_video(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -132,7 +147,8 @@ class RegressionDispatchTests(TestCase):
             args.weights.write_bytes(b"weights")
             args.conf, args.audit_conf = .1, .001
             args.stride, args.imgsz, args.device = 1, 640, "cpu"
-            with patch.object(prediction.base, "parse_args", return_value=args) as parse_args:
+            with patch.object(prediction, "REGRESSION_TESTS_ENABLED", True), \
+                 patch.object(prediction.base, "parse_args", return_value=args) as parse_args:
                 self.assertTrue(prediction.build_args([]).run_regression_tests)
                 trial = prediction.build_args(["--no-regression-tests", "--settled-unload-numbering"])
                 self.assertFalse(trial.run_regression_tests)
@@ -157,6 +173,57 @@ class RegressionDispatchTests(TestCase):
                                            regression_run=regression)
                     sequence = prediction.make_sequence(polygon, (640, 480), args=args)
                     self.assertEqual(sequence.tracker.unload_entry_numbering_seconds, expected)
+
+
+class SequenceComparisonTests(TestCase):
+    def reports(self, unload=(3, 4, 2, 1), load=(3, 4, 2, 1)):
+        return {phase: {"groups": [{"group_id": 1, "observed": True, "completed": True,
+                                   "sequence": list(sequence), "order_result": "pass"}]}
+                for phase, sequence in (("unload", unload), ("load", load))}
+
+    def test_complete_identical_original_sequences_pass(self):
+        self.assertEqual(prediction.compare_load_unload_sequences(self.reports())["status"], "pass")
+
+    def test_cyclic_shift_is_not_treated_as_identical(self):
+        check = prediction.compare_load_unload_sequences(self.reports(load=(2, 1, 3, 4)))
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(check["groups"][0]["load_sequence"], [2, 1, 3, 4])
+
+    def test_identical_duplicate_or_missing_slots_cannot_pass(self):
+        for sequence in ((3, 3, 2, 1), (3, 2, 1), ()):
+            with self.subTest(sequence=sequence):
+                self.assertEqual(prediction.compare_load_unload_sequences(
+                    self.reports(sequence, sequence))["status"], "fail")
+
+    def test_missing_group_and_incomplete_operation_are_reported(self):
+        reports = self.reports()
+        reports["load"]["groups"] = [{"group_id": 2, "observed": False, "sequence": []}]
+        self.assertEqual(prediction.compare_load_unload_sequences(reports)["status"], "fail")
+        reports = self.reports()
+        reports["unload"]["groups"][0]["completed"] = False
+        self.assertEqual(prediction.compare_load_unload_sequences(reports)["status"], "fail")
+
+    def test_raw_alarm_does_not_override_the_requested_sequence_comparison(self):
+        reports = self.reports()
+        reports["unload"]["groups"][0]["order_result"] = "fail"
+        self.assertEqual(prediction.compare_load_unload_sequences(reports)["status"], "pass")
+
+    def test_missing_phase_is_not_a_pass(self):
+        self.assertEqual(prediction.compare_load_unload_sequences({})["status"], "incomplete")
+
+    def test_terminal_summary_includes_mismatch_details_and_partial_run_status(self):
+        records = [{"name": "视频7", "status": "hatch_closed",
+                    "group_process_reports": self.reports(load=(3, 2, 4, 1))},
+                   {"name": "部分视频", "status": "frame_limit", "group_process_reports": self.reports()},
+                   {"name": "视频8", "status": "hatch_closed", "group_process_reports": self.reports()}]
+        lines = []
+        prediction._log_regression_sequence_results(records, lines.append)
+        text = "\n".join(lines)
+        self.assertIn("视频7：识别异常", text)
+        self.assertIn("下料 S3 → S4 → S2 → S1；上料 S3 → S2 → S4 → S1", text)
+        self.assertIn("部分视频：未完成核验", text)
+        self.assertIn("视频8：通过", text)
+        self.assertEqual([r["sequence_check"]["status"] for r in records], ["fail", "incomplete", "pass"])
 
 
 if __name__ == "__main__":

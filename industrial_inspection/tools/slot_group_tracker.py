@@ -423,6 +423,7 @@ class SlotGroupTracker:
         self._load_perspective_numbering = None
         self._g1_load_numbering_reference = None
         self._g1_load_reference_inferred_slot_ids = ()
+        self._load_corner_history = None
         self._load_verified_empty_slots = set()
         self._missing_load_contact_index = None
         self.initialization_seconds, self.initialization_frames = initialization_seconds, initialization_frames
@@ -841,8 +842,30 @@ class SlotGroupTracker:
                 alternatives.append(point)
         return alternatives[0] if len(alternatives) == 1 else None
 
-    def _infer_entry_s4(self, three_points, roi_contour):
+    def _infer_entry_s4(self, three_points, roi_contour, *, support_track_ids=None):
         """Project previous measured layouts onto the current three visible slots."""
+        if self.phase == "load" and self._load_perspective_numbering is not None:
+            subsequent = self.group_id > 1
+            reference = self._g1_load_numbering_reference if subsequent else self._load_numbering_reference
+            ids = tuple(support_track_ids) if support_track_ids is not None else ()
+            usable_ids = len(ids) == 3 and None not in ids and len(set(ids)) == 3
+            previous = self._load_corner_history
+            preferred = None
+            if usable_ids and previous is not None and self.last_time is not None:
+                if (set(ids) == set(previous["roles"])
+                        and 0 <= self.last_time-previous["at"] <= self.s4_contact_prediction_seconds):
+                    preferred = [previous["roles"][tid] for tid in ids]
+                else:
+                    self._load_corner_history = None
+            point, diagnostic = self._load_perspective_numbering.missing_load_point(
+                reference, three_points, roi_contour, same_load_pose=subsequent,
+                preferred_slot_ids=preferred)
+            if (point is not None and usable_ids and self.last_time is not None
+                    and diagnostic.get("selection") != "previous_verified_roles"):
+                self._load_corner_history = {"at": float(self.last_time),
+                    "roles": dict(zip(ids, diagnostic["slot_ids_in_observation_order"]))}
+            self.initialization["three_point_template_prediction"] = diagnostic
+            return point, [1 if subsequent else self.group_id] if point is not None else []
         fallback = infer_fourth_square_center(three_points)
         if (self._load_numbering_reference is not None and roi_contour is not None
                 and (fallback is None or cv2.pointPolygonTest(roi_contour, tuple(fallback), False) < 0)):
@@ -904,7 +927,7 @@ class SlotGroupTracker:
             return None
         points = np.asarray([obj["center"] for _, obj in support], dtype=float)
         point = (infer_fourth_square_center(points) if self._entry_gate is None
-                 else self._infer_entry_s4(points, roi_contour)[0])
+                 else self._infer_entry_s4(points, roi_contour, support_track_ids=tracks)[0])
         if (point is None or slot_layout_error(np.vstack((points, point))) is None
                 or (roi_contour is not None and cv2.pointPolygonTest(roi_contour, tuple(point), False) < 0)):
             return None
@@ -1383,7 +1406,8 @@ class SlotGroupTracker:
         inferred_now = False
         refreshed_s4 = False
         if len(self._entry_points) == 3 and three_point_ready:
-            inferred, reference_groups = self._infer_entry_s4(observed, roi_contour)
+            inferred, reference_groups = self._infer_entry_s4(
+                observed, roi_contour, support_track_ids=[tid for _, tid in support])
             if inferred is not None:
                 index = len(self._entry_points)
                 self.initialization.update(
@@ -1402,7 +1426,8 @@ class SlotGroupTracker:
         elif three_point_ready and not (self._entry_locked_s4_slot is not None
                                        and self._entry_locked_s4_slot.load_contact_pending):
             # 重新停稳后用当前三点重算一次，避免把遮挡前的定位偏差继续传递。
-            refreshed, _ = self._infer_entry_s4(observed, roi_contour)
+            refreshed, _ = self._infer_entry_s4(
+                observed, roi_contour, support_track_ids=[tid for _, tid in support])
             if refreshed is not None and (roi_contour is None or cv2.pointPolygonTest(
                     roi_contour, tuple(refreshed), False) >= 0):
                 if self._s4_before_recalculation is None:
@@ -1938,6 +1963,7 @@ class SlotGroupTracker:
         self._provisional = None
         self._entry_load_preview_contact = None
         self._machine_center_votes.clear()
+        self._load_corner_history = None
         self._provisional_inferred_slot_ids = set()
         self._reset_three_point_stability()
         self._initial_seen.clear()

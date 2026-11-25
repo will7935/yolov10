@@ -443,6 +443,21 @@ class RoiGroupSequence:
     def _record_g1_load_layout(self, result, now):
         """Record a stable G1 template, including uniquely verified two-point numbering."""
         tracker = self.tracker
+        # Formal numbering has already validated this pose. Cache it immediately;
+        # a hidden measured slot must not prevent later groups obtaining a template.
+        if (self._g1_load_layout is None and self.load_numbering_calibration is not None
+                and tracker.phase == "load" and tracker.group_id == 1
+                and result["slot_numbering_status"] == "final" and tracker.last_time == now
+                and self._observations_enabled and not tracker.identity_lost
+                and tracker.initialization.get("perspective_load_numbering", {}).get("status") == "matched"):
+            pose = tracker.initialization.get("numbering_reference_centers_xy")
+            if pose is not None and valid_slot_geometry(pose):
+                self._g1_load_layout = np.asarray(pose, dtype=float).copy()
+                self._g1_load_layout_inferred_slot_ids = tuple(tracker.initialization.get("inferred_slot_ids", ()))
+                tracker.initialization["g1_load_template"] = {"recorded_at": float(now),
+                    "source": "validated_formal_numbering", "measured_support":
+                        4-len(self._g1_load_layout_inferred_slot_ids),
+                    "inferred_slot_ids": list(self._g1_load_layout_inferred_slot_ids)}
         if (self.load_numbering_calibration is None or (self._g1_load_layout is not None
                 and not self._g1_load_layout_inferred_slot_ids)):
             return
@@ -467,18 +482,37 @@ class RoiGroupSequence:
         # Keep stable templates until a layout with more measured support can upgrade them.
         if self._g1_load_layout is not None and len(predicted) >= len(self._g1_load_layout_inferred_slot_ids):
             return
+        points = tracker.points.copy()
+        alignment = None
+        if self._g1_load_layout is not None:
+            anchors = [i for i in measured if i+1 not in self._g1_load_layout_inferred_slot_ids]
+            aligned, alignment = self.load_numbering_calibration.align_load_layout(
+                self._g1_load_layout, points, anchors)
+            if aligned is None:
+                self._g1_load_layout_samples.clear()
+                return
+            # Improve the measured shape without changing its reference pose.
+            # Coordinates still inferred retain their previous values.
+            points = self._g1_load_layout.copy()
+            for i in measured:
+                points[i] = aligned[i]
+            if not valid_slot_geometry(points):
+                self._g1_load_layout_samples.clear()
+                return
         key = (tuple((i, tracker.byte_track_ids[i]) for i in measured), tuple(predicted))
         if key != self._g1_load_layout_key or (self._g1_load_layout_samples and np.max(
-                np.linalg.norm(tracker.points-self._g1_load_layout_samples[0], axis=1))
+                np.linalg.norm(points-self._g1_load_layout_samples[0], axis=1))
                 > tracker._spacing()*self.entry_stability_ratio):
             self._g1_load_layout_samples.clear()
         self._g1_load_layout_key = key
-        self._g1_load_layout_samples.append(tracker.points.copy())
+        self._g1_load_layout_samples.append(points)
         if len(self._g1_load_layout_samples) == self._g1_load_layout_samples.maxlen:
             self._g1_load_layout = np.median(self._g1_load_layout_samples, axis=0)
             self._g1_load_layout_inferred_slot_ids = tuple(i+1 for i in predicted)
             tracker.initialization["g1_load_template"] = {"recorded_at": float(now),
-                "measured_support": len(measured), "inferred_slot_ids": list(self._g1_load_layout_inferred_slot_ids)}
+                "measured_support": len(measured), "inferred_slot_ids": list(self._g1_load_layout_inferred_slot_ids),
+                "source": "aligned_measured_slots" if alignment is not None else "stable_measured_slots",
+                "pose_alignment": alignment}
 
     def _record_outside_mapping_quarantine(self, objects, now):
         """Remember unbound ROI-outside IDs seen during this group's handoff."""

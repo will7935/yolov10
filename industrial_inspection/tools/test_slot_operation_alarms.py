@@ -2,7 +2,7 @@
 from copy import deepcopy
 import unittest
 
-from industrial_inspection.tools.slot_operation_alarms import group_operation_alarms
+from industrial_inspection.tools.slot_operation_alarms import SlotMotionAlarmReview, group_operation_alarms
 
 
 def event(slot, action, when, *, historical=False):
@@ -21,22 +21,34 @@ def snapshot():
                 slots=[dict(slot_id=i, last_confirmed_state='empty') for i in range(1, 5)])
 
 
+def stationary_review():
+    review = SlotMotionAlarmReview()
+    for now in (32.5, 32.6, 32.7, 32.8):
+        sample = snapshot()
+        sample['slots'] = [dict(slot_id=i+1, byte_track_id=i, center_xy=[100+i*80, 100],
+                                last_seen_at=now, observation='filled') for i in range(3)]
+        review.observe_group(sample, now)
+    return review
+
+
 class EntryAlarmTests(unittest.TestCase):
     def test_video11_initial_reverse_is_baseline_without_changing_raw_events(self):
         s = snapshot()
         events = [event(3, 'load', 31.403, historical=True), event(3, 'unload', 34.689, historical=True)]
         original = deepcopy(events)
-        self.assertEqual(group_operation_alarms(s, events, {3: 5}, 35.497), [])
+        self.assertEqual(group_operation_alarms(s, events, {3: 5}, 35.497,
+                                               motion_review=stationary_review()), [])
         self.assertEqual(events, original)
         self.assertEqual(s['order_result'], 'fail')  # Original audit result is preserved.
         self.assertEqual(s['alarm_order_result'], 'pending')
-        self.assertEqual(len(s['alarm_ignored_entry_events']), 1)
+        self.assertEqual(len(s['alarm_ignored_motion_events']), 1)
 
     def test_full_correct_unload_passes_after_baseline_review(self):
         s = snapshot()
         events = [event(3, 'load', 31.403, historical=True)]
         events += [event(i, 'unload', 34.689+j*2) for j, i in enumerate((3, 4, 2, 1))]
-        self.assertEqual(group_operation_alarms(s, events, {}, 44., close_reason='observed_roi_exit'), [])
+        self.assertEqual(group_operation_alarms(s, events, {}, 44., close_reason='observed_roi_exit',
+                                               motion_review=stationary_review()), [])
         self.assertEqual(s['alarm_order_result'], 'pass')
 
     def test_reverse_during_entry_is_still_an_alarm(self):
@@ -58,14 +70,14 @@ class EntryAlarmTests(unittest.TestCase):
     def test_bad_clockwise_order_still_alarms_after_filtering(self):
         events = [event(3, 'load', 31.403, historical=True)]
         events += [event(i, 'unload', 35.+j) for j, i in enumerate((3, 2, 4))]
-        alarm = group_operation_alarms(snapshot(), events, {}, 38.)[0]
+        alarm = group_operation_alarms(snapshot(), events, {}, 38., motion_review=stationary_review())[0]
         self.assertEqual(alarm['reason'], 'not_clockwise')
         self.assertEqual(alarm['slot_sequence'], [3, 2, 4])
 
     def test_repeated_real_operation_still_alarms_after_filtering(self):
         events = [event(3, 'load', 31.403, historical=True),
                   event(3, 'unload', 34.689), event(3, 'unload', 36.)]
-        alarm = group_operation_alarms(snapshot(), events, {}, 37.)[0]
+        alarm = group_operation_alarms(snapshot(), events, {}, 37., motion_review=stationary_review())[0]
         self.assertEqual(alarm['reason'], 'repeated_slot')
         self.assertEqual(alarm['slot_sequence'], [3, 3])
 
@@ -73,7 +85,8 @@ class EntryAlarmTests(unittest.TestCase):
         s = snapshot()
         s['slots'][0]['last_confirmed_state'] = 'filled'
         events = [event(3, 'load', 31.403, historical=True), event(3, 'unload', 34.689, historical=True)]
-        alarms = group_operation_alarms(s, events, {}, 36., close_reason='hatch_closed')
+        alarms = group_operation_alarms(s, events, {}, 36., close_reason='hatch_closed',
+                                        motion_review=stationary_review())
         self.assertEqual([a['type'] for a in alarms], ['group_incomplete_alarm'])
         self.assertEqual(alarms[0]['slots'][0]['slot_id'], 1)
 
