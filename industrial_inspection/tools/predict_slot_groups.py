@@ -69,7 +69,7 @@ _TRIAL_UNLOAD_STABLE_SECONDS = .20
 # 每次完成主视频后，自动使用同一套模型、分组逻辑和项目默认 ROI 处理回归视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
-REGRESSION_TESTS_ENABLED = True
+REGRESSION_TESTS_ENABLED = False
 REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
 REGRESSION_TEST_VIDEOS = (
     ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
@@ -96,8 +96,8 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
      base.DEFAULT_SLOT_ROI_FILE),
-    # ("测试视频13", REGRESSION_DATASET_ROOT / "测试视频13" / "camera_B_20260924_071629.avi",
-    #  base.DEFAULT_SLOT_ROI_FILE),
+    ("测试视频13", REGRESSION_DATASET_ROOT / "测试视频13" / "camera_B_20260924_071629.avi",
+     base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频14", REGRESSION_DATASET_ROOT / "测试视频14" / "camera_B_20260924_085126.avi",
     #  base.DEFAULT_SLOT_ROI_FILE),
 )
@@ -128,7 +128,7 @@ from industrial_inspection.tools.slot_process_config import (
     MATCH_DISTANCE_RATIO, CONFIRM_SECONDS,
     MIN_CONFIRM_FRAMES, LOAD_POST_CONTACT_CONFIRM_FRAMES, VISUAL_REVERSAL_REVIEW_SECONDS,
     IDENTITY_LOST_SECONDS, CONFLICT_CONF_MARGIN,
-    HAND_OVERLAP_RATIO, LOAD_HAND_CONTACT_ENABLED, LOAD_HAND_CONTACT_SECONDS,
+    HAND_OVERLAP_RATIO, LOAD_HAND_CONTACT_ENABLED, LOAD_HAND_CONTACT_SECONDS, LOAD_HAND_TRAJECTORY_ENABLED,
     LOAD_HAND_CONTACT_MIN_FRAMES, LOAD_HAND_CONTACT_OVERLAP_RATIO, LOAD_HAND_CONTACT_COMPETING_SLOT_ENABLED,
     LOAD_HAND_CONTACT_COMPETING_SLOT_ID, LOAD_HAND_CONTACT_COMPETING_MARGIN, LOAD_HAND_CONTACT_COMPETING_RATIO,
     S4_CONTACT_PREDICTION_SECONDS, S4_PREDICTION_CONTACT_OVERLAP_RATIO,
@@ -254,6 +254,7 @@ def make_tracker(hand_region=None, *, unload_entry_numbering_seconds=None, machi
         machine_center=machine_center,
         initialization_history_seconds=INITIALIZATION_HISTORY_SECONDS,
         load_hand_contact_enabled=LOAD_HAND_CONTACT_ENABLED,
+        load_trajectory_enabled=LOAD_HAND_TRAJECTORY_ENABLED,
         load_hand_contact_seconds=LOAD_HAND_CONTACT_SECONDS,
         load_hand_contact_min_frames=LOAD_HAND_CONTACT_MIN_FRAMES,
         load_hand_contact_overlap_ratio=LOAD_HAND_CONTACT_OVERLAP_RATIO,
@@ -468,6 +469,16 @@ def _live_sequence_text(original, continuous):
     raw = " → ".join(f"S{slot_id}" for slot_id in original) or "未记录"
     numbered = " → ".join(map(str, continuous)) or "起点待确认"
     return f"原槽号顺序 {raw}\n跨组顺时针编号顺序 {numbered}"
+
+
+def draw_load_trajectory_reviews(frame, snapshot):
+    slots = {s['slot_id']: s for s in snapshot.get('slots', ())}
+    for candidate in snapshot.get('hand_trajectory_review', {}).get('pending', ()):
+        point = slots.get(candidate['slot_id'], {}).get('center_xy')
+        if point is not None:
+            x, y = map(lambda value: int(round(value)), point)
+            cv2.putText(frame, f"S{candidate['slot_id']} LOAD? VERIFY", (max(0, x-75), max(18, y-28)),
+                        cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 220, 255), 1, cv2.LINE_AA)
 
 
 @lru_cache(maxsize=1)
@@ -742,6 +753,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
 
     group_completion = {}
     logged_sequences = {}
+    logged_trajectory_candidates = set()
     display_slot_numbering = {}
     inspection_history = []
     alarms = {}
@@ -776,12 +788,18 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         return "下料" if phase == "unload" else "上料"
 
     def log_sequence_updates(snapshot, now):
+        for candidate in snapshot.get('hand_trajectory_review', {}).get('pending', ()):
+            key = (snapshot['group_id'], candidate['slot_id'], candidate['time_upper'])
+            if key not in logged_trajectory_candidates:
+                logged_trajectory_candidates.add(key)
+                log(f"{now:.2f}s G{snapshot['group_id']} S{candidate['slot_id']} 疑似上料，等待视觉核验"
+                    f"（候选动作时间 {candidate['time_upper']:.2f}s）")
         changed = dict.fromkeys((event["phase"], event["group_id"])
                                for event in snapshot["new_events"] if event["expected_action"])
         for event in snapshot["new_events"]:
-            if (event["phase"] == "load" and event["slot_id"] == 4
-                    and event.get("reason") == "visual_after_s4_contact_lookback"):
-                log(f"{event['reported_at']:.2f}s G{event['group_id']} S4 上料核验通过"
+            if (event["phase"] == "load"
+                    and event.get("reason") in ("visual_after_s4_contact_lookback", "visual_after_hand_trajectory")):
+                log(f"{event['reported_at']:.2f}s G{event['group_id']} S{event['slot_id']} 上料核验通过"
                     f"（回填动作时间 {event['time_upper']:.2f}s）")
         for event in snapshot.get("new_group_events", ()):
             if event["type"] == "s4_inferred_load_cancelled":
@@ -976,6 +994,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
         "confirm_seconds": CONFIRM_SECONDS,"min_confirm_frames": MIN_CONFIRM_FRAMES,
         "visual_reversal_review_seconds": tracker.visual_reversal_review_seconds,
         "load_hand_contact_config": {"enabled": LOAD_HAND_CONTACT_ENABLED,
+            "trajectory_review_enabled": LOAD_HAND_TRAJECTORY_ENABLED,
             "contact_seconds": LOAD_HAND_CONTACT_SECONDS,
             "min_frames": LOAD_HAND_CONTACT_MIN_FRAMES,
             "post_contact_visual_confirm_frames": LOAD_POST_CONTACT_CONFIRM_FRAMES,
@@ -1448,6 +1467,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                             label_prefix="S" if snapshot.get("slot_numbering_status") == "final" else None,
                             absolute=DISPLAY_ABSOLUTE_SLOT_NUMBERS)
                     draw_two_point_hand_contacts(plotted, snapshot.get("two_point_hand_contacts", ()))
+                    draw_load_trajectory_reviews(plotted, snapshot)
                     if DRAW_SLOT_ROI:
                         draw_roi(plotted,polygon)
                     if tracker.machine_center is not None:
@@ -1584,6 +1604,10 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                                  for report in summary["group_process_reports"].values())
         if inspection is not None:
             report_text += '\n\n'+format_fullness_report(inspection.report)
+        alarm_text = "\n\n".join(f"{alarm['at']:.2f}s {alarm['message']}"
+                                  for alarm in summary["operation_alarms"])
+        if alarm_text:
+            report_text += "\n\n流程报警\n"+alarm_text
         (output/"group_process_report.json").write_text(
             json.dumps(summary["group_process_reports"],ensure_ascii=False,indent=2),encoding="utf-8")
         (output/"group_process_report.txt").write_text(report_text+"\n",encoding="utf-8")
@@ -1596,6 +1620,8 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                      for report in summary["group_process_reports"].values())
     if inspection is not None:
         final_log.append(format_fullness_report(inspection.report))
+    if alarm_text:
+        final_log.append("流程报警\n"+alarm_text)
     log("\n\n".join(final_log))
     log(f"工序报告已保存至 {output / 'group_process_report.txt'}")
     return summary

@@ -116,6 +116,7 @@ def group_operation_alarms(snapshot, events, numbering, now, *, close_reason=Non
     snapshot["alarm_ignored_motion_events"] = ignored_motion
     snapshot["order_alarm_paused_for_motion"] = bool(motion_review is not None and motion_review.paused)
     if (formal and result == "fail"
+            and (close_reason is not None or not snapshot.get('hand_trajectory_review_pending'))
             and (motion_review is None or not motion_review.paused or close_reason == 'hatch_closed')
             and (close_reason is not None or not snapshot.get("s4_inferred_load_pending"))):
         ordered = sort_events_by_time_upper(effective_events)
@@ -156,4 +157,26 @@ def group_operation_alarms(snapshot, events, numbering, now, *, close_reason=Non
         alarms.append({**identity, "type": "group_incomplete_alarm", "reason": close_reason,
             "target_state": target, "confirmed_count": confirmed_count, "slots": missing,
             "headline": headline, "message": f"{headline}：{'，'.join(details)}"})
+    else:
+        # Early operations may legitimately precede the stationary alarm window.
+        # Use the complete confirmed history for coverage, while the motion review
+        # above continues to decide whether order/direction warrants a live alarm.
+        operations = sort_events_by_time_upper([event for event in events
+            if event.get("expected_action") and event.get("action") == phase])
+        operated = {event["slot_id"] for event in operations}
+        absent = [slot_id for slot_id in range(1, 5) if slot_id not in operated]
+        if absent:
+            headline = f"报警 G{group_id} {action}操作记录不完整（{4-len(absent)}/4）"
+            detail = "，".join(f"{_slot_label(slot_id, numbering)} 缺少已确认{action}记录"
+                              for slot_id in absent)
+            sequence = [event["slot_id"] for event in operations]
+            continuous = [numbering.get(slot_id) for slot_id in sequence]
+            original = " → ".join(f"S{slot_id}" for slot_id in sequence) or "无"
+            numbered = " → ".join(str(n) if n is not None else "待编号" for n in continuous) or "无"
+            alarms.append({**identity, "type": "slot_operation_record_alarm",
+                "reason": "missing_slot_operation", "close_reason": close_reason,
+                "confirmed_count": 4-len(absent), "missing_slot_ids": absent,
+                "slot_sequence": sequence, "continuous_sequence": continuous,
+                "headline": headline, "message": (f"{headline}：{detail}\n原槽号顺序 {original}"
+                                                    f"\n跨组顺时针编号顺序 {numbered}")})
     return alarms

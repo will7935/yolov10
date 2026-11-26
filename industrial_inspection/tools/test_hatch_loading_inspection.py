@@ -300,6 +300,25 @@ class HatchPipelineTests(unittest.TestCase):
             self.assertEqual(len(early['closed_groups']), 1)
             self.assertEqual(early['operation_alarms'], [])
 
+    def test_closed_load_with_only_filled_baseline_reports_missing_operations(self):
+        frames = [boxes(filled=range(4)) + [handle('open')]] * 12
+        frames += [boxes(filled=range(4)) + [handle('closed')]] * 3
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary, logs, ui = self.run_video(frames, root, PROCESS_PHASE='load',
+                                               AUTO_LOAD_AFTER_UNLOAD=False)
+            alarm, = summary['operation_alarms']
+            self.assertEqual(alarm['type'], 'slot_operation_record_alarm')
+            self.assertEqual(alarm['missing_slot_ids'], [1, 2, 3, 4])
+            self.assertEqual(alarm['at'], summary['inspection']['closed_at'])
+            self.assertEqual([a for info in ui for a in info['new_alarms']], [alarm])
+            self.assertIn(alarm['message'], logs[-2])
+            report = (root/'results'/'group_process_report.txt').read_text(encoding='utf-8')
+            self.assertIn(alarm['message'], report)
+            saved = [json.loads(line) for line in (root/'results'/'inspection_events.jsonl')
+                     .read_text(encoding='utf-8').splitlines()]
+            self.assertIn(alarm, saved)
+
     def test_full_unload_load_cycle_starts_at_open_and_finishes_at_close_with_twenty_slots(self):
         frames = [boxes(filled=range(4))+[handle('closed')]]*5
         frames += [boxes(filled=range(4))+[handle('open')]]*5

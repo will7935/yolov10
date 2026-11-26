@@ -96,6 +96,48 @@ class EntryAlarmTests(unittest.TestCase):
         self.assertEqual(group_operation_alarms(s, [event(3, 'load', 31., historical=True)],
                                                {}, 35.5)[0]['reason'], 'unexpected_action')
 
+    def test_video12_empty_end_states_do_not_hide_the_missing_s4_operation(self):
+        s = snapshot()
+        s['group_id'] = 4
+        events = [event(3, 'unload', 31.), event(3, 'load', 31.5)]
+        events += [event(i, 'unload', 35.+j) for j, i in enumerate((3, 2, 1))]
+        review = stationary_review()
+        review.groups[('unload', 4)] = review.groups[('unload', 2)]
+        alarms = group_operation_alarms(s, events, {3: 13, 4: 14, 2: 15, 1: 16}, 40.,
+            close_reason='observed_roi_exit', motion_review=review)
+        alarm, = alarms
+        self.assertEqual(s['alarm_order_result'], 'pending')
+        self.assertEqual(alarm['type'], 'slot_operation_record_alarm')
+        self.assertEqual(alarm['missing_slot_ids'], [4])
+        self.assertEqual(alarm['confirmed_count'], 3)
+        self.assertEqual(alarm['slot_sequence'], [3, 3, 2, 1])
+        self.assertIn('S4', alarm['message'])
+
+    def test_record_audit_waits_for_group_close(self):
+        s = snapshot()
+        s['order_result'] = 'pending'
+        events = [event(i, 'unload', 35.+j) for j, i in enumerate((3, 2, 1))]
+        self.assertEqual(group_operation_alarms(s, events, {}, 40.), [])
+
+    def test_early_real_operation_counts_toward_record_coverage(self):
+        s = snapshot()
+        events = [event(3, 'unload', 31., historical=True)]
+        events += [event(i, 'unload', 35.+j) for j, i in enumerate((4, 2, 1))]
+        alarms = group_operation_alarms(s, events, {}, 40.,
+            close_reason='observed_roi_exit', motion_review=stationary_review())
+        self.assertEqual(alarms, [])
+
+    def test_hatch_close_audits_missing_load_records_too(self):
+        s = snapshot()
+        s.update(phase='load', order_result='pending', hand_trajectory_review_pending=True)
+        for slot in s['slots']:
+            slot['last_confirmed_state'] = 'filled'
+        events = [dict(event(i, 'load', 35.+j), expected_action=True)
+                  for j, i in enumerate((3, 2, 1))]
+        alarm, = group_operation_alarms(s, events, {}, 40., close_reason='hatch_closed')
+        self.assertEqual(alarm['missing_slot_ids'], [4])
+        self.assertIn('上料操作记录不完整', alarm['message'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -13,6 +13,7 @@ from industrial_inspection.tools.s4_hand_contact import (
     HandContactPolicy, box_overlap_ratio, centered_box, evaluate_s4_contact)
 from industrial_inspection.tools.slot_process_config import (
     LOAD_ENTRY_QUARTET_REVIEW_FRAMES, LOAD_ENTRY_QUARTET_REVIEW_SECONDS, LOAD_POST_CONTACT_CONFIRM_FRAMES)
+from industrial_inspection.tools.slot_hand_trajectory import LoadHandTrajectory
 
 SLOT_STATES = {"wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}
 S4_UNLOAD_REVIEW_SECONDS = .8
@@ -340,7 +341,7 @@ class SlotGroupTracker:
                  allow_three_point_initialization=None, s4_hand_region=None,
                  unload_entry_numbering_seconds=None, machine_center=None,
                  require_unload_event_before_numbering=False,
-                 visual_reversal_review_seconds=0.0):
+                 visual_reversal_review_seconds=0.0, load_trajectory_enabled=False):
         if group_count != 5 or not 1 <= group_id <= group_count:
             raise ValueError("当前流程固定五组，group_id 必须在1..5之间")
         if phase not in ("load", "unload") or sorted(clockwise) != [1, 2, 3, 4]:
@@ -476,6 +477,8 @@ class SlotGroupTracker:
         self.transition_load_track_id = None
         self.transition_load_slot_index = None
         self.s4_load_contact_lookback = None
+        self.load_trajectory_enabled = bool(load_trajectory_enabled)
+        self.load_trajectory = LoadHandTrajectory()
         self._entry_reference_points = None
         # Once a provisional slot has accumulated enough valid S4 contact
         # evidence, keep that *slot object* as S4 until the evidence is
@@ -1921,6 +1924,7 @@ class SlotGroupTracker:
         # 新组不能沿用旧组中心。默认重新等待YOLO四槽初始化。
         self.__init__(centers, group_id=group_id,
                       phase=phase or self.phase, clockwise=self.clockwise,
+                      load_trajectory_enabled=self.load_trajectory_enabled,
                       match_distance_ratio=self.match_distance_ratio, confirm_seconds=self.confirm_seconds,
                       minimum_frames=self.minimum_frames, lost_seconds=self.lost_seconds,
                       conflict_margin=self.conflict_margin, hand_overlap=self.hand_overlap,
@@ -2920,6 +2924,12 @@ class SlotGroupTracker:
         """策略只返回接触证据；计时、状态和事件仍由当前跟踪器统一管理。"""
         if not self._is_hand_contact_slot(slot_index):
             return False
+        if self.phase == 'load' and self.load_trajectory.blocks_inference(slot_index+1):
+            self._clear_load_contact(self.slots[slot_index])
+            self.slots[slot_index].prediction_contact = None
+            self.s4_contact_diagnostic = {'contact_detected': False, 'source': None,
+                'decision_reason': 'trajectory_passed_toward_other_slot', 'target_slot_id': slot_index+1}
+            return False
         self.s4_region_diagnostic = None
         self.s4_contact_diagnostic = None
         if not self.load_hand_contact_enabled:
@@ -3458,6 +3468,7 @@ class SlotGroupTracker:
         self.unmatched = [c for i, c in enumerate(candidates) if i not in matches.values()]
         self._update_load_contact_boxes(candidates, matches, geometry_matches, hands, now,
                                         observations_enabled and not moving and not self.identity_lost, roi_contour)
+        self._observe_load_trajectory(hands, now, observations_enabled and not moving)
         new_events = []
         for i,slot in enumerate(self.slots):
             obj = candidates[matches[i]] if i in matches else None
@@ -3483,6 +3494,7 @@ class SlotGroupTracker:
                     contact_supported or self._has_pending_s4_contact(slot)))
             else:
                 events = self._review_visual_events(slot, history, event, now)
+            events = [self._apply_load_trajectory(e, now) for e in events]
             self.events.extend(events)
             new_events.extend(events)
         if self._entry_s4_contact is not None:
@@ -3505,7 +3517,38 @@ class SlotGroupTracker:
         released = dict(event, slot_id=slot.slot_id, reported_at=float(now),
                     recovered_before_initialization=event["recovered_before_initialization"] or
                     (initialized_at is not None and event["confirmed_at"] < initialized_at))
-        return self._apply_s4_load_contact_lookback(slot, released, now)
+        return self._apply_load_trajectory(self._apply_s4_load_contact_lookback(slot, released, now), now)
+
+    def _observe_load_trajectory(self, hands, now, enabled):
+        if (not self.load_trajectory_enabled or not self.load_hand_contact_enabled
+                or self.phase != 'load' or self.points is None):
+            return
+        if self.identity_lost:
+            self.load_trajectory = LoadHandTrajectory()
+            return
+        targets = {}
+        for i, slot in enumerate(self.slots):
+            if slot.confirmed != 'empty' or any(e['slot_id'] == slot.slot_id and e['action'] == 'load'
+                                               for e in self.events):
+                continue
+            point = self.points[i]
+            box = slot.temporary_contact_box_xyxy or slot.last_valid_box_xyxy
+            if box is None:
+                size = slot.box_size_wh
+                if size is None:
+                    continue
+                box = centered_box(point, size)
+            else:
+                box = centered_box(point, (box[2]-box[0], box[3]-box[1]))
+            targets[slot.slot_id] = {'center': point, 'box': box,
+                'baseline_at': float(slot.evidence_time if slot.evidence_time is not None else now),
+                'bound': self.byte_track_ids[i] is not None}
+        self.load_trajectory.observe(hands, targets, self.initialization['inferred_slot_ids'], now, enabled)
+
+    def _apply_load_trajectory(self, event, now):
+        if not self.load_trajectory_enabled or self.phase != 'load':
+            return event
+        return self.load_trajectory.confirm(event, now)
 
     def _apply_s4_load_contact_lookback(self, slot, event, now):
         contact = self.s4_load_contact_lookback
@@ -3858,6 +3901,11 @@ class SlotGroupTracker:
                                 "released_at": slot.load_contact_released_at,
                                 "count": slot.load_contact_count}
         state, confidence, reason = self._slot_observation(obj, hands, enabled, roi_contour, contact=contact)
+        if self.load_trajectory_enabled and self.phase == 'load':
+            if state == 'empty':
+                self.load_trajectory.observe_empty(slot.slot_id, now, self.minimum_frames)
+            else:
+                self.load_trajectory.break_empty_run(slot.slot_id)
         verify_entry_full = (self._entry_points is not None and pending_contact
                              and slot.confirmed == "filled" and slot.entry_contact_center is not None)
         if verify_entry_full:
@@ -4216,6 +4264,8 @@ class SlotGroupTracker:
                 "s4_contact_diagnostic": self.s4_contact_diagnostic,
                 "s4_unload_review_pending": self._pending_s4_unload is not None,
                 "s4_inferred_load_pending": self.s4_inferred_load is not None,
+                "hand_trajectory_review": self.load_trajectory.snapshot(),
+                "hand_trajectory_review_pending": bool(self.load_trajectory.pending),
                 "s4_contact_prediction_seconds": self.s4_contact_prediction_seconds,
                 "s4_contact_lock": self._entry_s4_lock_snapshot(),
                 "three_point_preview": self.three_point_preview if self.points is None else None,
