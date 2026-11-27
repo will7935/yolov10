@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from industrial_inspection.tools.slot_group_tracker import SLOT_STATES, SlotState, slot_layout_error
+from industrial_inspection.tools.slot_unload_state_review import state_observation
 
 
 @dataclass
@@ -26,6 +27,9 @@ class RoiEdgeTrack:
     events: list = field(default_factory=list)
 
     def observe(self, state, confidence, now, peers, outside, rules):
+        if state == 'unknown':
+            self.miss(now)
+            return
         previous = self.state.confirmed
         if state == previous:
             self.first_change = None
@@ -117,10 +121,10 @@ class InitialEdgeSlot:
         center = np.asarray(obj['center'])
         evidence = previous if previous is not None else cls(center, peers, now)
         track_id = obj.get('track_id')
-        observation = SLOT_STATES[obj['class_name']]
+        observation, state_confidence, _ = state_observation(obj)
         if observation == 'filled':
             evidence.first_empty_at = None
-        elif evidence.filled_at is not None and evidence.first_empty_at is None:
+        elif observation == 'empty' and evidence.filled_at is not None and evidence.first_empty_at is None:
             evidence.first_empty_at = now
         if track_id is None:
             evidence.state.observe('unknown', now, None, 'not_detected', 0, 1)
@@ -131,7 +135,7 @@ class InitialEdgeSlot:
         evidence.frames += 1
         evidence.track_ids.add(track_id)
         evidence.center, evidence.peers, evidence.last_seen = center, peers, now
-        evidence.state.observe(observation, now, obj['confidence'], 'detected',
+        evidence.state.observe(observation, now, state_confidence, 'detected',
                                tracker.confirm_seconds, tracker.minimum_frames)
         if observation == evidence.state.confirmed == 'filled':
             evidence.filled_at = now
@@ -218,17 +222,20 @@ class SlotTrackStateStore:
             elif self.rules._occluded(obj, hands):
                 reason = 'hand_occlusion'
             else:
-                state, reason = SLOT_STATES[obj['class_name']], 'detected'
+                state, _, reason = state_observation(obj)
             if state != 'unknown':
                 if record['reliable_since'] is None or gap > .25:
                     record['reliable_since'], record['reliable_count'] = float(now), 0
                 record['reliable_count'] += 1
             else:
                 record['reliable_since'], record['reliable_count'] = None, 0
-            event = record['state'].observe(state, now, obj['confidence'], reason,
+            state_confidence = state_observation(obj)[1] if state != 'unknown' else None
+            event = record['state'].observe(state, now, state_confidence, reason,
                                            self.rules.confirm_seconds, self.rules.minimum_frames,
                                            visual_track_id=track_id)
             if event is not None:
+                if obj.get('unload_state_review') is not None:
+                    event['unload_state_review'] = obj['unload_state_review']
                 record['events'].append({**event, 'byte_track_id': track_id})
         for track_id, record in self.tracks.items():
             if track_id not in seen:
@@ -284,7 +291,8 @@ class SlotTrackStateStore:
                     history.state.evidence_time = prior['state'].evidence_time
                     history.confirmed_peers = prior_peers
             history.last_seen, history.center = now, center
-            history.observe(SLOT_STATES[obj['class_name']], obj['confidence'], now, support, outside, self.rules)
+            state, confidence, _ = state_observation(obj)
+            history.observe(state, confidence, now, support, outside, self.rules)
         for track_id, history in list(self._edge_tracks.items()):
             if now-history.last_seen > self.rules.lost_seconds:
                 del self._edge_tracks[track_id]

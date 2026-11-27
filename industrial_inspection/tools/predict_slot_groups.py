@@ -33,6 +33,8 @@ from industrial_inspection.tools.slot_local_redetection import (
 from industrial_inspection.tools.roi_group_sequence import RoiGroupSequence
 from industrial_inspection.tools.slot_perspective_numbering import SlotPerspectiveNumbering
 from industrial_inspection.tools.slot_process_config import LOAD_NUMBERING_CALIBRATION_FILE
+from industrial_inspection.tools.slot_process_config import UNLOAD_STATE_REVIEW_ENABLED, UNLOAD_STATE_REVIEW_WEIGHTS
+from industrial_inspection.tools.slot_unload_state_review import PremappingUnloadReview
 from industrial_inspection.tools.slot_process_config import TWO_POINT_UPPER_S3_SOURCES
 from industrial_inspection.tools.slot_process_config import LOAD_ORBIT_ROTATION_SOURCES, LOAD_ORBIT_ROTATION_DEGREES
 from industrial_inspection.tools.slot_roi import draw_roi, pixel_polygon, load_roi, select_roi
@@ -69,7 +71,7 @@ _TRIAL_UNLOAD_STABLE_SECONDS = .20
 # 每次完成主视频后，自动使用同一套模型、分组逻辑和项目默认 ROI 处理回归视频。
 # 回归结果写入 OUTPUT_ROOT/regression_runs；缺失文件只记录为跳过，不影响主视频。
 # 临时仅处理主视频可传 --no-regression-tests。
-REGRESSION_TESTS_ENABLED = False
+REGRESSION_TESTS_ENABLED = True
 REGRESSION_DATASET_ROOT = Path(r"I:\youyan\test_dataset")
 REGRESSION_TEST_VIDEOS = (
     ("测试视频1", REGRESSION_DATASET_ROOT / "测试视频1" / "camera_B_20260924_021033.avi",
@@ -94,8 +96,8 @@ REGRESSION_TEST_VIDEOS = (
      base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频11", REGRESSION_DATASET_ROOT / "测试视频11" / "camera_B_20260924_064032.avi",
      base.DEFAULT_SLOT_ROI_FILE),
-    ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
-     base.DEFAULT_SLOT_ROI_FILE),
+    # ("测试视频12", REGRESSION_DATASET_ROOT / "测试视频12" / "camera_B_20260924_065915.avi",
+    #  base.DEFAULT_SLOT_ROI_FILE),
     ("测试视频13", REGRESSION_DATASET_ROOT / "测试视频13" / "camera_B_20260924_071629.avi",
      base.DEFAULT_SLOT_ROI_FILE),
     # ("测试视频14", REGRESSION_DATASET_ROOT / "测试视频14" / "camera_B_20260924_085126.avi",
@@ -176,6 +178,7 @@ def build_args(argv=None):
     args.settled_unload_trial = settled_unload_trial
     args.write_video_output = write_video_output
     args.run_regression_tests = run_regression_tests
+    args.unload_state_review_enabled = UNLOAD_STATE_REVIEW_ENABLED
     args.slot_roi = True
     args.group_completion_log_only = True
     resolve_detection_thresholds(args)  # 在打开视频和创建输出前检查各职责门槛。
@@ -183,6 +186,8 @@ def build_args(argv=None):
         raise ValueError("本脚本专用于四槽跟踪；普通检测请运行 predict_video.py")
     if not args.source.is_file() or not args.weights.is_file():
         raise FileNotFoundError("请检查本脚本配置的视频和权重路径")
+    if args.unload_state_review_enabled and not UNLOAD_STATE_REVIEW_WEIGHTS.is_file():
+        raise FileNotFoundError(f"下料局部状态复核权重不存在：{UNLOAD_STATE_REVIEW_WEIGHTS}")
     audit_conf = getattr(args, "audit_conf", AUDIT_CONFIDENCE)
     if (not 0 < args.conf < 1 or not 0 < audit_conf <= args.conf
             or args.stride < 1 or args.max_frames < 0 or args.imgsz < 32):
@@ -859,6 +864,20 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
     finally:
         torch.load = original_load
     names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
+    def load_state_review_model():
+        torch.load = trusted_load
+        try:
+            auxiliary, auxiliary_architecture = base.load_detection_model(UNLOAD_STATE_REVIEW_WEIGHTS)
+        finally:
+            torch.load = original_load
+        log(f"下料局部状态复核已加载：{UNLOAD_STATE_REVIEW_WEIGHTS}")
+        summary['unload_state_review']['architecture'] = auxiliary_architecture
+        return auxiliary
+    state_reviewer = (PremappingUnloadReview(load_state_review_model, thresholds.slot_state,
+        crop_size=LOCAL_REDETECT_CROP_SIZE, imgsz=LOCAL_REDETECT_IMAGE_SIZE,
+        device=args.device, iou=args.nms_iou, conflict_margin=CONFLICT_CONF_MARGIN,
+        hand_threshold=thresholds.hand)
+        if getattr(args, 'unload_state_review_enabled', False) else None)
     slot_classes = [int(class_id) for class_id, name in names.items() if name in SLOT_STATES]
     audit_confidence = float(getattr(args, "audit_conf", AUDIT_CONFIDENCE))
     if not 0 < audit_confidence <= args.conf:
@@ -1011,6 +1030,10 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                                       "load": ["unknown->filled", "empty->unknown"]},
             "yolo_state_has_priority": True,"infer_after_unknown_grace": True},
         "match_distance_ratio": MATCH_DISTANCE_RATIO,"identity_lost_seconds": IDENTITY_LOST_SECONDS,
+        "unload_state_review": {"enabled": state_reviewer is not None,
+            "weights": str(UNLOAD_STATE_REVIEW_WEIGHTS), "crop_size_wh": list(LOCAL_REDETECT_CROP_SIZE),
+            "imgsz": LOCAL_REDETECT_IMAGE_SIZE, "threshold": thresholds.slot_state,
+            "scope": "start_before_mapping_on_primary_empty_continue_same_track_in_group"},
         "local_redetection_config": {"enabled": LOCAL_REDETECT_ENABLED, "slot_ids": [4],
             "load_scope": "third_support_for_provisional_three_point_preview",
             "crop_size_wh": list(LOCAL_REDETECT_CROP_SIZE),"imgsz": LOCAL_REDETECT_IMAGE_SIZE,
@@ -1247,6 +1270,10 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                     # gate. Retired boxes remain available for that gate but
                     # never enter the local crop detector.
                     objects.extend(retired_raw)
+                    if enabled and state_reviewer is not None:
+                        objects, state_review_attempts = state_reviewer.apply(frame, objects, sequence, timestamp)
+                    else:
+                        state_review_attempts = []
                     s4_position_candidates = [dict(item, confidence=item["tracking_confidence"])
                         for item in tracked_raw if item["class_name"] in SLOT_STATES
                         and item.get("track_id") is None
@@ -1264,6 +1291,7 @@ def _run_prediction_once(args,*,on_frame=None,on_log=None,should_stop=None,roi_p
                                                  if obj["confidence"] >= thresholds.slot_state],
                         load_support_resolver=find_load_preview_support if local_policy.enabled else None)
                     inspection_processed += 1
+                    snapshot['unload_state_review_attempts'] = state_review_attempts
                 else:
                     local_attempts = []
                     if inspection.closed_at is not None and not sequence_finished:

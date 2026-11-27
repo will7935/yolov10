@@ -14,6 +14,7 @@ from industrial_inspection.tools.s4_hand_contact import (
 from industrial_inspection.tools.slot_process_config import (
     LOAD_ENTRY_QUARTET_REVIEW_FRAMES, LOAD_ENTRY_QUARTET_REVIEW_SECONDS, LOAD_POST_CONTACT_CONFIRM_FRAMES)
 from industrial_inspection.tools.slot_hand_trajectory import LoadHandTrajectory
+from industrial_inspection.tools.slot_unload_state_review import state_observation
 
 SLOT_STATES = {"wafer_slot_empty": "empty", "wafer_slot_filled": "filled"}
 S4_UNLOAD_REVIEW_SECONDS = .8
@@ -248,6 +249,7 @@ class SlotState:
     empty_evidence_since: float | None = None
     empty_evidence_last_seen: float | None = None
     pending_visual_event: dict | None = None
+    unload_state_review: dict | None = None
 
     def observe(self, state, now, confidence, reason, confirm_seconds, minimum_frames,
                 contact_evidence=None, *, visual_track_id=None):
@@ -3775,12 +3777,13 @@ class SlotGroupTracker:
             return "unknown", confidence, "empty_filled_conflict"
         if self._occluded(obj, hands) or contact:
             return "unknown", confidence, "hand_occlusion"
-        return SLOT_STATES[obj["class_name"]], confidence, "detected"
+        return state_observation(obj)
 
     def _observe_slot(self, slot, obj, hands, now, enabled, roi_contour, *,
                       record_load_contact=True, restore_track_events=True):
         """正式槽与进入中的临时点共用同一套空满确认规则。"""
         slot_index = slot.slot_id-1
+        slot.unload_state_review = None if obj is None else obj.get('unload_state_review')
         load_locked = self._predicted_load_is_locked(slot)
         self._unlock_lost_entry_s4(slot, slot_index, obj, now)
         recovered = []
@@ -4109,6 +4112,8 @@ class SlotGroupTracker:
                 byte_track_id=self._byte_track_id_at(slot.slot_id-1),
                 expected_action=event["action"] == self.phase,
                 reported_at=float(now), recovered_before_initialization=False)
+            if slot.unload_state_review is not None and not event.get('inferred'):
+                event['unload_state_review'] = slot.unload_state_review
         if contact_slot_for_frame and self.s4_contact_diagnostic is not None:
             diagnostic = self.s4_contact_diagnostic
             diagnostic["prediction_contact"] = prediction_diagnostic
@@ -4224,6 +4229,7 @@ class SlotGroupTracker:
                 "reason": "visual_reversal_review_pending" if pending else s.reason,
                 "confirmation_source": None if pending else s.confirmation_source,
                 "visual_reversal_review_pending": pending is not None,
+                "unload_state_review": getattr(s, 'unload_state_review', None),
                 "load_state_locked": self._predicted_load_is_locked(s),
                 "geometry_inferred": s.geometry_inferred,
                 "position_is_prediction": is_prediction,
